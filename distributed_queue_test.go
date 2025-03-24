@@ -10,27 +10,29 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func setupTestDistributedQueue(t *testing.T) (*RedisDistributedQueue, func()) {
+func setupTestDistributedQueue(t *testing.T) (*DistributedQueue, func()) {
 	redisURL := getTestRedisURL()
-	q := NewRedisDistributedQueue(testQueueKey, redisURL)
+	qs := New(redisURL)
+	q := qs.NewDistributedQueue(testQueueKey)
 
 	// Clear the queue before test
 	ctx := context.Background()
-	require.NoError(t, q.RedisQueue.client.Del(ctx, testQueueKey).Err(), "Failed to clear test queue")
+	require.NoError(t, q.Queue.client.Del(ctx, testQueueKey).Err(), "Failed to clear test queue")
 
 	cleanup := func() {
-		q.RedisQueue.client.Del(ctx, testQueueKey)
+		q.Queue.client.Del(ctx, testQueueKey)
 		q.Close()
+		qs.Close()
 	}
 
 	return q, cleanup
 }
 
-func TestNewRedisDistributedQueue(t *testing.T) {
+func TestNewDistributedQueue(t *testing.T) {
 	q, cleanup := setupTestDistributedQueue(t)
 	defer cleanup()
 
-	assert.NotNil(t, q.RedisQueue, "RedisQueue should not be nil")
+	assert.NotNil(t, q.Queue, "Queue should not be nil")
 	assert.NotNil(t, q.Notification, "Notification should not be nil")
 }
 

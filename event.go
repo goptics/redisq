@@ -2,12 +2,12 @@ package redisq
 
 import "encoding/json"
 
-type Event struct {
+type event struct {
 	Action  string `json:"action"`
 	Message []byte `json:"message"`
 }
 
-func (e *Event) Json() ([]byte, error) {
+func (e *event) Json() ([]byte, error) {
 	json, err := json.Marshal(e)
 	if err != nil {
 		return nil, err
@@ -16,11 +16,11 @@ func (e *Event) Json() ([]byte, error) {
 	return json, nil
 }
 
-func parseToEvent(data []byte) (Event, error) {
-	var event Event
-	if err := json.Unmarshal(data, &event); err != nil {
-		return Event{}, err
+func parseToEvent(data []byte) (event, error) {
+	var e event
+	if err := json.Unmarshal(data, &e); err != nil {
+		return event{}, err
 	}
 
-	return event, nil
+	return e, nil
 }

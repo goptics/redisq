@@ -25,9 +25,10 @@ func getTestRedisURL() string {
 	panic("REDIS_URL environment variable is not set")
 }
 
-func setupTestQueue(t *testing.T) (*RedisQueue, func()) {
+func setupTestQueue(t *testing.T) (*Queue, func()) {
 	redisURL := getTestRedisURL()
-	q := NewRedisQueue(testQueueKey, redisURL)
+	qs := New(redisURL)
+	q := qs.NewQueue(testQueueKey)
 
 	// Clear the queue before test
 	ctx := context.Background()
@@ -36,14 +37,17 @@ func setupTestQueue(t *testing.T) (*RedisQueue, func()) {
 	cleanup := func() {
 		q.client.Del(ctx, testQueueKey)
 		q.Close()
+		qs.Close()
 	}
 
 	return q, cleanup
 }
 
-func TestNewRedisQueue(t *testing.T) {
+func TestNewQueue(t *testing.T) {
 	redisURL := getTestRedisURL()
-	q := NewRedisQueue(testQueueKey, redisURL)
+	qs := New(redisURL)
+	q := qs.NewQueue(testQueueKey)
+	defer qs.Close()
 	defer q.Close()
 
 	assert.Equal(t, testQueueKey, q.queueKey, "Queue key should match")

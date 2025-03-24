@@ -15,7 +15,7 @@ func setupTestNotification(t *testing.T) (*Notification, func()) {
 	require.NoError(t, err)
 
 	client := redis.NewClient(opts)
-	n := NewNotification(client, testQueueKey)
+	n := newNotification(client, testQueueKey)
 
 	cleanup := func() {
 		n.Stop()

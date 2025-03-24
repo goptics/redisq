@@ -9,12 +9,12 @@ import (
 func TestEventJson(t *testing.T) {
 	tests := []struct {
 		name    string
-		event   Event
+		event   event
 		wantErr bool
 	}{
 		{
 			name: "valid event",
-			event: Event{
+			event: event{
 				Action:  "test_action",
 				Message: []byte("test message"),
 			},
@@ -22,7 +22,7 @@ func TestEventJson(t *testing.T) {
 		},
 		{
 			name: "empty event",
-			event: Event{
+			event: event{
 				Action:  "",
 				Message: nil,
 			},
@@ -53,13 +53,13 @@ func TestParseToEvent(t *testing.T) {
 	tests := []struct {
 		name    string
 		input   []byte
-		want    Event
+		want    event
 		wantErr bool
 	}{
 		{
 			name:  "valid json",
 			input: []byte(`{"action":"test","message":"dGVzdA=="}`),
-			want: Event{
+			want: event{
 				Action:  "test",
 				Message: []byte("test"),
 			},

@@ -18,7 +18,7 @@ type Notification struct {
 	cancel      context.CancelFunc
 }
 
-func NewNotification(client *redis.Client, key string) *Notification {
+func newNotification(client *redis.Client, key string) *Notification {
 	ctx, cancel := context.WithCancel(context.Background())
 	notificationKey := key + ":notifications"
 
@@ -65,8 +65,8 @@ func (n *Notification) Subscribe(handler func(action string, message []byte)) {
 }
 
 func (n *Notification) Send(action string, message []byte) {
-	event := Event{Action: action, Message: message}
-	bytes, _ := event.Json()
+	e := event{Action: action, Message: message}
+	bytes, _ := e.Json()
 
 	if err := n.client.Publish(n.ctx, n.key, bytes).Err(); err != nil {
 		log.Printf("Error publishing notification: %v", err)
