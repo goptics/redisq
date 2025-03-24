@@ -14,10 +14,10 @@ import (
 const testQueueKey = "test_queue"
 
 func getTestRedisURL() string {
-	if err := godotenv.Load(); err != nil {
-		panic(err)
-	}
+	// Try to load .env file, but don't panic if it doesn't exist
+	_ = godotenv.Load()
 
+	// Get REDIS_URL from environment
 	if url := os.Getenv("REDIS_URL"); url != "" {
 		return url
 	}
