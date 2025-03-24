@@ -40,4 +40,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Graceful handling of Redis connection errors
 - Proper cleanup of resources on shutdown
 
-[0.1.0]: https://github.com/fahimfaiaal/redisq/releases/tag/v0.1.0
+[0.1.0]: https://github.com/fahimfaisaal/redisq/releases/tag/v0.1.0

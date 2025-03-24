@@ -14,13 +14,13 @@ A lightweight, thread-safe Redis-backed queue implementation in Go with support 
 ## Installation
 
 ```bash
-go get github.com/fahimfaiaal/redisq
+go get github.com/fahimfaisaal/redisq
 ```
 
 ## Quick Start
 
 ```go
-import "github.com/fahimfaiaal/redisq"
+import "github.com/fahimfaisaal/redisq"
 
 func main() {
     // Initialize queue system
