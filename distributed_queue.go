@@ -13,6 +13,7 @@ func newDistributedQueue(client *redis.Client, queueKey string) *DistributedQueu
 		Queue:        rq,
 		Notification: newNotification(client, queueKey),
 	}
+	defer q.Start()
 
 	return q
 }
