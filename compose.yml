@@ -1,0 +1,22 @@
+services:
+  redis:
+    image: redis:7.2-alpine
+    container_name: gocq_redis
+    ports:
+      - "${REDIS_PORT}:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    hostname: redis
+    init: true
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    env_file:
+      - .env
+
+volumes:
+  redisq_data:
+    name: redisq_data
