@@ -8,6 +8,7 @@ type queues struct {
 
 type Queues interface {
 	NewQueue(queueKey string) *Queue
+	NewPriorityQueue(queueKey string) *PriorityQueue
 	NewDistributedQueue(queueKey string) *DistributedQueue
 	Close() error
 }
@@ -27,6 +28,10 @@ func New(url string) Queues {
 
 func (qs *queues) NewQueue(queueKey string) *Queue {
 	return newQueue(qs.client, queueKey)
+}
+
+func (qs *queues) NewPriorityQueue(queueKey string) *PriorityQueue {
+	return newPriorityQueue(qs.client, queueKey)
 }
 
 func (qs *queues) NewDistributedQueue(queueKey string) *DistributedQueue {
