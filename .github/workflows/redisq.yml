@@ -44,11 +44,12 @@ jobs:
       - name: Run tests with coverage
         run: |
           go test -race -coverprofile=coverage.txt -covermode=atomic ./...
+        env:
+          REDIS_URL: redis://localhost:6375
 
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v5
-        env:
-          REDIS_URL: redis://localhost:6375
+
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: fahimfaisaal/redisq
