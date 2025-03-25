@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2025-03-25
+
+### Added
+
+- Priority Queue implementation with Redis sorted sets
+- Distributed Priority Queue with real-time notifications
+- Comprehensive test coverage for priority queue operations
+- Priority-based message ordering
+- Documentation for priority queue usage
+
+### Changed
+
+- Renamed `Clear` method to `Purge` for better semantic clarity
+- Improved error handling in queue operations
+- Enhanced documentation with more detailed examples
+- Updated Go module dependencies to latest versions
+- Optimized Redis operations for better performance
+
 ## [0.1.0] - 2025-03-24
 
 ### Added
@@ -40,4 +58,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Graceful handling of Redis connection errors
 - Proper cleanup of resources on shutdown
 
+[1.0.0]: https://github.com/fahimfaisaal/redisq/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/fahimfaisaal/redisq/releases/tag/v0.1.0
