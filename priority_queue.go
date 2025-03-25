@@ -1,7 +1,6 @@
 package redisq
 
 import (
-	"fmt"
 	"log"
 
 	"github.com/redis/go-redis/v9"
@@ -103,25 +102,4 @@ func (pq *PriorityQueue) Values() []any {
 	}
 
 	return values
-}
-
-// GetPriority returns the priority of an item in the queue
-func (pq *PriorityQueue) GetPriority(item any) (float64, error) {
-	pq.mx.Lock()
-	defer pq.mx.Unlock()
-
-	data, err := pq.toBytes(item)
-	if err != nil {
-		return 0, fmt.Errorf("error converting item to bytes: %v", err)
-	}
-
-	score, err := pq.client.ZScore(pq.ctx, pq.queueKey, string(data)).Result()
-	if err == redis.Nil {
-		return 0, fmt.Errorf("item not found in queue")
-	}
-	if err != nil {
-		return 0, fmt.Errorf("error getting priority: %v", err)
-	}
-
-	return score, nil
 }

@@ -8,9 +8,8 @@ type DistributedQueue struct {
 }
 
 func newDistributedQueue(client *redis.Client, queueKey string) *DistributedQueue {
-	rq := newQueue(client, queueKey)
 	q := &DistributedQueue{
-		Queue:        rq,
+		Queue:        newQueue(client, queueKey),
 		Notification: newNotification(client, queueKey),
 	}
 	defer q.Start()

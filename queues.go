@@ -10,6 +10,7 @@ type Queues interface {
 	NewQueue(queueKey string) *Queue
 	NewPriorityQueue(queueKey string) *PriorityQueue
 	NewDistributedQueue(queueKey string) *DistributedQueue
+	NewDistributedPriorityQueue(queueKey string) *DistributedPriorityQueue
 	Close() error
 }
 
@@ -36,6 +37,10 @@ func (qs *queues) NewPriorityQueue(queueKey string) *PriorityQueue {
 
 func (qs *queues) NewDistributedQueue(queueKey string) *DistributedQueue {
 	return newDistributedQueue(qs.client, queueKey)
+}
+
+func (qs *queues) NewDistributedPriorityQueue(queueKey string) *DistributedPriorityQueue {
+	return newDistributedPriorityQueue(qs.client, queueKey)
 }
 
 func (qs *queues) Close() error {
