@@ -70,8 +70,8 @@ length := queue.Len()
 // Get all values
 values := queue.Values()
 
-// Clear the queue
-queue.Clear()
+// Purge the queue
+queue.Purge()
 ```
 
 ### Priority Queue

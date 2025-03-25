@@ -118,7 +118,7 @@ func (q *Queue) Len() int {
 	return int(length)
 }
 
-func (q *Queue) Clear() {
+func (q *Queue) Purge() {
 	q.mx.Lock()
 	defer q.mx.Unlock()
 
