@@ -2,7 +2,9 @@ package redisq
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,7 +24,8 @@ func getTestRedisURL() string {
 		return url
 	}
 
-	panic("REDIS_URL environment variable is not set")
+	// Default to localhost:6379 if not set
+	return "redis://localhost:6379"
 }
 
 func setupTestQueue(t *testing.T) (*Queue, func()) {
@@ -30,12 +33,21 @@ func setupTestQueue(t *testing.T) (*Queue, func()) {
 	qs := New(redisURL)
 	q := qs.NewQueue(testQueueKey)
 
-	// Clear the queue before test
+	// Ping Redis to ensure it's available
 	ctx := context.Background()
+	_, err := q.client.Ping(ctx).Result()
+	if err != nil {
+		t.Skip("Redis server is not available, skipping test: " + err.Error())
+		return nil, func() {}
+	}
+
+	// Clear the queue before test
 	require.NoError(t, q.client.Del(ctx, testQueueKey).Err(), "Failed to clear test queue")
+	require.NoError(t, q.client.Del(ctx, q.getNackedItemKey()).Err(), "Failed to clear nacked queue")
 
 	cleanup := func() {
 		q.client.Del(ctx, testQueueKey)
+		q.client.Del(ctx, q.getNackedItemKey())
 		q.Close()
 		qs.Close()
 	}
@@ -189,4 +201,171 @@ func TestQueueClose(t *testing.T) {
 	assert.False(t, q.Enqueue("test"), "Enqueue should fail after close")
 	_, ok := q.Dequeue()
 	assert.False(t, ok, "Dequeue should fail after close")
+
+	assert.Error(t, q.PrepareForAck("test-ack", "test"), "PrepareForAck should fail after close")
+	assert.False(t, q.Acknowledge("test-ack"), "Acknowledge should fail after close")
+}
+
+func TestPrepareForAck(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// Test with string item
+	err := q.PrepareForAck("ack-1", "test-item")
+	assert.NoError(t, err, "PrepareForAck should succeed with string")
+
+	// Test with byte array
+	err = q.PrepareForAck("ack-2", []byte("test-bytes"))
+	assert.NoError(t, err, "PrepareForAck should succeed with bytes")
+
+	// Verify items are in the nacked items list
+	count := q.GetNackedItemsCount()
+	assert.Equal(t, 2, count, "Should have 2 items in nacked list")
+}
+
+func TestAcknowledge(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// Add an item to acknowledge
+	err := q.PrepareForAck("ack-id", "test-item")
+	assert.NoError(t, err, "PrepareForAck should succeed")
+
+	// Verify item is in the pending list
+	count := q.GetNackedItemsCount()
+	assert.Equal(t, 1, count, "Should have 1 item in nacked list")
+
+	// Acknowledge the item
+	result := q.Acknowledge("ack-id")
+	assert.True(t, result, "Acknowledge should succeed")
+
+	// Verify item is removed from pending list
+	count = q.GetNackedItemsCount()
+	assert.Equal(t, 0, count, "Should have 0 items in nacked list after acknowledgment")
+
+	// Test acknowledging non-existent item
+	result = q.Acknowledge("non-existent")
+	assert.True(t, result, "Acknowledge should succeed even for non-existent items")
+}
+
+func TestRequeueNackedItems(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// First add items to the main queue
+	q.Enqueue("item-1")
+	q.Enqueue("item-2")
+	
+	// Dequeue them and prepare for acknowledgment
+	item1, ok := q.Dequeue()
+	assert.True(t, ok, "First dequeue should succeed")
+	item2, ok := q.Dequeue()
+	assert.True(t, ok, "Second dequeue should succeed")
+	
+	// Prepare for acknowledgment
+	err := q.PrepareForAck("ack-1", item1)
+	assert.NoError(t, err, "PrepareForAck should succeed for item1")
+	err = q.PrepareForAck("ack-2", item2)
+	assert.NoError(t, err, "PrepareForAck should succeed for item2")
+
+	// Verify main queue is empty
+	assert.Equal(t, 0, q.Len(), "Main queue should be empty")
+	
+	// Verify items are in the nacked list
+	count := q.GetNackedItemsCount()
+	assert.Equal(t, 2, count, "Should have 2 items in nacked list")
+
+	// Set a longer ack timeout (Redis minimum is 1s)
+	q.SetAckTimeout(1 * time.Second)
+	
+	// Wait for timeout to expire (wait a bit longer than the timeout)
+	time.Sleep(1500 * time.Millisecond)
+
+	// Manually call requeueNackedItems for testing
+	type testQueue struct {
+		*Queue
+	}
+	tq := testQueue{Queue: q}
+	
+	// Requeue the nacked items
+	err = tq.requeueNackedItems()
+	assert.NoError(t, err, "requeueNackedItems should succeed")
+
+	// Verify items were moved from nacked list to main queue
+	nackedCount := q.GetNackedItemsCount()
+	assert.Equal(t, 0, nackedCount, "Should have 0 items in nacked list after requeue")
+
+	mainQueueCount := q.Len()
+	assert.Equal(t, 2, mainQueueCount, "Should have 2 items in main queue after requeue")
+
+	// Verify we can dequeue the items again
+	for i := 0; i < 2; i++ {
+		item, ok := q.Dequeue()
+		assert.True(t, ok, fmt.Sprintf("Dequeue %d should succeed after requeue", i+1))
+		
+		bytes, ok := item.([]byte)
+		assert.True(t, ok, fmt.Sprintf("Dequeued item %d should be []byte", i+1))
+		
+		// Convert to string for comparison
+		strItem := string(bytes)
+		assert.Contains(t, []string{"item-1", "item-2"}, strItem,
+			"Dequeued item should be one of the requeued items")
+	}
+
+	// Verify main queue is empty again after dequeueing both items
+	assert.Equal(t, 0, q.Len(), "Main queue should be empty after dequeueing requeued items")
+}
+
+func TestAcknowledgmentConcurrency(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// Set a longer ack timeout for this test
+	q.SetAckTimeout(5 * time.Second)
+
+	// Number of concurrent workers and items
+	const numWorkers = 5
+	const itemsPerWorker = 20
+	// Fill queue with items
+	for i := 0; i < numWorkers*itemsPerWorker; i++ {
+		assert.True(t, q.Enqueue(fmt.Sprintf("item-%d", i)), "Enqueue should succeed")
+	}
+
+	wg := sync.WaitGroup{}
+	wg.Add(numWorkers)
+
+	// Launch concurrent workers to process items with acknowledgment
+	for w := 0; w < numWorkers; w++ {
+		go func(workerID int) {
+			defer wg.Done()
+
+			for j := 0; j < itemsPerWorker; j++ {
+				// Dequeue item
+				item, ok := q.Dequeue()
+				if !ok {
+					break
+				}
+
+				// Create unique ack ID
+				ackID := fmt.Sprintf("worker-%d-item-%d", workerID, j)
+
+				// Prepare for acknowledgment
+				err := q.PrepareForAck(ackID, item)
+				assert.NoError(t, err, "PrepareForAck should succeed")
+
+				// Simulate processing time
+				time.Sleep(50 * time.Millisecond)
+
+				// Acknowledge successful processing
+				assert.True(t, q.Acknowledge(ackID), "Acknowledge should succeed")
+			}
+		}(w)
+	}
+
+	// Wait for all workers to finish
+	wg.Wait()
+
+	// Verify all items were processed
+	assert.Equal(t, 0, q.Len(), "Main queue should be empty")
+	assert.Equal(t, 0, q.GetNackedItemsCount(), "Nacked list should be empty")
 }

@@ -7,16 +7,17 @@ services:
     volumes:
       - redis_data:/data
     restart: unless-stopped
-    hostname: redis
     init: true
+    env_file:
+      - .env
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 3
-    env_file:
-      - .env
 
 volumes:
+  redis_data:
+    driver: local
   redisq_data:
     name: redisq_data

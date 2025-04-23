@@ -20,17 +20,20 @@ type Queue struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	expiration time.Duration
+	ackTimeout time.Duration
 }
 
 func newQueue(c *redis.Client, queueKey string) *Queue {
 	ctx, cancel := context.WithCancel(context.Background())
-
-	return &Queue{
+	q := &Queue{
 		client:   c,
 		queueKey: queueKey,
 		ctx:      ctx,
 		cancel:   cancel,
 	}
+	// Start a goroutine to requeue nacked items
+	go q.requeueNackedItems()
+	return q
 }
 
 // SetExpiration sets the expiration time for the Queue
@@ -40,6 +43,16 @@ func (q *Queue) SetExpiration(expiration time.Duration) {
 	q.expiration = expiration
 }
 
+// SetAckTimeout sets the acknowledgment timeout for jobs
+// This controls how long a job can be processing before being requeued
+func (q *Queue) SetAckTimeout(ackTimeout time.Duration) {
+	q.mx.Lock()
+	defer q.mx.Unlock()
+	q.ackTimeout = ackTimeout
+}
+
+// Dequeue removes and returns an item from the queue without acknowledgment
+// For reliable processing with acknowledgment, use DequeueWithAck instead
 func (q *Queue) Dequeue() (any, bool) {
 	q.mx.Lock()
 	defer q.mx.Unlock()
@@ -141,6 +154,103 @@ func (q *Queue) Values() []any {
 	}
 
 	return values
+}
+
+// PrepareForAck adds an item to the pending list for acknowledgment tracking
+// Returns an error if the operation fails
+func (q *Queue) PrepareForAck(ackID string, item any) error {
+	q.mx.Lock()
+	defer q.mx.Unlock()
+
+	select {
+	case <-q.ctx.Done():
+		return fmt.Errorf("queue closed, cannot prepare for acknowledgment")
+	default:
+		// Store in pending list with the ack ID
+		pendingKey := q.getNackedItemKey()
+		err := q.client.HSet(q.ctx, pendingKey, ackID, item).Err()
+		if err != nil {
+			return fmt.Errorf("error storing item in pending list: %v", err)
+		}
+
+		// Set the expiration for the pending entry
+		if q.ackTimeout > 0 {
+			q.client.Expire(q.ctx, pendingKey, q.ackTimeout)
+		}
+
+		return nil
+	}
+}
+
+// Acknowledge removes an item from the pending list indicating successful processing
+func (q *Queue) Acknowledge(ackID string) bool {
+	q.mx.Lock()
+	defer q.mx.Unlock()
+
+	select {
+	case <-q.ctx.Done():
+		log.Println("queue closed, cannot acknowledge")
+		return false
+	default:
+		_, err := q.client.HDel(q.ctx, q.getNackedItemKey(), ackID).Result()
+		if err != nil {
+			log.Printf("Error acknowledging item: %v", err)
+			return false
+		}
+		return true
+	}
+}
+
+// RequeueIdleItems checks for idle items in the pending list
+// and returns them to the main queue to be processed again
+func (q *Queue) requeueNackedItems() error {
+	q.mx.Lock()
+	defer q.mx.Unlock()
+
+	select {
+	case <-q.ctx.Done():
+		log.Println("queue closed, cannot requeue idle items")
+		return fmt.Errorf("queue closed")
+	default:
+		// Get all pending items
+		pendingItems, err := q.client.HGetAll(q.ctx, q.getNackedItemKey()).Result()
+		if err != nil {
+			log.Printf("Error getting pending items: %v", err)
+			return fmt.Errorf("error getting pending items: %v", err)
+		}
+
+		for ackID, item := range pendingItems {
+			// Move from pending back to the main queue at the front
+			// Using LPush to maintain FIFO ordering and prioritize previously timed-out items
+			pipe := q.client.Pipeline()
+			pipe.HDel(q.ctx, q.getNackedItemKey(), ackID)
+			pipe.LPush(q.ctx, q.queueKey, item)
+
+			if _, err := pipe.Exec(q.ctx); err != nil {
+				log.Printf("Error requeueing idle item: %v", err)
+				continue
+			}
+		}
+
+		return nil
+	}
+}
+
+// GetNackedItemsCount returns the number of items in the nacked list
+func (q *Queue) GetNackedItemsCount() int {
+	q.mx.Lock()
+	defer q.mx.Unlock()
+
+	count, err := q.client.HLen(q.ctx, q.getNackedItemKey()).Result()
+	if err != nil {
+		return 0
+	}
+	return int(count)
+}
+
+// getNackedItemKey returns the Redis key for the nacked items list
+func (q *Queue) getNackedItemKey() string {
+	return q.queueKey + ":nacked"
 }
 
 func (q *Queue) Close() error {
