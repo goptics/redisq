@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2025-04-24
+
+### Added
+
+- Acknowledgment system for reliable queue processing:
+  - `PrepareForFutureAck` - Add items to a separate pending hash with acknowledgment ID
+  - `Acknowledge` - Confirm successful processing of items
+  - `RequeueNackedItems` - Move unacknowledged items back to front of queue (FIFO)
+  - `SetAckTimeout` - Configure timeout for acknowledgment processing
+  - `GetNackedItemsCount` - Retrieve count of pending items awaiting acknowledgment
+- Updated documentation with acknowledgment feature examples
+
+### Changed
+
+- Made `RequeueNackedItems` method public for manual requeuing of unacknowledged items
+- Enhanced queue system attempt to requeue unacknowledged items
+- Improved thread safety for high concurrency acknowledgment processing
+
 ## [1.0.0] - 2025-03-25
 
 ### Added
