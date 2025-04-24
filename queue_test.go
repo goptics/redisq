@@ -255,13 +255,13 @@ func TestRequeueNackedItems(t *testing.T) {
 	// First add items to the main queue
 	q.Enqueue("item-1")
 	q.Enqueue("item-2")
-	
+
 	// Dequeue them and prepare for acknowledgment
 	item1, ok := q.Dequeue()
 	assert.True(t, ok, "First dequeue should succeed")
 	item2, ok := q.Dequeue()
 	assert.True(t, ok, "Second dequeue should succeed")
-	
+
 	// Prepare for acknowledgment
 	err := q.PrepareForAck("ack-1", item1)
 	assert.NoError(t, err, "PrepareForAck should succeed for item1")
@@ -270,14 +270,14 @@ func TestRequeueNackedItems(t *testing.T) {
 
 	// Verify main queue is empty
 	assert.Equal(t, 0, q.Len(), "Main queue should be empty")
-	
+
 	// Verify items are in the nacked list
 	count := q.GetNackedItemsCount()
 	assert.Equal(t, 2, count, "Should have 2 items in nacked list")
 
 	// Set a longer ack timeout (Redis minimum is 1s)
 	q.SetAckTimeout(1 * time.Second)
-	
+
 	// Wait for timeout to expire (wait a bit longer than the timeout)
 	time.Sleep(1500 * time.Millisecond)
 
@@ -286,7 +286,7 @@ func TestRequeueNackedItems(t *testing.T) {
 		*Queue
 	}
 	tq := testQueue{Queue: q}
-	
+
 	// Requeue the nacked items
 	err = tq.requeueNackedItems()
 	assert.NoError(t, err, "requeueNackedItems should succeed")
@@ -302,10 +302,10 @@ func TestRequeueNackedItems(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		item, ok := q.Dequeue()
 		assert.True(t, ok, fmt.Sprintf("Dequeue %d should succeed after requeue", i+1))
-		
+
 		bytes, ok := item.([]byte)
 		assert.True(t, ok, fmt.Sprintf("Dequeued item %d should be []byte", i+1))
-		
+
 		// Convert to string for comparison
 		strItem := string(bytes)
 		assert.Contains(t, []string{"item-1", "item-2"}, strItem,
@@ -327,7 +327,7 @@ func TestAcknowledgmentConcurrency(t *testing.T) {
 	const numWorkers = 5
 	const itemsPerWorker = 20
 	// Fill queue with items
-	for i := 0; i < numWorkers*itemsPerWorker; i++ {
+	for i := range numWorkers * itemsPerWorker {
 		assert.True(t, q.Enqueue(fmt.Sprintf("item-%d", i)), "Enqueue should succeed")
 	}
 
@@ -335,11 +335,11 @@ func TestAcknowledgmentConcurrency(t *testing.T) {
 	wg.Add(numWorkers)
 
 	// Launch concurrent workers to process items with acknowledgment
-	for w := 0; w < numWorkers; w++ {
+	for w := range numWorkers {
 		go func(workerID int) {
 			defer wg.Done()
 
-			for j := 0; j < itemsPerWorker; j++ {
+			for j := range itemsPerWorker {
 				// Dequeue item
 				item, ok := q.Dequeue()
 				if !ok {

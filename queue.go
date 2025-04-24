@@ -31,8 +31,10 @@ func newQueue(c *redis.Client, queueKey string) *Queue {
 		ctx:      ctx,
 		cancel:   cancel,
 	}
-	// Start a goroutine to requeue nacked items
-	go q.requeueNackedItems()
+
+	// requeue nacked items
+	q.requeueNackedItems()
+
 	return q
 }
 
@@ -201,7 +203,7 @@ func (q *Queue) Acknowledge(ackID string) bool {
 	}
 }
 
-// RequeueIdleItems checks for idle items in the pending list
+// requeueNackedItems checks for un-acknowledged items in the nacked list
 // and returns them to the main queue to be processed again
 func (q *Queue) requeueNackedItems() error {
 	q.mx.Lock()
