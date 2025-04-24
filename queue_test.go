@@ -202,21 +202,21 @@ func TestQueueClose(t *testing.T) {
 	_, ok := q.Dequeue()
 	assert.False(t, ok, "Dequeue should fail after close")
 
-	assert.Error(t, q.PrepareForAck("test-ack", "test"), "PrepareForAck should fail after close")
+	assert.Error(t, q.PrepareForFutureAck("test-ack", "test"), "PrepareForFutureAck should fail after close")
 	assert.False(t, q.Acknowledge("test-ack"), "Acknowledge should fail after close")
 }
 
-func TestPrepareForAck(t *testing.T) {
+func TestPrepareForFutureAck(t *testing.T) {
 	q, cleanup := setupTestQueue(t)
 	defer cleanup()
 
 	// Test with string item
-	err := q.PrepareForAck("ack-1", "test-item")
-	assert.NoError(t, err, "PrepareForAck should succeed with string")
+	err := q.PrepareForFutureAck("ack-1", "test-item")
+	assert.NoError(t, err, "PrepareForFutureAck should succeed with string")
 
 	// Test with byte array
-	err = q.PrepareForAck("ack-2", []byte("test-bytes"))
-	assert.NoError(t, err, "PrepareForAck should succeed with bytes")
+	err = q.PrepareForFutureAck("ack-2", []byte("test-bytes"))
+	assert.NoError(t, err, "PrepareForFutureAck should succeed with bytes")
 
 	// Verify items are in the nacked items list
 	count := q.GetNackedItemsCount()
@@ -228,8 +228,8 @@ func TestAcknowledge(t *testing.T) {
 	defer cleanup()
 
 	// Add an item to acknowledge
-	err := q.PrepareForAck("ack-id", "test-item")
-	assert.NoError(t, err, "PrepareForAck should succeed")
+	err := q.PrepareForFutureAck("ack-id", "test-item")
+	assert.NoError(t, err, "PrepareForFutureAck should succeed")
 
 	// Verify item is in the pending list
 	count := q.GetNackedItemsCount()
@@ -263,10 +263,10 @@ func TestRequeueNackedItems(t *testing.T) {
 	assert.True(t, ok, "Second dequeue should succeed")
 
 	// Prepare for acknowledgment
-	err := q.PrepareForAck("ack-1", item1)
-	assert.NoError(t, err, "PrepareForAck should succeed for item1")
-	err = q.PrepareForAck("ack-2", item2)
-	assert.NoError(t, err, "PrepareForAck should succeed for item2")
+	err := q.PrepareForFutureAck("ack-1", item1)
+	assert.NoError(t, err, "PrepareForFutureAck should succeed for item1")
+	err = q.PrepareForFutureAck("ack-2", item2)
+	assert.NoError(t, err, "PrepareForFutureAck should succeed for item2")
 
 	// Verify main queue is empty
 	assert.Equal(t, 0, q.Len(), "Main queue should be empty")
@@ -299,7 +299,7 @@ func TestRequeueNackedItems(t *testing.T) {
 	assert.Equal(t, 2, mainQueueCount, "Should have 2 items in main queue after requeue")
 
 	// Verify we can dequeue the items again
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		item, ok := q.Dequeue()
 		assert.True(t, ok, fmt.Sprintf("Dequeue %d should succeed after requeue", i+1))
 
@@ -350,11 +350,8 @@ func TestAcknowledgmentConcurrency(t *testing.T) {
 				ackID := fmt.Sprintf("worker-%d-item-%d", workerID, j)
 
 				// Prepare for acknowledgment
-				err := q.PrepareForAck(ackID, item)
-				assert.NoError(t, err, "PrepareForAck should succeed")
-
-				// Simulate processing time
-				time.Sleep(50 * time.Millisecond)
+				err := q.PrepareForFutureAck(ackID, item)
+				assert.NoError(t, err, "PrepareForFutureAck should succeed")
 
 				// Acknowledge successful processing
 				assert.True(t, q.Acknowledge(ackID), "Acknowledge should succeed")

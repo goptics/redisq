@@ -158,9 +158,9 @@ func (q *Queue) Values() []any {
 	return values
 }
 
-// PrepareForAck adds an item to the pending list for acknowledgment tracking
+// PrepareForFutureAck adds an item to the pending list for acknowledgment tracking
 // Returns an error if the operation fails
-func (q *Queue) PrepareForAck(ackID string, item any) error {
+func (q *Queue) PrepareForFutureAck(ackID string, item any) error {
 	q.mx.Lock()
 	defer q.mx.Unlock()
 
