@@ -33,7 +33,7 @@ func newQueue(c *redis.Client, queueKey string) *Queue {
 	}
 
 	// requeue nacked items
-	q.requeueNackedItems()
+	q.RequeueNackedItems()
 
 	return q
 }
@@ -205,7 +205,7 @@ func (q *Queue) Acknowledge(ackID string) bool {
 
 // requeueNackedItems checks for un-acknowledged items in the nacked list
 // and returns them to the main queue to be processed again
-func (q *Queue) requeueNackedItems() error {
+func (q *Queue) RequeueNackedItems() error {
 	q.mx.Lock()
 	defer q.mx.Unlock()
 

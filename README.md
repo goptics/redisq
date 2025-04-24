@@ -137,6 +137,42 @@ data, ok := dq.Dequeue()
 dq.Stop()
 ```
 
+### Queue with Acknowledgment (Reliable Processing)
+
+```go
+// Create a queue with acknowledgment support
+queue := qs.NewQueue("ack-queue")
+
+// Set acknowledgment timeout (how long before unacknowledged items are requeued)
+queue.SetAckTimeout(time.Minute * 5)
+
+// Dequeue an item with a unique acknowledgment ID
+ackID := "job-123"
+item, ok := queue.Dequeue()
+if ok {
+    // Process the item
+    processItem(item)
+
+    // Mark the item as successfully processed
+    queue.Acknowledge(ackID)
+}
+
+// For manual control of the acknowledgment process:
+// 1. Prepare an item for future acknowledgment
+ackID := "job-456"
+data := "important job"
+err := queue.PrepareForFutureAck(ackID, data)
+
+// 2. Acknowledge the item after processing
+success := queue.Acknowledge(ackID)
+
+// You can trigger requeue of all unacknowledged items
+queue.RequeueNackedItems()
+
+// 4. Get count of pending unacknowledged items
+pendingCount := queue.GetNackedItemsCount()
+```
+
 ## Configuration
 
 If you have docker installed just do the following:

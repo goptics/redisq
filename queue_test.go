@@ -281,15 +281,15 @@ func TestRequeueNackedItems(t *testing.T) {
 	// Wait for timeout to expire (wait a bit longer than the timeout)
 	time.Sleep(1500 * time.Millisecond)
 
-	// Manually call requeueNackedItems for testing
+	// Manually call RequeueNackedItems for testing
 	type testQueue struct {
 		*Queue
 	}
 	tq := testQueue{Queue: q}
 
 	// Requeue the nacked items
-	err = tq.requeueNackedItems()
-	assert.NoError(t, err, "requeueNackedItems should succeed")
+	err = tq.RequeueNackedItems()
+	assert.NoError(t, err, "RequeueNackedItems should succeed")
 
 	// Verify items were moved from nacked list to main queue
 	nackedCount := q.GetNackedItemsCount()
