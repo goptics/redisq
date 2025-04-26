@@ -95,13 +95,11 @@ data, ok := pq.Dequeue() // Returns "high priority"
 // Create a distributed priority queue
 dpq := qs.NewDistributedPriorityQueue("distributed-priority-queue")
 
-// Subscribe to notifications
-dpq.Subscribe(func(action string, message []byte) {
-    fmt.Printf("Action: %s, Message: %s\n", action, string(message))
+// Subscribe to notifications for queue and dequeue events
+dpq.Subscribe(func(action string) {
+    fmt.Printf("Action: %s\n", action)
 })
 
-// Start listening for notifications
-dpq.Start()
 
 // Enqueue with priority will trigger "enqueued" notification
 dpq.Enqueue("important message", 1)
@@ -109,8 +107,6 @@ dpq.Enqueue("important message", 1)
 // Dequeue will trigger "dequeued" notification
 data, ok := dpq.Dequeue()
 
-// Stop notifications
-dpq.Stop()
 ```
 
 ### Distributed Queue with Notifications
@@ -119,22 +115,16 @@ dpq.Stop()
 // Create a distributed queue
 dq := qs.NewDistributedQueue("distributed-queue")
 
-// Subscribe to notifications
-dq.Subscribe(func(action string, message []byte) {
-    fmt.Printf("Action: %s, Message: %s\n", action, string(message))
+// Subscribe to notifications for queue and dequeue events
+dq.Subscribe(func(action string) {
+    fmt.Printf("Action: %s\n", action)
 })
-
-// Start listening for notifications
-dq.Start()
 
 // Enqueue will trigger "enqueued" notification
 dq.Enqueue("test message")
 
 // Dequeue will trigger "dequeued" notification
 data, ok := dq.Dequeue()
-
-// Stop notifications
-dq.Stop()
 ```
 
 ### Queue with Acknowledgment (Reliable Processing)
