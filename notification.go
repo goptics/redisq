@@ -12,7 +12,7 @@ type Notification struct {
 	client      *redis.Client
 	pubsub      *redis.PubSub
 	key         string
-	subscribers []func(action string, message []byte)
+	subscribers []func(action string)
 	mx          sync.RWMutex
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -27,7 +27,7 @@ func newNotification(client *redis.Client, key string) *Notification {
 		pubsub:      client.Subscribe(ctx, notificationKey),
 		cancel:      cancel,
 		key:         notificationKey,
-		subscribers: make([]func(action string, message []byte), 0),
+		subscribers: make([]func(action string), 0),
 		ctx:         ctx,
 	}
 }
@@ -47,28 +47,20 @@ func (n *Notification) broadcast(msg string) {
 	n.mx.RLock()
 	defer n.mx.RUnlock()
 
-	event, err := parseToEvent([]byte(msg))
-	if err != nil {
-		log.Printf("Error parsing event: %v", err)
-		return
-	}
-
 	for _, subscriber := range n.subscribers {
-		subscriber(event.Action, event.Message)
+		subscriber(msg)
 	}
 }
 
-func (n *Notification) Subscribe(handler func(action string, message []byte)) {
+func (n *Notification) Subscribe(handler func(action string)) {
 	n.mx.Lock()
+	defer n.mx.Unlock()
+
 	n.subscribers = append(n.subscribers, handler)
-	n.mx.Unlock()
 }
 
-func (n *Notification) Send(action string, message []byte) {
-	e := event{Action: action, Message: message}
-	bytes, _ := e.Json()
-
-	if err := n.client.Publish(n.ctx, n.key, bytes).Err(); err != nil {
+func (n *Notification) Send(action string) {
+	if err := n.client.Publish(n.ctx, n.key, action).Err(); err != nil {
 		log.Printf("Error publishing notification: %v", err)
 	}
 }

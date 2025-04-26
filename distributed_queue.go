@@ -18,18 +18,20 @@ func newDistributedQueue(client *redis.Client, queueKey string) *DistributedQueu
 }
 
 func (q *DistributedQueue) Enqueue(item any) bool {
-	if message, err := q.toBytes(item); err == nil {
-		defer q.Send("enqueued", message)
+	ok := q.Queue.Enqueue(item)
+
+	if ok {
+		defer q.Send("enqueued")
 	}
 
-	return q.Queue.Enqueue(item)
+	return ok
 }
 
 func (q *DistributedQueue) Dequeue() (any, bool) {
 	item, ok := q.Queue.Dequeue()
 
 	if ok {
-		defer q.Send("dequeued", item.([]byte))
+		defer q.Send("dequeued")
 	}
 
 	return item, ok

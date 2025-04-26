@@ -41,7 +41,7 @@ func TestDistributedQueueEnqueueDequeue(t *testing.T) {
 	defer cleanup()
 
 	notifications := make(chan string, 2)
-	q.Subscribe(func(action string, message []byte) {
+	q.Subscribe(func(action string) {
 		notifications <- action
 	})
 	q.Start()
@@ -76,7 +76,7 @@ func TestDistributedQueueConcurrency(t *testing.T) {
 	const numOperations = 100
 
 	notifications := make(chan string, numGoroutines*numOperations*2) // *2 for enqueue and dequeue
-	q.Subscribe(func(action string, message []byte) {
+	q.Subscribe(func(action string) {
 		notifications <- action
 	})
 	q.Start()

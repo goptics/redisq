@@ -102,9 +102,6 @@ func TestPriorityQueueRemove(t *testing.T) {
 	// Verify queue length decreased by 1
 	assert.Equal(t, len(items)-1, pq.Len())
 
-	// Check that item2 is no longer in the queue
-	assert.Len(t, pq.Len(), len(items)-1)
-
 	// Verify remaining items
 	var foundItem2 bool
 	for _, val := range pq.Values() {

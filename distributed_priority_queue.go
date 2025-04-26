@@ -18,9 +18,7 @@ func newDistributedPriorityQueue(client *redis.Client, queueKey string) *Distrib
 }
 
 func (q *DistributedPriorityQueue) Enqueue(item any, priority int) bool {
-	if message, err := q.toBytes(item); err == nil {
-		defer q.Send("enqueued", message)
-	}
+	defer q.Send("enqueued")
 
 	return q.PriorityQueue.Enqueue(item, priority)
 }
@@ -29,7 +27,7 @@ func (q *DistributedPriorityQueue) Dequeue() (any, bool) {
 	item, ok := q.PriorityQueue.Dequeue()
 
 	if ok {
-		defer q.Send("dequeued", item.([]byte))
+		defer q.Send("dequeued")
 	}
 
 	return item, ok

@@ -31,18 +31,16 @@ func TestNotificationSubscribe(t *testing.T) {
 
 	received := make(chan struct{})
 	expectedAction := "test_action"
-	expectedMessage := []byte("test message")
 
-	n.Subscribe(func(action string, message []byte) {
+	n.Subscribe(func(action string) {
 		assert.Equal(t, expectedAction, action)
-		assert.Equal(t, expectedMessage, message)
 		received <- struct{}{}
 	})
 
 	n.Start()
 
 	// Send notification
-	n.Send(expectedAction, expectedMessage)
+	n.Send(expectedAction)
 
 	select {
 	case <-received:
@@ -60,7 +58,7 @@ func TestNotificationMultipleSubscribers(t *testing.T) {
 	received := make(chan struct{}, numSubscribers)
 
 	for i := 0; i < numSubscribers; i++ {
-		n.Subscribe(func(action string, message []byte) {
+		n.Subscribe(func(action string) {
 			received <- struct{}{}
 		})
 	}
@@ -68,7 +66,7 @@ func TestNotificationMultipleSubscribers(t *testing.T) {
 	n.Start()
 
 	// Send notification
-	n.Send("test", []byte("test"))
+	n.Send("test")
 
 	// Wait for all subscribers
 	for i := 0; i < numSubscribers; i++ {
@@ -86,7 +84,7 @@ func TestNotificationStop(t *testing.T) {
 	defer cleanup()
 
 	received := make(chan struct{})
-	n.Subscribe(func(action string, message []byte) {
+	n.Subscribe(func(action string) {
 		received <- struct{}{}
 	})
 
@@ -94,7 +92,7 @@ func TestNotificationStop(t *testing.T) {
 	n.Stop()
 
 	// Send notification after stop
-	n.Send("test", []byte("test"))
+	n.Send("test")
 
 	select {
 	case <-received:

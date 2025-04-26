@@ -396,9 +396,6 @@ func TestQueueRemove(t *testing.T) {
 	// Verify queue length decreased by 1
 	assert.Equal(t, len(testItems)-1, q.Len(), "Queue length should decrease after removal")
 
-	// Check that item2 is no longer in the queue
-	assert.Len(t, q.Len(), len(testItems)-1, "One item should be removed from values")
-
 	// Verify item2 is not in the remaining items
 	var foundItem2 bool
 	for _, val := range q.Values() {

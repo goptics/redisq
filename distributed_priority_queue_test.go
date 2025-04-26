@@ -35,7 +35,7 @@ func TestDistributedPriorityQueue(t *testing.T) {
 		defer cleanup()
 
 		notifications := make(chan string, 2)
-		q.Subscribe(func(action string, message []byte) {
+		q.Subscribe(func(action string) {
 			notifications <- action
 		})
 		q.Start()
@@ -93,7 +93,7 @@ func TestDistributedPriorityQueue(t *testing.T) {
 		)
 
 		notifications := make(chan string, totalOperations*2) // *2 for enqueue and dequeue
-		q.Subscribe(func(action string, message []byte) {
+		q.Subscribe(func(action string) {
 			notifications <- action
 		})
 		q.Start()
