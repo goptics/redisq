@@ -85,6 +85,15 @@ func (pq *PriorityQueue) Len() int {
 	return int(length)
 }
 
+func (pq *PriorityQueue) Remove(item any) bool {
+	pq.mx.Lock()
+	defer pq.mx.Unlock()
+
+	_, err := pq.client.ZRem(pq.ctx, pq.queueKey, item).Result()
+
+	return err == nil
+}
+
 // Values returns all items in the priority queue ordered by priority (highest to lowest)
 func (pq *PriorityQueue) Values() []any {
 	pq.mx.Lock()

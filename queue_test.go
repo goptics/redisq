@@ -366,3 +366,52 @@ func TestAcknowledgmentConcurrency(t *testing.T) {
 	assert.Equal(t, 0, q.Len(), "Main queue should be empty")
 	assert.Equal(t, 0, q.GetNackedItemsCount(), "Nacked list should be empty")
 }
+
+func TestQueueRemove(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// Test items
+	testItems := []string{"item1", "item2", "item3"}
+
+	// Enqueue items
+	for _, item := range testItems {
+		assert.True(t, q.Enqueue(item), "Enqueue should succeed")
+	}
+
+	// Verify initial queue length
+	assert.Equal(t, len(testItems), q.Len(), "Queue length should match")
+
+	// Get values to find the serialized version of item2
+	values := q.Values()
+	assert.Len(t, values, len(testItems), "Values should return all items")
+
+	item2Bytes := []byte(testItems[1])
+
+	require.NotNil(t, item2Bytes, "Failed to find item2 in queue values")
+
+	// Remove item2 from the queue
+	assert.True(t, q.Remove(item2Bytes), "Remove should succeed")
+
+	// Verify queue length decreased by 1
+	assert.Equal(t, len(testItems)-1, q.Len(), "Queue length should decrease after removal")
+
+	// Check that item2 is no longer in the queue
+	assert.Len(t, q.Len(), len(testItems)-1, "One item should be removed from values")
+
+	// Verify item2 is not in the remaining items
+	var foundItem2 bool
+	for _, val := range q.Values() {
+		if string(val.([]byte)) == "item2" {
+			foundItem2 = true
+			break
+		}
+	}
+	assert.False(t, foundItem2, "item2 should have been removed from the queue")
+
+	// Attempt to remove an item that doesn't exist
+	assert.True(t, q.Remove([]byte("nonexistent-item")), "Remove should return true even for non-existent items")
+
+	// Verify queue length hasn't changed
+	assert.Equal(t, len(testItems)-1, q.Len(), "Queue length should not change when removing non-existent item")
+}

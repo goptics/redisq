@@ -260,6 +260,15 @@ func (q *Queue) Close() error {
 	return nil
 }
 
+func (q *Queue) Remove(item any) bool {
+	q.mx.Lock()
+	defer q.mx.Unlock()
+
+	_, err := q.client.LRem(q.ctx, q.queueKey, 1, item).Result()
+
+	return err == nil
+}
+
 func (q *Queue) Listen() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)

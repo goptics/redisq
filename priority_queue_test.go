@@ -69,6 +69,59 @@ func TestPriorityQueueValues(t *testing.T) {
 	}
 }
 
+func TestPriorityQueueRemove(t *testing.T) {
+	pq, cleanup := setupTestPriorityQueue(t)
+	defer cleanup()
+
+	// Test items with different priorities
+	items := []struct {
+		value    string
+		priority int
+	}{
+		{"item1", 1},
+		{"item2", 2},
+		{"item3", 3},
+	}
+
+	// Enqueue items
+	for _, item := range items {
+		assert.True(t, pq.Enqueue(item.value, item.priority))
+	}
+
+	// Verify initial queue length
+	assert.Equal(t, len(items), pq.Len())
+
+	// Get values to find the serialized version of item2
+	item2Bytes := []byte(items[1].value)
+
+	require.NotNil(t, item2Bytes, "Failed to find item2 in queue values")
+
+	// Remove item2 from the queue
+	assert.True(t, pq.Remove(item2Bytes))
+
+	// Verify queue length decreased by 1
+	assert.Equal(t, len(items)-1, pq.Len())
+
+	// Check that item2 is no longer in the queue
+	assert.Len(t, pq.Len(), len(items)-1)
+
+	// Verify remaining items
+	var foundItem2 bool
+	for _, val := range pq.Values() {
+		if string(val.([]byte)) == "item2" {
+			foundItem2 = true
+			break
+		}
+	}
+	assert.False(t, foundItem2, "item2 should have been removed from the queue")
+
+	// Attempt to remove an item that doesn't exist
+	assert.True(t, pq.Remove("nonexistent-item"), "Remove should return true even for non-existent items")
+
+	// Verify queue length hasn't changed
+	assert.Equal(t, len(items)-1, pq.Len())
+}
+
 func setupTestPriorityQueue(t *testing.T) (*PriorityQueue, func()) {
 	redisURL := getTestRedisURL()
 	qs := New(redisURL)
