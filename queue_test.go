@@ -412,3 +412,66 @@ func TestQueueRemove(t *testing.T) {
 	// Verify queue length hasn't changed
 	assert.Equal(t, len(testItems)-1, q.Len(), "Queue length should not change when removing non-existent item")
 }
+
+func TestDequeueWithAckId(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// Test with empty queue
+	item, ok, ackID := q.DequeueWithAckId()
+	assert.Nil(t, item, "Item should be nil when queue is empty")
+	assert.False(t, ok, "ok should be false when queue is empty")
+	assert.Equal(t, "", ackID, "ackID should be empty when queue is empty")
+
+	// Add items to the queue
+	testItem := "test-item-for-ack"
+	assert.True(t, q.Enqueue(testItem), "Enqueue should succeed")
+
+	// Dequeue with acknowledgment
+	dequeuedItem, ok, ackID := q.DequeueWithAckId()
+	assert.True(t, ok, "Dequeue should succeed")
+	
+	// Check if the item is a byte slice, which is the expected behavior 
+	// when Redis deserializes the data
+	if byteItem, isByteSlice := dequeuedItem.([]byte); isByteSlice {
+		assert.Equal(t, testItem, string(byteItem), "Dequeued item should match enqueued item when converted to string")
+	} else {
+		assert.Equal(t, testItem, dequeuedItem, "Dequeued item should match enqueued item")
+	}
+	
+	assert.NotEmpty(t, ackID, "Should generate a non-empty ackID")
+
+	// Verify queue is now empty
+	assert.Equal(t, 0, q.Len(), "Queue should be empty after dequeue")
+
+	// Verify item is in the nacked items list
+	count := q.GetNackedItemsCount()
+	assert.Equal(t, 1, count, "Should have 1 item in nacked list")
+
+	// Acknowledge the item
+	result := q.Acknowledge(ackID)
+	assert.True(t, result, "Acknowledge should succeed")
+
+	// Verify item is removed from nacked list
+	count = q.GetNackedItemsCount()
+	assert.Equal(t, 0, count, "Should have 0 items in nacked list after acknowledgment")
+
+	// Test error handling during acknowledgment preparation
+	// Close the queue to force an error in PrepareForFutureAck
+	q.Close()
+
+	// Try to dequeue with acknowledgment when queue is closed
+	// First, we need to add an item to the queue for testing
+	// Create a new queue since the previous one is closed
+	q2, cleanup2 := setupTestQueue(t)
+	defer cleanup2()
+
+	assert.True(t, q2.Enqueue(testItem), "Enqueue should succeed")
+
+	// Now close the queue before attempting DequeueWithAckId
+	q2.Close()
+
+	// This should fail because the queue is closed
+	_, ok, _ = q2.DequeueWithAckId()
+	assert.False(t, ok, "DequeueWithAckId should fail when queue is closed")
+}

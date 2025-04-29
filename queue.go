@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/lucsky/cuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -201,6 +202,25 @@ func (q *Queue) Acknowledge(ackID string) bool {
 		}
 		return true
 	}
+}
+
+func (q *Queue) DequeueWithAckId() (any, bool, string) {
+	v, ok := q.Dequeue()
+
+	if !ok {
+		return nil, false, ""
+	}
+
+	// Prepare for acknowledgment
+	ackID := cuid.New()
+	err := q.PrepareForFutureAck(ackID, v)
+
+	if err != nil {
+		log.Printf("Error preparing for acknowledgment: %v", err)
+		return nil, false, ""
+	}
+
+	return v, true, ackID
 }
 
 // requeueNackedItems checks for un-acknowledged items in the nacked list
