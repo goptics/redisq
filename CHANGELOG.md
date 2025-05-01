@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2025-05-01
+
+### Changed
+
+- Moved repository from fahimfaisaal to goptics organization
+
 ## [1.3.0] - 2025-04-30
 
 ### Added
@@ -90,8 +96,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Graceful handling of Redis connection errors
 - Proper cleanup of resources on shutdown
 
-[1.0.0]: https://github.com/fahimfaisaal/redisq/compare/v0.1.0...v1.0.0
-[0.1.0]: https://github.com/fahimfaisaal/redisq/releases/tag/v0.1.0
-[1.1.0]: https://github.com/fahimfaisaal/redisq/compare/v1.0.0...v1.1.0
-[1.2.0]: https://github.com/fahimfaisaal/redisq/compare/v1.1.0...v1.2.0
-[1.3.0]: https://github.com/fahimfaisaal/redisq/compare/v1.2.0...v1.3.0
+[1.0.0]: https://github.com/goptics/redisq/compare/v0.1.0...v1.0.0
+[0.1.0]: https://github.com/goptics/redisq/releases/tag/v0.1.0
+[1.1.0]: https://github.com/goptics/redisq/compare/v1.0.0...v1.1.0
+[1.2.0]: https://github.com/goptics/redisq/compare/v1.1.0...v1.2.0
+[1.3.0]: https://github.com/goptics/redisq/compare/v1.2.0...v1.3.0
+[1.3.1]: https://github.com/goptics/redisq/compare/v1.3.0...v1.3.1
