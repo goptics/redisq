@@ -1,4 +1,4 @@
-module github.com/fahimfaisaal/redisq
+module github.com/goptics/redisq
 
 go 1.24.1
 

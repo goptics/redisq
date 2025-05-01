@@ -1,10 +1,10 @@
 # Redisq
 
-[![Go Reference](https://img.shields.io/badge/go-pkg-00ADD8.svg?logo=go)](https://pkg.go.dev/github.com/fahimfaisaal/redisq)
-[![Go Report Card](https://goreportcard.com/badge/github.com/fahimfaisaal/redisq)](https://goreportcard.com/report/github.com/fahimfaisaal/redisq)
+[![Go Reference](https://img.shields.io/badge/go-pkg-00ADD8.svg?logo=go)](https://pkg.go.dev/github.com/goptics/redisq)
+[![Go Report Card](https://goreportcard.com/badge/github.com/goptics/redisq)](https://goreportcard.com/report/github.com/goptics/redisq)
 [![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat-square&logo=go)](https://golang.org/doc/devel/release.html)
-[![CI](https://github.com/fahimfaisaal/redisq/actions/workflows/redisq.yml/badge.svg)](https://github.com/fahimfaisaal/redisq/actions/workflows/go.yml)
-[![codecov](https://codecov.io/gh/fahimfaisaal/redisq/branch/main/graph/badge.svg)](https://codecov.io/gh/fahimfaisaal/redisq)
+[![CI](https://github.com/goptics/redisq/actions/workflows/redisq.yml/badge.svg)](https://github.com/goptics/redisq/actions/workflows/go.yml)
+[![codecov](https://codecov.io/gh/goptics/redisq/branch/main/graph/badge.svg)](https://codecov.io/gh/goptics/redisq)
 
 A lightweight, thread-safe Redis-backed queue implementation in Go with support for distributed notifications and priority queuing.
 
@@ -21,13 +21,13 @@ A lightweight, thread-safe Redis-backed queue implementation in Go with support 
 ## Installation
 
 ```bash
-go get github.com/fahimfaisaal/redisq
+go get github.com/goptics/redisq
 ```
 
 ## Quick Start
 
 ```go
-import "github.com/fahimfaisaal/redisq"
+import "github.com/goptics/redisq"
 
 func main() {
     // Initialize queue system
@@ -195,9 +195,9 @@ go test -race -v ./...
 
 ## 👤 Author
 
-- GitHub: [@fahimfaisaal](https://github.com/fahimfaisaal)
-- LinkedIn: [in/fahimfaisaal](https://www.linkedin.com/in/fahimfaisaal/)
-- Twitter: [@FahimFaisaal](https://twitter.com/FahimFaisaal)
+- GitHub: [@goptics](https://github.com/goptics)
+- LinkedIn: [in/goptics](https://www.linkedin.com/in/goptics/)
+- Twitter: [@goptics](https://twitter.com/goptics)
 
 ## License
 

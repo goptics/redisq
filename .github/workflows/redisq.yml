@@ -52,6 +52,6 @@ jobs:
 
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          slug: fahimfaisaal/redisq
+          slug: goptics/redisq
           files: ./coverage.txt
           verbose: true
