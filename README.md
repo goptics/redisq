@@ -195,9 +195,9 @@ go test -race -v ./...
 
 ## 👤 Author
 
-- GitHub: [@goptics](https://github.com/goptics)
-- LinkedIn: [in/goptics](https://www.linkedin.com/in/goptics/)
-- Twitter: [@goptics](https://twitter.com/goptics)
+- GitHub: [@fahimfaisaal](https://github.com/fahimfaisaal)
+- LinkedIn: [in/fahimfaisaal](https://www.linkedin.com/in/fahimfaisaal/)
+- Twitter: [@FahimFaisaal](https://twitter.com/FahimFaisaal)
 
 ## License
 
