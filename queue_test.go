@@ -430,15 +430,15 @@ func TestDequeueWithAckId(t *testing.T) {
 	// Dequeue with acknowledgment
 	dequeuedItem, ok, ackID := q.DequeueWithAckId()
 	assert.True(t, ok, "Dequeue should succeed")
-	
-	// Check if the item is a byte slice, which is the expected behavior 
+
+	// Check if the item is a byte slice, which is the expected behavior
 	// when Redis deserializes the data
 	if byteItem, isByteSlice := dequeuedItem.([]byte); isByteSlice {
 		assert.Equal(t, testItem, string(byteItem), "Dequeued item should match enqueued item when converted to string")
 	} else {
 		assert.Equal(t, testItem, dequeuedItem, "Dequeued item should match enqueued item")
 	}
-	
+
 	assert.NotEmpty(t, ackID, "Should generate a non-empty ackID")
 
 	// Verify queue is now empty
