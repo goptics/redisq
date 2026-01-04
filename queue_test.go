@@ -64,6 +64,7 @@ func TestNewQueue(t *testing.T) {
 
 	assert.Equal(t, testQueueKey, q.queueKey, "Queue key should match")
 	assert.NotNil(t, q.client, "Redis client should not be nil")
+	assert.Equal(t, 5*time.Minute, q.visibilityTimeout, "Default visibility timeout should be 5 minutes")
 }
 
 func TestEnqueueDequeue(t *testing.T) {
@@ -474,4 +475,58 @@ func TestDequeueWithAckId(t *testing.T) {
 	// This should fail because the queue is closed
 	_, ok, _ = q2.DequeueWithAckId()
 	assert.False(t, ok, "DequeueWithAckId should fail when queue is closed")
+}
+
+func TestVisibilityTimeout(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// Set visibility timeout
+	visibilityTimeout := 2 * time.Second
+	q.SetVisibilityTimeout(visibilityTimeout)
+
+	// Enqueue item
+	item := "test-visibility"
+	assert.True(t, q.Enqueue(item), "Enqueue should succeed")
+
+	// Dequeue with AckID
+	dequeuedItem, ok, ackID := q.DequeueWithAckId()
+	assert.True(t, ok, "Dequeue should succeed")
+	if byteItem, isByteSlice := dequeuedItem.([]byte); isByteSlice {
+		assert.Equal(t, item, string(byteItem))
+	} else {
+		assert.Equal(t, item, dequeuedItem)
+	}
+
+	// Verify item is in ZSET with correct score
+	// Check ZSET
+	timeoutKey := q.queueKey + ":timeouts"
+	score, err := q.client.ZScore(context.Background(), timeoutKey, ackID).Result()
+	assert.NoError(t, err, "ZScore should succeed")
+
+	// Score should be roughly now + visibilityTimeout
+	expectedScore := float64(time.Now().Add(visibilityTimeout).Unix())
+	assert.InDelta(t, expectedScore, score, 2.0, "Score should be close to expected execution time")
+
+	// Verify RequeueNackedItems does NOT requeue immediately
+	err = q.RequeueNackedItems()
+	assert.NoError(t, err)
+	assert.Equal(t, 0, q.Len(), "Queue should be empty as timeout hasn't passed")
+
+	// Wait for timeout
+	time.Sleep(visibilityTimeout + 500*time.Millisecond)
+
+	// Verify RequeueNackedItems DOES requeue now
+	err = q.RequeueNackedItems()
+	assert.NoError(t, err)
+	assert.Equal(t, 1, q.Len(), "Queue should have 1 item after timeout")
+
+	// Verify item can be dequeued again
+	dequeuedItem2, ok2, _ := q.DequeueWithAckId()
+	assert.True(t, ok2, "Should be able to dequeue again")
+	if byteItem, isByteSlice := dequeuedItem2.([]byte); isByteSlice {
+		assert.Equal(t, item, string(byteItem))
+	} else {
+		assert.Equal(t, item, dequeuedItem2)
+	}
 }

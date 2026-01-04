@@ -1,8 +1,11 @@
 package redisq
 
 import (
+	"fmt"
 	"log"
+	"time"
 
+	"github.com/lucsky/cuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -11,9 +14,12 @@ type PriorityQueue struct {
 }
 
 func newPriorityQueue(client *redis.Client, queueKey string) *PriorityQueue {
-	return &PriorityQueue{
-		Queue: newQueue(client, queueKey),
+	q := &PriorityQueue{
+		Queue: newQueueBase(client, queueKey),
 	}
+
+	q.RequeueNackedItems()
+	return q
 }
 
 // Enqueue adds an item to the queue with a specified priority
@@ -111,4 +117,110 @@ func (pq *PriorityQueue) Values() []any {
 	}
 
 	return values
+}
+
+func (pq *PriorityQueue) DequeueWithAckId() (any, bool, string) {
+	v, ok := pq.Dequeue()
+
+	if !ok {
+		return nil, false, ""
+	}
+
+	// Prepare for acknowledgment
+	ackID := cuid.New()
+	err := pq.PrepareForFutureAck(ackID, v)
+
+	if err != nil {
+		log.Printf("Error preparing for acknowledgment: %v", err)
+		return nil, false, ""
+	}
+
+	return v, true, ackID
+}
+
+// RequeueNackedItems checks for un-acknowledged items in the nacked list
+// and returns them to the priority queue
+func (pq *PriorityQueue) RequeueNackedItems() error {
+	pq.mx.Lock()
+	defer pq.mx.Unlock()
+
+	select {
+	case <-pq.ctx.Done():
+		log.Println("queue closed, cannot requeue idle items")
+		return fmt.Errorf("queue closed")
+	default:
+		var pendingItems map[string]string
+		var err error
+
+		// If visibility timeout is used, only get expired items
+		if pq.visibilityTimeout > 0 {
+			// Find items with score <= now
+			now := float64(time.Now().Unix())
+			vals, err := pq.client.ZRangeByScore(pq.ctx, pq.getTimeoutKey(), &redis.ZRangeBy{
+				Min: "-inf",
+				Max: fmt.Sprintf("%f", now),
+			}).Result()
+
+			if err != nil {
+				log.Printf("Error getting expired pending items: %v", err)
+				return fmt.Errorf("error getting expired pending items: %v", err)
+			}
+
+			if len(vals) == 0 {
+				return nil
+			}
+
+			if len(vals) > 0 {
+				items, err := pq.client.HMGet(pq.ctx, pq.getNackedItemKey(), vals...).Result()
+				if err != nil {
+					log.Printf("Error fetching values for expired items: %v", err)
+					return err
+				}
+
+				pendingItems = make(map[string]string)
+				for i, id := range vals {
+					if items[i] != nil {
+						switch v := items[i].(type) {
+						case string:
+							pendingItems[id] = v
+						case []byte:
+							pendingItems[id] = string(v)
+						}
+					}
+				}
+			}
+
+		} else {
+			// Old behavior: Get all pending items
+			pendingItems, err = pq.client.HGetAll(pq.ctx, pq.getNackedItemKey()).Result()
+			if err != nil {
+				log.Printf("Error getting pending items: %v", err)
+				return fmt.Errorf("error getting pending items: %v", err)
+			}
+		}
+
+		for ackID, item := range pendingItems {
+			// Move from pending back to the priority queue
+			// Using ZAdd with score 1 (High Priority) to requeue
+			pipe := pq.client.Pipeline()
+			pipe.HDel(pq.ctx, pq.getNackedItemKey(), ackID)
+			if pq.visibilityTimeout > 0 {
+				pipe.ZRem(pq.ctx, pq.getTimeoutKey(), ackID)
+			}
+
+			// We convert the string item back to bytes for storage if needed, but ZAdd takes interface{}
+			// Redis driver handles string/bytes fine.
+			pipe.ZAdd(pq.ctx, pq.queueKey, redis.Z{
+				Score:  1, // Default high priority for requeued items
+				Member: item,
+			})
+
+			if _, err := pipe.Exec(pq.ctx); err != nil {
+				log.Printf("Error requeueing idle item: %v", err)
+				continue
+			}
+		}
+
+		return nil
+	}
 }
