@@ -253,6 +253,9 @@ func TestRequeueNackedItems(t *testing.T) {
 	q, cleanup := setupTestQueue(t)
 	defer cleanup()
 
+	// Set short visibility timeout for testing
+	q.SetVisibilityTimeout(100 * time.Millisecond)
+
 	// First add items to the main queue
 	q.Enqueue("item-1")
 	q.Enqueue("item-2")
