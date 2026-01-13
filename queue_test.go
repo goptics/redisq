@@ -533,3 +533,27 @@ func TestVisibilityTimeout(t *testing.T) {
 		assert.Equal(t, item, dequeuedItem2)
 	}
 }
+
+func TestQueuePurge(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// Add items to the queue
+	testData := []string{"item1", "item2", "item3"}
+	for _, item := range testData {
+		assert.True(t, q.Enqueue(item), "Enqueue should succeed")
+	}
+
+	// Verify items are in the queue
+	assert.Equal(t, len(testData), q.Len(), "Queue should have items")
+
+	// Purge the queue
+	q.Purge()
+
+	// Verify queue is empty
+	assert.Equal(t, 0, q.Len(), "Queue should be empty after purge")
+
+	// Verify dequeue returns nothing
+	_, ok := q.Dequeue()
+	assert.False(t, ok, "Dequeue should return false after purge")
+}
