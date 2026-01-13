@@ -44,10 +44,12 @@ func setupTestQueue(t *testing.T) (*Queue, func()) {
 	// Clear the queue before test
 	require.NoError(t, q.client.Del(ctx, testQueueKey).Err(), "Failed to clear test queue")
 	require.NoError(t, q.client.Del(ctx, q.getNackedItemKey()).Err(), "Failed to clear nacked queue")
+	require.NoError(t, q.client.Del(ctx, q.getTimeoutKey()).Err(), "Failed to clear timeout key")
 
 	cleanup := func() {
 		q.client.Del(ctx, testQueueKey)
 		q.client.Del(ctx, q.getNackedItemKey())
+		q.client.Del(ctx, q.getTimeoutKey())
 		q.Close()
 		qs.Close()
 	}
@@ -222,6 +224,30 @@ func TestPrepareForFutureAck(t *testing.T) {
 	// Verify items are in the nacked items list
 	count := q.GetNackedItemsCount()
 	assert.Equal(t, 2, count, "Should have 2 items in nacked list")
+}
+
+func TestPrepareForFutureAckWithTimeout(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// Set both visibility timeout and ack timeout
+	q.SetVisibilityTimeout(1 * time.Second)
+	q.SetAckTimeout(5 * time.Second)
+
+	// Prepare for ack - this should set expiration on both keys
+	err := q.PrepareForFutureAck("ack-with-timeout", "test-item")
+	assert.NoError(t, err, "PrepareForFutureAck should succeed with timeouts set")
+
+	// Verify item is in the nacked items list
+	count := q.GetNackedItemsCount()
+	assert.Equal(t, 1, count, "Should have 1 item in nacked list")
+
+	// Verify item is also in the timeout ZSET
+	ctx := context.Background()
+	timeoutKey := q.queueKey + ":timeouts"
+	zCount, err := q.client.ZCard(ctx, timeoutKey).Result()
+	assert.NoError(t, err, "ZCard should succeed")
+	assert.Equal(t, int64(1), zCount, "Should have 1 item in timeout ZSET")
 }
 
 func TestAcknowledge(t *testing.T) {

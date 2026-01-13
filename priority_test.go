@@ -353,3 +353,36 @@ func TestPriorityQueueDequeueWithAckIdClosed(t *testing.T) {
 	assert.False(t, ok, "ok should be false when queue is closed")
 	assert.Empty(t, ackID, "ackID should be empty when queue is closed")
 }
+
+func TestPriorityQueueDequeueWithAckIdAndTimeout(t *testing.T) {
+	pq, cleanup := setupTestPriorityQueue(t)
+	defer cleanup()
+
+	// Set both visibility timeout and ack timeout
+	pq.SetVisibilityTimeout(1 * time.Second)
+	pq.SetAckTimeout(5 * time.Second)
+
+	// Enqueue item
+	pq.Enqueue("test-item", 1)
+
+	// Dequeue with ack ID
+	item, ok, ackID := pq.DequeueWithAckId()
+	assert.True(t, ok, "Dequeue should succeed")
+	assert.NotEmpty(t, ackID, "ackID should not be empty")
+
+	if byteItem, isByteSlice := item.([]byte); isByteSlice {
+		assert.Equal(t, "test-item", string(byteItem))
+	}
+
+	// Verify item is in the timeout ZSET
+	ctx := context.Background()
+	timeoutKey := pq.queueKey + ":timeouts"
+	zCount, err := pq.client.ZCard(ctx, timeoutKey).Result()
+	assert.NoError(t, err, "ZCard should succeed")
+	assert.Equal(t, int64(1), zCount, "Should have 1 item in timeout ZSET")
+
+	// Acknowledge and verify cleanup
+	pq.Acknowledge(ackID)
+	zCount, _ = pq.client.ZCard(ctx, timeoutKey).Result()
+	assert.Equal(t, int64(0), zCount, "Timeout ZSET should be empty after ack")
+}
