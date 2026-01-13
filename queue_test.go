@@ -44,10 +44,12 @@ func setupTestQueue(t *testing.T) (*Queue, func()) {
 	// Clear the queue before test
 	require.NoError(t, q.client.Del(ctx, testQueueKey).Err(), "Failed to clear test queue")
 	require.NoError(t, q.client.Del(ctx, q.getNackedItemKey()).Err(), "Failed to clear nacked queue")
+	require.NoError(t, q.client.Del(ctx, q.getTimeoutKey()).Err(), "Failed to clear timeout key")
 
 	cleanup := func() {
 		q.client.Del(ctx, testQueueKey)
 		q.client.Del(ctx, q.getNackedItemKey())
+		q.client.Del(ctx, q.getTimeoutKey())
 		q.Close()
 		qs.Close()
 	}
@@ -64,6 +66,7 @@ func TestNewQueue(t *testing.T) {
 
 	assert.Equal(t, testQueueKey, q.queueKey, "Queue key should match")
 	assert.NotNil(t, q.client, "Redis client should not be nil")
+	assert.Equal(t, 5*time.Minute, q.visibilityTimeout, "Default visibility timeout should be 5 minutes")
 }
 
 func TestEnqueueDequeue(t *testing.T) {
@@ -223,6 +226,30 @@ func TestPrepareForFutureAck(t *testing.T) {
 	assert.Equal(t, 2, count, "Should have 2 items in nacked list")
 }
 
+func TestPrepareForFutureAckWithTimeout(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// Set both visibility timeout and ack timeout
+	q.SetVisibilityTimeout(1 * time.Second)
+	q.SetAckTimeout(5 * time.Second)
+
+	// Prepare for ack - this should set expiration on both keys
+	err := q.PrepareForFutureAck("ack-with-timeout", "test-item")
+	assert.NoError(t, err, "PrepareForFutureAck should succeed with timeouts set")
+
+	// Verify item is in the nacked items list
+	count := q.GetNackedItemsCount()
+	assert.Equal(t, 1, count, "Should have 1 item in nacked list")
+
+	// Verify item is also in the timeout ZSET
+	ctx := context.Background()
+	timeoutKey := q.queueKey + ":timeouts"
+	zCount, err := q.client.ZCard(ctx, timeoutKey).Result()
+	assert.NoError(t, err, "ZCard should succeed")
+	assert.Equal(t, int64(1), zCount, "Should have 1 item in timeout ZSET")
+}
+
 func TestAcknowledge(t *testing.T) {
 	q, cleanup := setupTestQueue(t)
 	defer cleanup()
@@ -251,6 +278,9 @@ func TestAcknowledge(t *testing.T) {
 func TestRequeueNackedItems(t *testing.T) {
 	q, cleanup := setupTestQueue(t)
 	defer cleanup()
+
+	// Set short visibility timeout for testing
+	q.SetVisibilityTimeout(100 * time.Millisecond)
 
 	// First add items to the main queue
 	q.Enqueue("item-1")
@@ -474,4 +504,140 @@ func TestDequeueWithAckId(t *testing.T) {
 	// This should fail because the queue is closed
 	_, ok, _ = q2.DequeueWithAckId()
 	assert.False(t, ok, "DequeueWithAckId should fail when queue is closed")
+}
+
+func TestVisibilityTimeout(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// Set visibility timeout
+	visibilityTimeout := 2 * time.Second
+	q.SetVisibilityTimeout(visibilityTimeout)
+
+	// Enqueue item
+	item := "test-visibility"
+	assert.True(t, q.Enqueue(item), "Enqueue should succeed")
+
+	// Dequeue with AckID
+	dequeuedItem, ok, ackID := q.DequeueWithAckId()
+	assert.True(t, ok, "Dequeue should succeed")
+	if byteItem, isByteSlice := dequeuedItem.([]byte); isByteSlice {
+		assert.Equal(t, item, string(byteItem))
+	} else {
+		assert.Equal(t, item, dequeuedItem)
+	}
+
+	// Verify item is in ZSET with correct score
+	// Check ZSET
+	timeoutKey := q.queueKey + ":timeouts"
+	score, err := q.client.ZScore(context.Background(), timeoutKey, ackID).Result()
+	assert.NoError(t, err, "ZScore should succeed")
+
+	// Score should be roughly now + visibilityTimeout
+	expectedScore := float64(time.Now().Add(visibilityTimeout).Unix())
+	assert.InDelta(t, expectedScore, score, 2.0, "Score should be close to expected execution time")
+
+	// Verify RequeueNackedItems does NOT requeue immediately
+	err = q.RequeueNackedItems()
+	assert.NoError(t, err)
+	assert.Equal(t, 0, q.Len(), "Queue should be empty as timeout hasn't passed")
+
+	// Wait for timeout
+	time.Sleep(visibilityTimeout + 500*time.Millisecond)
+
+	// Verify RequeueNackedItems DOES requeue now
+	err = q.RequeueNackedItems()
+	assert.NoError(t, err)
+	assert.Equal(t, 1, q.Len(), "Queue should have 1 item after timeout")
+
+	// Verify item can be dequeued again
+	dequeuedItem2, ok2, _ := q.DequeueWithAckId()
+	assert.True(t, ok2, "Should be able to dequeue again")
+	if byteItem, isByteSlice := dequeuedItem2.([]byte); isByteSlice {
+		assert.Equal(t, item, string(byteItem))
+	} else {
+		assert.Equal(t, item, dequeuedItem2)
+	}
+}
+
+func TestQueuePurge(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// Add items to the queue
+	testData := []string{"item1", "item2", "item3"}
+	for _, item := range testData {
+		assert.True(t, q.Enqueue(item), "Enqueue should succeed")
+	}
+
+	// Verify items are in the queue
+	assert.Equal(t, len(testData), q.Len(), "Queue should have items")
+
+	// Purge the queue
+	q.Purge()
+
+	// Verify queue is empty
+	assert.Equal(t, 0, q.Len(), "Queue should be empty after purge")
+
+	// Verify dequeue returns nothing
+	_, ok := q.Dequeue()
+	assert.False(t, ok, "Dequeue should return false after purge")
+}
+
+func TestRequeueNackedItemsClosed(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// Close the queue
+	q.Close()
+
+	// Attempt to requeue nacked items
+	err := q.RequeueNackedItems()
+	assert.Error(t, err, "RequeueNackedItems should fail when queue is closed")
+	assert.Contains(t, err.Error(), "queue closed", "Error should mention queue closed")
+}
+
+func TestRequeueNackedItemsWithoutVisibilityTimeout(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// Disable visibility timeout
+	q.SetVisibilityTimeout(0)
+
+	// Add items to the queue
+	q.Enqueue("item1")
+	q.Enqueue("item2")
+
+	// Manually add items to nacked list (simulating failed acks)
+	ctx := context.Background()
+	q.client.HSet(ctx, q.getNackedItemKey(), "test-ack-1", "nacked-item-1")
+	q.client.HSet(ctx, q.getNackedItemKey(), "test-ack-2", "nacked-item-2")
+
+	// Verify nacked items are there
+	assert.Equal(t, 2, q.GetNackedItemsCount(), "Should have 2 items in nacked list")
+
+	// Requeue nacked items (without visibility timeout, should get all items)
+	err := q.RequeueNackedItems()
+	assert.NoError(t, err, "RequeueNackedItems should succeed")
+
+	// Verify nacked list is now empty
+	assert.Equal(t, 0, q.GetNackedItemsCount(), "Nacked list should be empty after requeue")
+
+	// Verify items were requeued (queue should have original 2 + requeued 2 = 4)
+	assert.Equal(t, 4, q.Len(), "Queue should have 4 items after requeue")
+}
+
+func TestRequeueNackedItemsEmptyWithVisibilityTimeout(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// Set visibility timeout
+	q.SetVisibilityTimeout(5 * time.Minute)
+
+	// No items in nacked list, this should return nil early
+	err := q.RequeueNackedItems()
+	assert.NoError(t, err, "RequeueNackedItems should succeed with empty nacked list")
+
+	// Verify queue is still empty
+	assert.Equal(t, 0, q.Len(), "Queue should be empty")
 }

@@ -15,27 +15,34 @@ import (
 )
 
 type Queue struct {
-	client     *redis.Client
-	queueKey   string
-	mx         sync.Mutex
-	ctx        context.Context
-	cancel     context.CancelFunc
-	expiration time.Duration
-	ackTimeout time.Duration
+	client            *redis.Client
+	queueKey          string
+	mx                sync.Mutex
+	ctx               context.Context
+	cancel            context.CancelFunc
+	expiration        time.Duration
+	ackTimeout        time.Duration
+	visibilityTimeout time.Duration
 }
 
 func newQueue(c *redis.Client, queueKey string) *Queue {
-	ctx, cancel := context.WithCancel(context.Background())
-	q := &Queue{
-		client:   c,
-		queueKey: queueKey,
-		ctx:      ctx,
-		cancel:   cancel,
-	}
+	q := newQueueBase(c, queueKey)
 
 	// requeue nacked items
 	q.RequeueNackedItems()
 
+	return q
+}
+
+func newQueueBase(c *redis.Client, queueKey string) *Queue {
+	ctx, cancel := context.WithCancel(context.Background())
+	q := &Queue{
+		client:            c,
+		queueKey:          queueKey,
+		ctx:               ctx,
+		cancel:            cancel,
+		visibilityTimeout: 5 * time.Minute,
+	}
 	return q
 }
 
@@ -52,6 +59,14 @@ func (q *Queue) SetAckTimeout(ackTimeout time.Duration) {
 	q.mx.Lock()
 	defer q.mx.Unlock()
 	q.ackTimeout = ackTimeout
+}
+
+// SetVisibilityTimeout sets the visibility timeout for jobs
+// This controls how long a job remains invisible in the nacked queue before being candidates for requeuing
+func (q *Queue) SetVisibilityTimeout(d time.Duration) {
+	q.mx.Lock()
+	defer q.mx.Unlock()
+	q.visibilityTimeout = d
 }
 
 // Dequeue removes and returns an item from the queue without acknowledgment
@@ -171,14 +186,32 @@ func (q *Queue) PrepareForFutureAck(ackID string, item any) error {
 	default:
 		// Store in pending list with the ack ID
 		pendingKey := q.getNackedItemKey()
-		err := q.client.HSet(q.ctx, pendingKey, ackID, item).Err()
-		if err != nil {
-			return fmt.Errorf("error storing item in pending list: %v", err)
+		pipe := q.client.Pipeline()
+
+		pipe.HSet(q.ctx, pendingKey, ackID, item)
+
+		// If visibility timeout is set, track it in ZSET
+		if q.visibilityTimeout > 0 {
+			timeoutKey := q.getTimeoutKey()
+			score := float64(time.Now().Add(q.visibilityTimeout).Unix())
+			pipe.ZAdd(q.ctx, timeoutKey, redis.Z{
+				Score:  score,
+				Member: ackID,
+			})
+			// Expire the timeout key eventually too, matching ackTimeout or just being safe
+			if q.ackTimeout > 0 {
+				pipe.Expire(q.ctx, timeoutKey, q.ackTimeout)
+			}
 		}
 
 		// Set the expiration for the pending entry
 		if q.ackTimeout > 0 {
-			q.client.Expire(q.ctx, pendingKey, q.ackTimeout)
+			pipe.Expire(q.ctx, pendingKey, q.ackTimeout)
+		}
+
+		_, err := pipe.Exec(q.ctx)
+		if err != nil {
+			return fmt.Errorf("error storing item in pending list: %v", err)
 		}
 
 		return nil
@@ -195,7 +228,12 @@ func (q *Queue) Acknowledge(ackID string) bool {
 		log.Println("queue closed, cannot acknowledge")
 		return false
 	default:
-		_, err := q.client.HDel(q.ctx, q.getNackedItemKey(), ackID).Result()
+		pipe := q.client.Pipeline()
+		pipe.HDel(q.ctx, q.getNackedItemKey(), ackID)
+		pipe.ZRem(q.ctx, q.getTimeoutKey(), ackID)
+
+		_, err := pipe.Exec(q.ctx)
+
 		if err != nil {
 			log.Printf("Error acknowledging item: %v", err)
 			return false
@@ -234,11 +272,65 @@ func (q *Queue) RequeueNackedItems() error {
 		log.Println("queue closed, cannot requeue idle items")
 		return fmt.Errorf("queue closed")
 	default:
-		// Get all pending items
-		pendingItems, err := q.client.HGetAll(q.ctx, q.getNackedItemKey()).Result()
-		if err != nil {
-			log.Printf("Error getting pending items: %v", err)
-			return fmt.Errorf("error getting pending items: %v", err)
+		var pendingItems map[string]string
+		var err error
+
+		// If visibility timeout is used, only get expired items
+		if q.visibilityTimeout > 0 {
+			// Find items with score <= now
+			now := float64(time.Now().Unix())
+			vals, err := q.client.ZRangeByScore(q.ctx, q.getTimeoutKey(), &redis.ZRangeBy{
+				Min: "-inf",
+				Max: fmt.Sprintf("%f", now),
+			}).Result()
+
+			if err != nil {
+				log.Printf("Error getting expired pending items: %v", err)
+				return fmt.Errorf("error getting expired pending items: %v", err)
+			}
+
+			if len(vals) == 0 {
+				return nil
+			}
+
+			// Retrieve the actual items for these keys
+			// We have to HGet them. Since HMGet isn't ideal for unknown keys, let's just HMGet or loop.
+			// HMGet is better.
+			if len(vals) > 0 {
+				// To use HMGet we need keys.
+				// However, we need to map results back to IDs.
+				// Let's just HGetAll to be safe for now or optimize later.
+				// Actually, we can just loop over vals and fetch from Hash, but HGetAll is efficient enough if list isn't huge.
+				// But wait, if we have millions of pending, HGetAll is bad.
+				// Better approach: HMGet.
+				// vals is []string of ackIDs.
+				items, err := q.client.HMGet(q.ctx, q.getNackedItemKey(), vals...).Result()
+				if err != nil {
+					log.Printf("Error fetching values for expired items: %v", err)
+					return err
+				}
+
+				pendingItems = make(map[string]string)
+				for i, id := range vals {
+					if items[i] != nil {
+						// items[i] is interface{}, likely string or []byte
+						switch v := items[i].(type) {
+						case string:
+							pendingItems[id] = v
+						case []byte:
+							pendingItems[id] = string(v)
+						}
+					}
+				}
+			}
+
+		} else {
+			// Old behavior: Get all pending items
+			pendingItems, err = q.client.HGetAll(q.ctx, q.getNackedItemKey()).Result()
+			if err != nil {
+				log.Printf("Error getting pending items: %v", err)
+				return fmt.Errorf("error getting pending items: %v", err)
+			}
 		}
 
 		for ackID, item := range pendingItems {
@@ -246,6 +338,9 @@ func (q *Queue) RequeueNackedItems() error {
 			// Using LPush to maintain FIFO ordering and prioritize previously timed-out items
 			pipe := q.client.Pipeline()
 			pipe.HDel(q.ctx, q.getNackedItemKey(), ackID)
+			if q.visibilityTimeout > 0 {
+				pipe.ZRem(q.ctx, q.getTimeoutKey(), ackID)
+			}
 			pipe.LPush(q.ctx, q.queueKey, item)
 
 			if _, err := pipe.Exec(q.ctx); err != nil {
@@ -273,6 +368,11 @@ func (q *Queue) GetNackedItemsCount() int {
 // getNackedItemKey returns the Redis key for the nacked items list
 func (q *Queue) getNackedItemKey() string {
 	return q.queueKey + ":nacked"
+}
+
+// getTimeoutKey returns the Redis key for the visibility timeout ZSET
+func (q *Queue) getTimeoutKey() string {
+	return q.queueKey + ":timeouts"
 }
 
 func (q *Queue) Close() error {
