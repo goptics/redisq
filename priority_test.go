@@ -293,3 +293,63 @@ func TestPriorityQueueExpiration(t *testing.T) {
 	// Verify queue is empty after expiration
 	assert.Equal(t, 0, pq.Len(), "Queue should be empty after expiration")
 }
+
+func TestPriorityQueueRequeueNackedItemsClosed(t *testing.T) {
+	pq, cleanup := setupTestPriorityQueue(t)
+	defer cleanup()
+
+	// Close the queue
+	pq.Close()
+
+	// Attempt to requeue nacked items
+	err := pq.RequeueNackedItems()
+	assert.Error(t, err, "RequeueNackedItems should fail when queue is closed")
+	assert.Contains(t, err.Error(), "queue closed", "Error should mention queue closed")
+}
+
+func TestPriorityQueueRequeueWithoutVisibilityTimeout(t *testing.T) {
+	pq, cleanup := setupTestPriorityQueue(t)
+	defer cleanup()
+
+	// Disable visibility timeout to use the old behavior path
+	pq.SetVisibilityTimeout(0)
+
+	// Add items to the queue
+	pq.Enqueue("item1", 1)
+	pq.Enqueue("item2", 2)
+
+	// Manually add items to nacked list (simulating failed acks)
+	ctx := context.Background()
+	pq.client.HSet(ctx, pq.getNackedItemKey(), "test-ack-1", "nacked-item-1")
+	pq.client.HSet(ctx, pq.getNackedItemKey(), "test-ack-2", "nacked-item-2")
+
+	// Verify nacked items are there
+	assert.Equal(t, 2, pq.GetNackedItemsCount(), "Should have 2 items in nacked list")
+
+	// Requeue nacked items (without visibility timeout, should get all items)
+	err := pq.RequeueNackedItems()
+	assert.NoError(t, err, "RequeueNackedItems should succeed")
+
+	// Verify nacked list is now empty
+	assert.Equal(t, 0, pq.GetNackedItemsCount(), "Nacked list should be empty after requeue")
+
+	// Verify items were requeued (queue should have original 2 + requeued 2 = 4)
+	assert.Equal(t, 4, pq.Len(), "Queue should have 4 items after requeue")
+}
+
+func TestPriorityQueueDequeueWithAckIdClosed(t *testing.T) {
+	pq, cleanup := setupTestPriorityQueue(t)
+	defer cleanup()
+
+	// Add item
+	pq.Enqueue("test", 1)
+
+	// Close the queue
+	pq.Close()
+
+	// DequeueWithAckId should fail
+	item, ok, ackID := pq.DequeueWithAckId()
+	assert.Nil(t, item, "Item should be nil when queue is closed")
+	assert.False(t, ok, "ok should be false when queue is closed")
+	assert.Empty(t, ackID, "ackID should be empty when queue is closed")
+}

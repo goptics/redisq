@@ -557,3 +557,61 @@ func TestQueuePurge(t *testing.T) {
 	_, ok := q.Dequeue()
 	assert.False(t, ok, "Dequeue should return false after purge")
 }
+
+func TestRequeueNackedItemsClosed(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// Close the queue
+	q.Close()
+
+	// Attempt to requeue nacked items
+	err := q.RequeueNackedItems()
+	assert.Error(t, err, "RequeueNackedItems should fail when queue is closed")
+	assert.Contains(t, err.Error(), "queue closed", "Error should mention queue closed")
+}
+
+func TestRequeueNackedItemsWithoutVisibilityTimeout(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// Disable visibility timeout
+	q.SetVisibilityTimeout(0)
+
+	// Add items to the queue
+	q.Enqueue("item1")
+	q.Enqueue("item2")
+
+	// Manually add items to nacked list (simulating failed acks)
+	ctx := context.Background()
+	q.client.HSet(ctx, q.getNackedItemKey(), "test-ack-1", "nacked-item-1")
+	q.client.HSet(ctx, q.getNackedItemKey(), "test-ack-2", "nacked-item-2")
+
+	// Verify nacked items are there
+	assert.Equal(t, 2, q.GetNackedItemsCount(), "Should have 2 items in nacked list")
+
+	// Requeue nacked items (without visibility timeout, should get all items)
+	err := q.RequeueNackedItems()
+	assert.NoError(t, err, "RequeueNackedItems should succeed")
+
+	// Verify nacked list is now empty
+	assert.Equal(t, 0, q.GetNackedItemsCount(), "Nacked list should be empty after requeue")
+
+	// Verify items were requeued (queue should have original 2 + requeued 2 = 4)
+	assert.Equal(t, 4, q.Len(), "Queue should have 4 items after requeue")
+}
+
+func TestRequeueNackedItemsEmptyWithVisibilityTimeout(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// Set visibility timeout
+	q.SetVisibilityTimeout(5 * time.Minute)
+
+	// No items in nacked list, this should return nil early
+	err := q.RequeueNackedItems()
+	assert.NoError(t, err, "RequeueNackedItems should succeed with empty nacked list")
+
+	// Verify queue is still empty
+	assert.Equal(t, 0, q.Len(), "Queue should be empty")
+}
