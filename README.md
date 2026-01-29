@@ -178,7 +178,7 @@ docker compose up -d
 ## Testing
 
 ```bash
-go test -race -v ./...
+make test
 ```
 
 ## Requirements
