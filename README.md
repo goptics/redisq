@@ -17,6 +17,7 @@ A lightweight, thread-safe Redis-backed queue implementation in Go with support 
 - Graceful shutdown handling
 - Concurrent operations support
 - Simple API for queue operations
+- Built as a persistence adapter for [varmq](https://github.com/goptics/varmq)
 
 ## Installation
 
