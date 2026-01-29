@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-01-29
+
+### Added
+
+- Visibility timeout for reliable message processing
+  - `SetVisibilityTimeout` - Configure how long items remain invisible after dequeue
+  - Items automatically become visible again if not acknowledged within timeout
+  - Time-based requeuing of unacknowledged items using Redis sorted sets
+- Dockertest integration for automated Redis container management during tests
+- Makefile with `test`, `format`, and `release` targets
+- Example docker compose configuration in `examples/varmq/`
+
+### Changed
+
+- Tests no longer require a pre-running Redis server
+- Simplified CI workflow by removing Redis service dependency
+- Updated README with new testing instructions
+- Improved README author section formatting
+
+### Removed
+
+- Removed `godotenv` dependency (no longer needed)
+- Removed Redis service configuration from GitHub Actions workflow
+- Removed example `.env` file (no longer required)
+
 ## [1.3.1] - 2025-05-01
 
 ### Changed
@@ -102,3 +127,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [1.2.0]: https://github.com/goptics/redisq/compare/v1.1.0...v1.2.0
 [1.3.0]: https://github.com/goptics/redisq/compare/v1.2.0...v1.3.0
 [1.3.1]: https://github.com/goptics/redisq/compare/v1.3.0...v1.3.1
+[1.4.0]: https://github.com/goptics/redisq/compare/v1.3.1...v1.4.0
+
