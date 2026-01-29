@@ -3,30 +3,15 @@ package redisq
 import (
 	"context"
 	"fmt"
-	"os"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/joho/godotenv"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 const testQueueKey = "test_queue"
-
-func getTestRedisURL() string {
-	// Try to load .env file, but don't panic if it doesn't exist
-	_ = godotenv.Load()
-
-	// Get REDIS_URL from environment
-	if url := os.Getenv("REDIS_URL"); url != "" {
-		return url
-	}
-
-	// Default to localhost:6379 if not set
-	return "redis://localhost:6379"
-}
 
 func setupTestQueue(t *testing.T) (*Queue, func()) {
 	redisURL := getTestRedisURL()
