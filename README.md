@@ -164,17 +164,6 @@ queue.RequeueNackedItems()
 pendingCount := queue.GetNackedItemsCount()
 ```
 
-## Configuration
-
-If you have docker installed just do the following:
-
-```bash
-cp .env.example .env
-docker compose up -d
-```
-
-> you can change the `REDIS_PORT` in the .env file
-
 ## Testing
 
 ```bash
