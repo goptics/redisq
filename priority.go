@@ -55,9 +55,6 @@ func newPriorityQueue(client *redis.Client, queueKey string) *PriorityQueue {
 // Enqueue adds an item to the queue with a specified priority
 // Lower priority values (closer to 1) will be dequeued first
 func (pq *PriorityQueue) Enqueue(item any, priority int) bool {
-	pq.mx.Lock()
-	defer pq.mx.Unlock()
-
 	select {
 	case <-pq.ctx.Done():
 		log.Println("queue closed, cannot enqueue")
@@ -74,8 +71,8 @@ func (pq *PriorityQueue) Enqueue(item any, priority int) bool {
 			return false
 		}
 
-		if pq.expiration > 0 {
-			pq.client.Expire(pq.ctx, pq.queueKey, pq.expiration)
+		if exp := pq.getExpiration(); exp > 0 {
+			pq.client.Expire(pq.ctx, pq.queueKey, exp)
 		}
 
 		return true
@@ -84,9 +81,6 @@ func (pq *PriorityQueue) Enqueue(item any, priority int) bool {
 
 // Dequeue removes and returns the highest priority item from the queue (lowest score)
 func (pq *PriorityQueue) Dequeue() (any, bool) {
-	pq.mx.Lock()
-	defer pq.mx.Unlock()
-
 	select {
 	case <-pq.ctx.Done():
 		log.Println("queue closed, cannot dequeue")
@@ -104,9 +98,6 @@ func (pq *PriorityQueue) Dequeue() (any, bool) {
 
 // Len returns the number of items in the priority queue
 func (pq *PriorityQueue) Len() int {
-	pq.mx.Lock()
-	defer pq.mx.Unlock()
-
 	length, err := pq.client.ZCard(pq.ctx, pq.queueKey).Result()
 	if err != nil {
 		return 0
@@ -115,9 +106,6 @@ func (pq *PriorityQueue) Len() int {
 }
 
 func (pq *PriorityQueue) Remove(item any) bool {
-	pq.mx.Lock()
-	defer pq.mx.Unlock()
-
 	data, err := pq.toBytes(item)
 	if err != nil {
 		return false
@@ -128,9 +116,6 @@ func (pq *PriorityQueue) Remove(item any) bool {
 
 // Values returns all items in the priority queue ordered by priority (highest to lowest)
 func (pq *PriorityQueue) Values() []any {
-	pq.mx.Lock()
-	defer pq.mx.Unlock()
-
 	results, err := pq.client.ZRangeWithScores(pq.ctx, pq.queueKey, 0, -1).Result()
 	if err != nil {
 		return []any{}
