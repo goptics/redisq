@@ -290,96 +290,63 @@ func (q *Queue) dequeueWithAck(pop *redis.Script) (any, bool, string) {
 	return []byte(v), true, ackID
 }
 
-// requeueNackedItems checks for un-acknowledged items in the nacked list
-// and returns them to the main queue to be processed again
+// requeueLoop and requeueEnd wrap a push of item v back onto the queue. With
+// ARGV[1] > 0 they requeue pending items whose visibility deadline is at or
+// before ARGV[1] (Unix seconds), else every pending item. An item leaves the
+// pending hash in the same script that pushes it, so processes requeueing at
+// once can't push it twice.
+// ponytail: one script for all expired items blocks Redis for that long;
+// batch with ZRANGEBYSCORE LIMIT if pending runs to millions.
+const (
+	requeueLoop = `
+local ids
+if tonumber(ARGV[1]) > 0 then
+	ids = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', ARGV[1])
+else
+	ids = redis.call('HKEYS', KEYS[2])
+end
+for _, id in ipairs(ids) do
+	local v = redis.call('HGET', KEYS[2], id)
+	redis.call('HDEL', KEYS[2], id)
+	redis.call('ZREM', KEYS[3], id)
+	if v then
+`
+	requeueEnd = `
+	end
+end
+return #ids`
+)
+
+// listRequeue pushes requeued items to the front, ahead of newer work.
+var listRequeue = redis.NewScript(requeueLoop + `redis.call('LPUSH', KEYS[1], v)` + requeueEnd)
+
+// RequeueNackedItems returns un-acknowledged items whose visibility timeout
+// has passed (every pending item when it is 0) to the queue.
 func (q *Queue) RequeueNackedItems() error {
+	return q.requeue(listRequeue)
+}
+
+func (q *Queue) requeue(script *redis.Script, extraKeys ...string) error {
 	q.mx.Lock()
 	defer q.mx.Unlock()
 
-	select {
-	case <-q.ctx.Done():
+	if q.ctx.Err() != nil {
 		log.Println("queue closed, cannot requeue idle items")
 		return fmt.Errorf("queue closed")
-	default:
-		var pendingItems map[string]string
-		var err error
-
-		// If visibility timeout is used, only get expired items
-		if q.visibilityTimeout > 0 {
-			// Find items with score <= now
-			now := float64(time.Now().Unix())
-			vals, err := q.client.ZRangeByScore(q.ctx, q.getTimeoutKey(), &redis.ZRangeBy{
-				Min: "-inf",
-				Max: fmt.Sprintf("%f", now),
-			}).Result()
-
-			if err != nil {
-				log.Printf("Error getting expired pending items: %v", err)
-				return fmt.Errorf("error getting expired pending items: %v", err)
-			}
-
-			if len(vals) == 0 {
-				return nil
-			}
-
-			// Retrieve the actual items for these keys
-			// We have to HGet them. Since HMGet isn't ideal for unknown keys, let's just HMGet or loop.
-			// HMGet is better.
-			if len(vals) > 0 {
-				// To use HMGet we need keys.
-				// However, we need to map results back to IDs.
-				// Let's just HGetAll to be safe for now or optimize later.
-				// Actually, we can just loop over vals and fetch from Hash, but HGetAll is efficient enough if list isn't huge.
-				// But wait, if we have millions of pending, HGetAll is bad.
-				// Better approach: HMGet.
-				// vals is []string of ackIDs.
-				items, err := q.client.HMGet(q.ctx, q.getNackedItemKey(), vals...).Result()
-				if err != nil {
-					log.Printf("Error fetching values for expired items: %v", err)
-					return err
-				}
-
-				pendingItems = make(map[string]string)
-				for i, id := range vals {
-					if items[i] != nil {
-						// items[i] is interface{}, likely string or []byte
-						switch v := items[i].(type) {
-						case string:
-							pendingItems[id] = v
-						case []byte:
-							pendingItems[id] = string(v)
-						}
-					}
-				}
-			}
-
-		} else {
-			// Old behavior: Get all pending items
-			pendingItems, err = q.client.HGetAll(q.ctx, q.getNackedItemKey()).Result()
-			if err != nil {
-				log.Printf("Error getting pending items: %v", err)
-				return fmt.Errorf("error getting pending items: %v", err)
-			}
-		}
-
-		for ackID, item := range pendingItems {
-			// Move from pending back to the main queue at the front
-			// Using LPush to maintain FIFO ordering and prioritize previously timed-out items
-			pipe := q.client.Pipeline()
-			pipe.HDel(q.ctx, q.getNackedItemKey(), ackID)
-			if q.visibilityTimeout > 0 {
-				pipe.ZRem(q.ctx, q.getTimeoutKey(), ackID)
-			}
-			pipe.LPush(q.ctx, q.queueKey, item)
-
-			if _, err := pipe.Exec(q.ctx); err != nil {
-				log.Printf("Error requeueing idle item: %v", err)
-				continue
-			}
-		}
-
-		return nil
 	}
+
+	var now int64
+	if q.visibilityTimeout > 0 {
+		now = time.Now().Unix()
+	}
+
+	keys := append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey()}, extraKeys...)
+	if err := script.Run(q.ctx, q.client, keys, now).Err(); err != nil {
+		log.Printf("Error requeueing pending items: %v", err)
+		return fmt.Errorf("error requeueing pending items: %v", err)
+	}
+
+	return nil
 }
 
 // GetNackedItemsCount returns the number of items in the nacked list

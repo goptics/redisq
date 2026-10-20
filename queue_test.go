@@ -707,3 +707,37 @@ func TestAckTimeoutZeroKeepsVisibility(t *testing.T) {
 	assert.Equal(t, 0, q.Len(), "an in-progress job was requeued")
 	assert.Equal(t, 1, q.GetNackedItemsCount())
 }
+
+// Several processes requeueing the same expired items at once must push each
+// item back exactly once.
+func TestConcurrentRequeueNoDuplicates(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	const n = 200
+	q.SetVisibilityTimeout(100 * time.Millisecond)
+	for i := range n {
+		require.True(t, q.Enqueue(fmt.Sprintf("item-%d", i)))
+	}
+	for range n {
+		_, ok, _ := q.DequeueWithAckId()
+		require.True(t, ok)
+	}
+	time.Sleep(1100 * time.Millisecond)
+
+	var wg sync.WaitGroup
+	for range 8 {
+		qs := New(getTestRedisURL()).(*queues)
+		defer qs.Close()
+		other := newQueueBase(qs.client, testQueueKey) // NewQueue would requeue on construction
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			assert.NoError(t, other.RequeueNackedItems())
+		}()
+	}
+	wg.Wait()
+
+	assert.Equal(t, n, q.Len(), "each expired item should be requeued once")
+	assert.Equal(t, 0, q.GetNackedItemsCount())
+}
