@@ -81,11 +81,12 @@ func TestWakeReachesOneIdleConsumerEach(t *testing.T) {
 
 func TestWakeSkipsBusyConsumers(t *testing.T) {
 	resetWakeKeys(t)
-	_, got := newTestNotification(t, true) // never found the queue empty
+	_, got := newTestNotification(t, true) // idle: just subscribed
 	producer, _ := newTestNotification(t, false)
 
+	producer.wake(1) // takes it out of the idle set: now busy
 	producer.wake(1)
-	assert.Zero(t, signals(got, 300*time.Millisecond))
+	assert.Equal(t, 1, signals(got, 300*time.Millisecond))
 }
 
 func TestWakeCount(t *testing.T) {
@@ -121,6 +122,7 @@ func TestWakeSkipsGoneConsumer(t *testing.T) {
 	resetWakeKeys(t)
 	a, got := newTestNotification(t, true)
 	ctx := context.Background()
+	require.NoError(t, a.client.SRem(ctx, a.idleKey, a.id).Err()) // a is busy
 
 	// Only a gone consumer idle: it is dropped and nobody is woken.
 	require.NoError(t, a.client.SAdd(ctx, a.idleKey, "crashed-instance").Err())
@@ -164,4 +166,15 @@ func TestNudgeWakesIdleConsumerWithWaitingItems(t *testing.T) {
 	member, err := a.client.SIsMember(context.Background(), a.idleKey, a.id).Result()
 	require.NoError(t, err)
 	assert.False(t, member, "a nudged consumer is no longer idle")
+}
+
+// A consumer that subscribes while items already wait must be woken without
+// any new enqueue.
+func TestSubscribeOnBacklogGetsWoken(t *testing.T) {
+	resetWakeKeys(t)
+	producer, _ := newTestNotification(t, false)
+	require.NoError(t, producer.client.RPush(context.Background(), testWakeKey, "a", "b").Err())
+
+	_, got := newTestNotification(t, true)
+	assert.Equal(t, 1, signals(got, 2500*time.Millisecond))
 }

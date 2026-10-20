@@ -148,13 +148,16 @@ func (n *Notification) broadcast(msg string) {
 }
 
 // Subscribe registers handler for wake signals ("enqueued") and makes this
-// instance a consumer.
+// instance a consumer. A consumer that just subscribed has no work yet, so
+// it joins the idle set: an enqueue wakes it, and so does the nudge if items
+// were already waiting (varmq sends no signal when it binds a queue).
 func (n *Notification) Subscribe(handler func(action string)) {
 	n.mx.Lock()
-	defer n.mx.Unlock()
-
 	n.subscribers = append(n.subscribers, handler)
+	n.mx.Unlock()
+
 	n.consumer.Store(true)
+	n.markIdle()
 }
 
 // len returns the queue length, marking this consumer idle when it is 0.
