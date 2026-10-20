@@ -128,9 +128,10 @@ data, ok := dq.Dequeue()
 #### How consumers are woken
 
 A busy consumer keeps pulling on its own, so only idle ones need a signal.
-A consumer that finds the queue empty (`Len()` returns 0, or a dequeue finds
-nothing) joins the idle set `<key>:idle`. Each enqueue wakes **at most one**
-idle consumer on its own channel `<key>:wake:<id>`; when every consumer is
+A consumer that finds the queue empty (`Len()` returns 0, or a dequeue leaves
+it empty while the consumer could take more) joins the idle set `<key>:idle`.
+Each enqueue wakes idle consumers on their own channel `<key>:wake:<id>`, up to
+one per waiting item, so a backlog wakes them all; when every consumer is
 busy, nothing is published. A requeue of `n` expired items wakes up to `n`.
 A consumer that is idle while items wait (for example after a wake reached a
 paused instance) is nudged within a second. There is no `"dequeued"`
@@ -171,14 +172,33 @@ queue.RequeueNackedItems()
 pendingCount := queue.GetNackedItemsCount()
 ```
 
+#### Taking several items at once
+
+`DequeueBatchWithAckIds` takes up to `len(items)` items (at most 1000) in one
+round trip, each pending under its own ack ID, and reports how many are left.
+Size the buffers to the work you can start right away: items taken but not
+started are invisible to other consumers while their visibility timeout runs.
+
+```go
+items := make([]any, 8)
+ackIDs := make([]string, 8)
+
+n, remaining, err := queue.DequeueBatchWithAckIds(items, ackIDs)
+for i := range n {
+    processItem(items[i])
+    queue.Acknowledge(ackIDs[i])
+}
+```
+
 #### Network errors and retries
 
 go-redis re-sends a command whose reply was lost (a read timeout or a dropped
 connection), up to 3 times by default. What that means per call:
 
-- **`DequeueWithAckId`** is safe: a re-sent pop hands back the item the first
-  attempt took, and after a call that failed outright, the next call returns
-  that item. Delivery is at least once.
+- **`DequeueWithAckId`** and **`DequeueBatchWithAckIds`** are safe: a re-sent
+  pop hands back the items the first attempt took, and after a call that
+  failed outright, the next call of at least its size returns those items (a
+  smaller call leaves them for a later one). Delivery is at least once.
 - **`Enqueue`** can store a job twice, and returning `false` after a network
   error does not prove the job was not stored. Make handlers idempotent.
 - **`Dequeue`** (no ack) is at most once: an item whose reply never arrives is

@@ -815,6 +815,7 @@ type dropProxy struct {
 	hash   []byte
 	sends  atomic.Int32
 	drops  atomic.Int32
+	onDrop func() // if set, runs after Redis ran a call whose reply is being dropped
 }
 
 func newDropProxy(t *testing.T, script *redis.Script) *dropProxy {
@@ -879,6 +880,9 @@ func (p *dropProxy) handle(c net.Conn) {
 		n, err := r.Read(buf)
 		if n > 0 {
 			if drop.Load() {
+				if p.onDrop != nil {
+					p.onDrop()
+				}
 				return // Redis ran the script; the client never hears back
 			}
 			if _, err := c.Write(buf[:n]); err != nil {

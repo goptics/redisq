@@ -29,7 +29,7 @@ func TestMain(m *testing.M) {
 	// Pulls an image, creates a container based on it and runs it
 	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
 		Repository: "redis",
-		Tag:        "latest",
+		Tag:        redisTag(),
 	}, func(config *docker.HostConfig) {
 		// Set AutoRemove to true so that stopped container goes away by itself
 		config.AutoRemove = true
@@ -70,4 +70,13 @@ func TestMain(m *testing.M) {
 // getTestRedisURL returns the Redis URL for the dockertest-managed container
 func getTestRedisURL() string {
 	return testRedisURL
+}
+
+// redisTag is the Redis image tag the tests run on: REDIS_TAG, or latest.
+// REDIS_TAG=6.0 checks the oldest supported version.
+func redisTag() string {
+	if tag := os.Getenv("REDIS_TAG"); tag != "" {
+		return tag
+	}
+	return "latest"
 }

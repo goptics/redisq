@@ -7,7 +7,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -28,7 +27,7 @@ type Queue struct {
 	visibilityTimeout atomic.Int64                // time.Duration
 	onRequeue         atomic.Pointer[func(int64)] // called after the sweeper requeues n items
 	ackPrefix         string                      // ack IDs are <ackPrefix>:<n>, unique per Queue object
-	ackSeq            atomic.Uint64               // last ack ID number handed out
+	ackSeq            atomic.Uint64               // last reservation number handed out
 	retryPop          atomic.Pointer[reservation] // ack IDs of a pop that failed with an error, reused by the next pop
 	isPriority        bool                        // a zset queue, with :prio entries to clear on ack; set before any goroutine starts
 }
@@ -260,8 +259,8 @@ func (q *Queue) Acknowledge(ackID string) bool {
 	}
 }
 
-// maxPop caps the items one pop call takes, keeping the script's argument
-// lists small.
+// maxPop caps the items one pop call takes. A script unpacks 2*maxPop values
+// in one call, which must stay under Lua's 8000-value limit.
 const maxPop = 1000
 
 // popHead and popTail wrap the storage-specific part of the ack pop scripts,
@@ -269,33 +268,42 @@ const maxPop = 1000
 //
 // KEYS: queue, pending hash, deadlines, idle set [, priorities].
 // ARGV: want, deadline (Unix seconds; 0: no visibility timeout), ack ID
-// prefix, first ack ID number - 1, consumer ID (” if the caller is not a
-// distributed consumer).
+// prefix, reservation (20-digit start), consumer ID (” if the caller is not
+// a distributed consumer), the caller's free slots.
 //
-// Item i is pending under "<prefix>:<start+i>". Redis runs each script
-// atomically, so an item is always in the queue or in the pending hash.
+// Item i is pending under "<prefix>:<reservation>:<i as 4 digits>". IDs are
+// built from strings, so no number goes through Lua arithmetic, and they sort
+// in pop order. Redis runs each script atomically, so an item is always in
+// the queue or in the pending hash.
 //
 // go-redis re-sends a command whose reply was lost (a read timeout or a
 // dropped connection) with the same ARGV, so a script can run twice for one
-// call. If the call's first ack ID is already pending, the first run popped:
-// popHead returns its items and pops nothing, or the second run would pop
-// the next items under the same IDs and lose the first ones. A batch shares
-// one deadline, so a requeue moves either all of its items or none.
+// call, and a copy can even arrive after the caller acked some of the items.
+// If any of the call's IDs is still pending, an earlier run popped: popHead
+// pops nothing, so no live pending entry is overwritten, and hands back the
+// leading run of those items with their deadlines raised to this call's. A
+// batch shares one deadline, so a requeue moves all of it or none.
 //
-// A pop that comes up short (fewer items than asked for) emptied the queue
-// while the caller could take more: a distributed consumer joins the idle
-// set then, in the same step, so an enqueue right after it wakes it.
-const popHead = `local want, st, pre = tonumber(ARGV[1]), tonumber(ARGV[4]), ARGV[3]
-local function id(i) return pre .. ':' .. string.format('%d', st + i) end
-if redis.call('HEXISTS', KEYS[2], id(1)) == 1 then
-	local ids = {}
-	for i = 1, want do ids[i] = id(i) end
-	local vals, items = redis.call('HMGET', KEYS[2], unpack(ids)), {}
-	for i = 1, want do
-		if not vals[i] then break end
-		items[i] = vals[i]
+// A pop that leaves the queue empty while the caller had free slots left
+// makes a distributed consumer join the idle set, in the same step, so an
+// enqueue right after it wakes it.
+const popHead = `local want, pre, resv = tonumber(ARGV[1]), ARGV[3], ARGV[4]
+local ids = {}
+for i = 1, want do ids[i] = pre .. ':' .. resv .. ':' .. string.format('%04d', i) end
+local held = redis.call('HMGET', KEYS[2], unpack(ids))
+for i = 1, want do
+	if held[i] then
+		local items = {}
+		for j = 1, want do
+			if not held[j] then break end
+			items[j] = held[j]
+			if tonumber(ARGV[2]) > 0 then
+				local d = redis.call('ZSCORE', KEYS[3], ids[j])
+				if not d or tonumber(d) < tonumber(ARGV[2]) then redis.call('ZADD', KEYS[3], ARGV[2], ids[j]) end
+			end
+		end
+		return {redis.call(__LEN__, KEYS[1]), items}
 	end
-	return {redis.call(__LEN__, KEYS[1]), items}
 end
 local items = {}
 `
@@ -305,14 +313,15 @@ local n = #items
 if n > 0 then
 	local h, z = {}, {}
 	for i = 1, n do
-		h[2*i-1] = id(i); h[2*i] = items[i]
-		z[2*i-1] = ARGV[2]; z[2*i] = id(i)
+		h[2*i-1] = ids[i]; h[2*i] = items[i]
+		z[2*i-1] = ARGV[2]; z[2*i] = ids[i]
 	end
 	redis.call('HSET', KEYS[2], unpack(h))
 	if tonumber(ARGV[2]) > 0 then redis.call('ZADD', KEYS[3], unpack(z)) end
 end
-if n < want and ARGV[5] ~= '' then redis.call('SADD', KEYS[4], ARGV[5]) end
-return {redis.call(__LEN__, KEYS[1]), items}`
+local len = redis.call(__LEN__, KEYS[1])
+if ARGV[5] ~= '' and len == 0 and n < tonumber(ARGV[6]) then redis.call('SADD', KEYS[4], ARGV[5]) end
+return {len, items}`
 
 // popScript builds an ack pop script whose body pops into `items`, for
 // storage whose length command is lenCmd.
@@ -338,12 +347,13 @@ for i = 1, #r / 2 do
 	local m = r[2*i-1]
 	if #m >= 17 and string.byte(m, 1) == 255 then m = string.sub(m, 18) end
 	items[i] = m
-	p[2*i-1] = id(i); p[2*i] = r[2*i]
+	p[2*i-1] = ids[i]; p[2*i] = r[2*i]
 end
 if #items > 0 then redis.call('HSET', KEYS[5], unpack(p)) end`)
 )
 
-// reservation is the ack IDs <prefix>:<start+1>..<start+want> of one pop call.
+// reservation is the ack IDs <prefix>:<start>:0001..<start>:<want> of one pop
+// call; start is unique per Queue object.
 type reservation struct {
 	start uint64
 	want  int
@@ -355,12 +365,13 @@ func (q *Queue) DequeueWithAckId() (any, bool, string) {
 	return q.dequeueOne(listAckPop, "")
 }
 
-// DequeueBatchWithAckIds moves up to len(items) items (at most 1000) from the
-// queue to pending in one atomic step, each under its own ack ID, into
-// items[:n] and ackIDs[:n]. remaining is the queue length right after the
-// move. n is 0 with a nil error when the queue is empty. n can be below the
-// requested count while remaining > 0 only right after a failed call, whose
-// reservation (and so its count) the next call reuses.
+// DequeueBatchWithAckIds moves up to min(len(items), len(ackIDs), 1000) items
+// from the queue to pending in one atomic step, each under its own ack ID,
+// into items[:n] and ackIDs[:n]. remaining is the queue length right after
+// the move. n is 0 with a nil error when the queue is empty, or when no
+// capacity was given (remaining is then 0 and means nothing). n can be below
+// that count while remaining > 0 only right after a failed call: the next call
+// of at least that call's size reuses its ack IDs and gets its items back.
 func (q *Queue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n, remaining int, err error) {
 	return q.dequeueBatch(listAckPop, items, ackIDs, "")
 }
@@ -403,24 +414,31 @@ func (q *Queue) dequeueBatch(pop *redis.Script, items []any, ackIDs []string, co
 	// The ack IDs are reserved once per call, so a script go-redis re-sends
 	// carries them again. After a failed call they are kept for the next one:
 	// if the failed pop ran anyway, popHead hands its items back now instead
-	// of leaving them pending until the visibility timeout. A smaller call
-	// can't take a bigger reservation's items; those wait for the timeout.
+	// of leaving them pending until the visibility timeout. A call smaller
+	// than the kept reservation leaves it for a later call, and a failure
+	// that finds one already kept drops its own: those items wait for the
+	// timeout.
 	r := q.retryPop.Swap(nil)
-	if r == nil || r.want > want {
-		r = &reservation{start: q.ackSeq.Add(uint64(want)) - uint64(want), want: want}
+	if r != nil && r.want > want {
+		q.retryPop.CompareAndSwap(nil, r)
+		r = nil
+	}
+	if r == nil {
+		r = &reservation{start: q.ackSeq.Add(1), want: want}
 	}
 
+	resv := fmt.Sprintf("%020d", r.start)
 	keys := append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey()}, extraKeys...)
-	reply, err := pop.Run(q.ctx, q.client, keys, r.want, deadline, q.ackPrefix, r.start, consumer).Slice()
+	reply, err := pop.Run(q.ctx, q.client, keys, r.want, deadline, q.ackPrefix, resv, consumer, want).Slice()
 	if err != nil {
-		q.retryPop.Store(r)
+		q.retryPop.CompareAndSwap(nil, r)
 		return 0, 0, err
 	}
 
 	popped := reply[1].([]any)
 	for i, v := range popped {
 		items[i] = []byte(v.(string))
-		ackIDs[i] = q.ackPrefix + ":" + strconv.FormatUint(r.start+uint64(i)+1, 10)
+		ackIDs[i] = fmt.Sprintf("%s:%s:%04d", q.ackPrefix, resv, i+1)
 	}
 
 	return len(popped), int(reply[0].(int64)), nil
