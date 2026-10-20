@@ -251,7 +251,8 @@ var (
 	listAckPop = redis.NewScript(`local v = redis.call('LPOP', KEYS[1])
 if not v then return false end` + ackPending)
 	zsetAckPop = redis.NewScript(`local v = redis.call('ZPOPMIN', KEYS[1])[1]
-if not v then return false end` + ackPending)
+if not v then return false end
+if #v >= 17 and string.byte(v, 1) == 255 then v = string.sub(v, 18) end` + ackPending)
 )
 
 func (q *Queue) DequeueWithAckId() (any, bool, string) {

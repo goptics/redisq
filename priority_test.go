@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -385,4 +386,90 @@ func TestPriorityQueueDequeueWithAckIdAndTimeout(t *testing.T) {
 	pq.Acknowledge(ackID)
 	zCount, _ = pq.client.ZCard(ctx, timeoutKey).Result()
 	assert.Equal(t, int64(0), zCount, "Timeout ZSET should be empty after ack")
+}
+
+// A ZSET merges equal members, so identical jobs used to collapse into one.
+func TestPriorityQueueKeepsDuplicates(t *testing.T) {
+	pq, cleanup := setupTestPriorityQueue(t)
+	defer cleanup()
+
+	job := `{"id":"","status":"Created","data":"send-email"}`
+	require.True(t, pq.Enqueue(job, 5))
+	require.True(t, pq.Enqueue(job, 5))
+	assert.Equal(t, 2, pq.Len())
+
+	for range 2 {
+		item, ok := pq.Dequeue()
+		require.True(t, ok)
+		assert.Equal(t, job, string(item.([]byte)))
+	}
+}
+
+// Equal priorities used to dequeue in byte order of the items.
+func TestPriorityQueueFIFOWithinPriority(t *testing.T) {
+	pq, cleanup := setupTestPriorityQueue(t)
+	defer cleanup()
+
+	for _, v := range []string{"b", "c", "a"} {
+		require.True(t, pq.Enqueue(v, 1))
+	}
+
+	var got []string
+	for _, v := range pq.Values() {
+		got = append(got, string(v.([]byte)))
+	}
+	assert.Equal(t, []string{"b", "c", "a"}, got)
+
+	for _, want := range []string{"b", "c", "a"} {
+		item, ok := pq.Dequeue()
+		require.True(t, ok)
+		assert.Equal(t, want, string(item.([]byte)))
+	}
+}
+
+// Members written by older versions have no sequence prefix and must be
+// returned byte for byte.
+func TestPriorityQueueReadsUnprefixedMembers(t *testing.T) {
+	pq, cleanup := setupTestPriorityQueue(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	require.NoError(t, pq.client.ZAdd(ctx, pq.queueKey, redis.Z{Score: 1, Member: "old"}).Err())
+	require.True(t, pq.Enqueue("new", 1))
+
+	assert.True(t, pq.Remove("missing"))
+	item, ok := pq.Dequeue()
+	require.True(t, ok)
+	assert.Equal(t, "old", string(item.([]byte)), "old members drain first")
+
+	require.NoError(t, pq.client.ZAdd(ctx, pq.queueKey, redis.Z{Score: 1, Member: "old2"}).Err())
+	item, ok, _ = pq.DequeueWithAckId()
+	require.True(t, ok)
+	assert.Equal(t, "old2", string(item.([]byte)))
+
+	assert.True(t, pq.Remove("new"))
+	assert.Equal(t, 0, pq.Len())
+}
+
+// The ack path stores the bare item in pending, and a requeue gives it a
+// fresh sequence number.
+func TestPriorityQueueAckRequeueKeepsItem(t *testing.T) {
+	pq, cleanup := setupTestPriorityQueue(t)
+	defer cleanup()
+
+	pq.SetVisibilityTimeout(100 * time.Millisecond)
+	require.True(t, pq.Enqueue("job", 3))
+	require.True(t, pq.Enqueue("job", 3))
+	for range 2 {
+		item, ok, _ := pq.DequeueWithAckId()
+		require.True(t, ok)
+		assert.Equal(t, "job", string(item.([]byte)))
+	}
+
+	time.Sleep(1100 * time.Millisecond)
+	require.NoError(t, pq.RequeueNackedItems())
+	assert.Equal(t, 2, pq.Len())
+	for _, v := range pq.Values() {
+		assert.Equal(t, "job", string(v.([]byte)))
+	}
 }

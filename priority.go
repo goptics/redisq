@@ -12,6 +12,38 @@ type PriorityQueue struct {
 	*Queue
 }
 
+// Members are "\xff" + 16 hex digits of a per-queue sequence + the item. The
+// sequence keeps identical items as separate members (a ZSET would merge
+// them) and breaks score ties in insertion order, not byte order. \xff never
+// starts UTF-8 text and sorts after it, so members stored without the prefix
+// by older versions are still read as is, and drain first.
+const seqPrefixLen = 17
+
+// zsetPush adds item ARGV[2] at score ARGV[1] under the next sequence number.
+var zsetPush = redis.NewScript(`local s = redis.call('INCR', KEYS[2])
+redis.call('ZADD', KEYS[1], ARGV[1], '\255' .. string.format('%016x', s) .. ARGV[2])
+return s`)
+
+// zsetRemove removes the first member holding item ARGV[1].
+var zsetRemove = redis.NewScript(`for _, m in ipairs(redis.call('ZRANGE', KEYS[1], 0, -1)) do
+	if m == ARGV[1] or (#m >= 17 and string.byte(m, 1) == 255 and string.sub(m, 18) == ARGV[1]) then
+		return redis.call('ZREM', KEYS[1], m)
+	end
+end
+return 0`)
+
+// itemOf returns the item stored in member m.
+func itemOf(m string) []byte {
+	if len(m) >= seqPrefixLen && m[0] == 0xff {
+		return []byte(m[seqPrefixLen:])
+	}
+	return []byte(m)
+}
+
+func (pq *PriorityQueue) pushKeys() []string {
+	return []string{pq.queueKey, pq.queueKey + ":seq"}
+}
+
 func newPriorityQueue(client *redis.Client, queueKey string) *PriorityQueue {
 	q := &PriorityQueue{
 		Queue: newQueueBase(client, queueKey),
@@ -38,19 +70,13 @@ func (pq *PriorityQueue) Enqueue(item any, priority int) bool {
 			return false
 		}
 
-		pipe := pq.client.Pipeline()
-		pipe.ZAdd(pq.ctx, pq.queueKey, redis.Z{
-			Score:  float64(priority),
-			Member: data,
-		})
-
-		if pq.expiration > 0 {
-			pipe.Expire(pq.ctx, pq.queueKey, pq.expiration)
-		}
-
-		if _, err := pipe.Exec(pq.ctx); err != nil {
+		if err := zsetPush.Run(pq.ctx, pq.client, pq.pushKeys(), priority, data).Err(); err != nil {
 			log.Printf("Error enqueueing item with priority: %v", err)
 			return false
+		}
+
+		if pq.expiration > 0 {
+			pq.client.Expire(pq.ctx, pq.queueKey, pq.expiration)
 		}
 
 		return true
@@ -73,8 +99,7 @@ func (pq *PriorityQueue) Dequeue() (any, bool) {
 			return nil, false
 		}
 
-		// Convert string back to []byte to maintain consistency with Queue interface
-		return []byte(results[0].Member.(string)), true
+		return itemOf(results[0].Member.(string)), true
 	}
 }
 
@@ -94,9 +119,12 @@ func (pq *PriorityQueue) Remove(item any) bool {
 	pq.mx.Lock()
 	defer pq.mx.Unlock()
 
-	_, err := pq.client.ZRem(pq.ctx, pq.queueKey, item).Result()
+	data, err := pq.toBytes(item)
+	if err != nil {
+		return false
+	}
 
-	return err == nil
+	return zsetRemove.Run(pq.ctx, pq.client, []string{pq.queueKey}, data).Err() == nil
 }
 
 // Values returns all items in the priority queue ordered by priority (highest to lowest)
@@ -111,8 +139,7 @@ func (pq *PriorityQueue) Values() []any {
 
 	values := make([]any, 0, len(results))
 	for _, result := range results {
-		// Convert string back to []byte
-		values = append(values, []byte(result.Member.(string)))
+		values = append(values, itemOf(result.Member.(string)))
 	}
 
 	return values
@@ -192,12 +219,8 @@ func (pq *PriorityQueue) RequeueNackedItems() error {
 				pipe.ZRem(pq.ctx, pq.getTimeoutKey(), ackID)
 			}
 
-			// We convert the string item back to bytes for storage if needed, but ZAdd takes interface{}
-			// Redis driver handles string/bytes fine.
-			pipe.ZAdd(pq.ctx, pq.queueKey, redis.Z{
-				Score:  1, // Default high priority for requeued items
-				Member: item,
-			})
+			// Default high priority for requeued items
+			zsetPush.Eval(pq.ctx, pipe, pq.pushKeys(), 1, item)
 
 			if _, err := pipe.Exec(pq.ctx); err != nil {
 				log.Printf("Error requeueing idle item: %v", err)
