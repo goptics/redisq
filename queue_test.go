@@ -58,7 +58,7 @@ func TestNewQueue(t *testing.T) {
 
 	assert.Equal(t, testQueueKey, q.queueKey, "Queue key should match")
 	assert.NotNil(t, q.client, "Redis client should not be nil")
-	assert.Equal(t, 5*time.Minute, q.visibilityTimeout, "Default visibility timeout should be 5 minutes")
+	assert.Equal(t, 5*time.Minute, q.getVisibilityTimeout(), "Default visibility timeout should be 5 minutes")
 }
 
 func TestEnqueueDequeue(t *testing.T) {
@@ -999,4 +999,48 @@ func TestPopAfterFailedCallReturnsItsItem(t *testing.T) {
 			assert.Equal(t, "b", item, "the next call is an ordinary pop")
 		})
 	}
+}
+
+// slowPipelines delays every pipeline by d, like a distant Redis.
+type slowPipelines struct{ d time.Duration }
+
+func (s slowPipelines) DialHook(next redis.DialHook) redis.DialHook          { return next }
+func (s slowPipelines) ProcessHook(next redis.ProcessHook) redis.ProcessHook { return next }
+func (s slowPipelines) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		time.Sleep(s.d)
+		return next(ctx, cmds)
+	}
+}
+
+// Workers acknowledge in parallel; a queue lock held across the network call
+// used to make each ack wait for the one before it.
+func TestAcknowledgeRunsInParallel(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	const n = 10
+	ackIDs := make([]string, 0, n)
+	for i := range n {
+		require.True(t, q.Enqueue(fmt.Sprint(i)))
+		_, ok, ackID := q.DequeueWithAckId()
+		require.True(t, ok)
+		ackIDs = append(ackIDs, ackID)
+	}
+
+	q.client.AddHook(slowPipelines{100 * time.Millisecond})
+
+	start := time.Now()
+	var wg sync.WaitGroup
+	for _, id := range ackIDs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			assert.True(t, q.Acknowledge(id))
+		}()
+	}
+	wg.Wait()
+
+	assert.Less(t, time.Since(start), 500*time.Millisecond, "acks ran one at a time")
+	assert.Equal(t, 0, q.GetNackedItemsCount())
 }

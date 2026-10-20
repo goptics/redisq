@@ -7,7 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -16,15 +16,17 @@ import (
 )
 
 type Queue struct {
-	client            *redis.Client
-	queueKey          string
-	mx                sync.Mutex
-	ctx               context.Context
-	cancel            context.CancelFunc
-	expiration        time.Duration
-	visibilityTimeout time.Duration
-	onRequeue         func(n int64) // called after the sweeper requeues n items; guarded by mx
-	retryAckID        string        // ack ID of a pop that failed with an error, reused by the next pop; guarded by mx
+	client   *redis.Client
+	queueKey string
+	ctx      context.Context
+	cancel   context.CancelFunc
+	// Config is atomic so no lock is held across a network call: Redis applies
+	// each command, pipeline and script on its own.
+	expiration        atomic.Int64                // time.Duration
+	visibilityTimeout atomic.Int64                // time.Duration
+	onRequeue         atomic.Pointer[func(int64)] // called after the sweeper requeues n items
+	retryAckID        atomic.Pointer[string]      // ack ID of a pop that failed with an error, reused by the next pop
+	isPriority        bool                        // a zset queue, with :prio entries to clear on ack; set before any goroutine starts
 }
 
 func newQueue(c *redis.Client, queueKey string) *Queue {
@@ -40,20 +42,26 @@ func newQueue(c *redis.Client, queueKey string) *Queue {
 func newQueueBase(c *redis.Client, queueKey string) *Queue {
 	ctx, cancel := context.WithCancel(context.Background())
 	q := &Queue{
-		client:            c,
-		queueKey:          queueKey,
-		ctx:               ctx,
-		cancel:            cancel,
-		visibilityTimeout: 5 * time.Minute,
+		client:   c,
+		queueKey: queueKey,
+		ctx:      ctx,
+		cancel:   cancel,
 	}
+	q.visibilityTimeout.Store(int64(5 * time.Minute))
 	return q
+}
+
+func (q *Queue) getExpiration() time.Duration {
+	return time.Duration(q.expiration.Load())
+}
+
+func (q *Queue) getVisibilityTimeout() time.Duration {
+	return time.Duration(q.visibilityTimeout.Load())
 }
 
 // SetExpiration sets the expiration time for the Queue
 func (q *Queue) SetExpiration(expiration time.Duration) {
-	q.mx.Lock()
-	defer q.mx.Unlock()
-	q.expiration = expiration
+	q.expiration.Store(int64(expiration))
 }
 
 // SetAckTimeout sets how long a job can be processing before being requeued.
@@ -71,17 +79,12 @@ func (q *Queue) SetAckTimeout(ackTimeout time.Duration) {
 // SetVisibilityTimeout sets the visibility timeout for jobs
 // This controls how long a job remains invisible in the nacked queue before being candidates for requeuing
 func (q *Queue) SetVisibilityTimeout(d time.Duration) {
-	q.mx.Lock()
-	defer q.mx.Unlock()
-	q.visibilityTimeout = d
+	q.visibilityTimeout.Store(int64(d))
 }
 
 // Dequeue removes and returns an item from the queue without acknowledgment
 // For reliable processing with acknowledgment, use DequeueWithAck instead
 func (q *Queue) Dequeue() (any, bool) {
-	q.mx.Lock()
-	defer q.mx.Unlock()
-
 	select {
 	case <-q.ctx.Done():
 		log.Println("queue closed, cannot dequeue")
@@ -115,9 +118,6 @@ func (q *Queue) toBytes(item any) ([]byte, error) {
 }
 
 func (q *Queue) Enqueue(item any) bool {
-	q.mx.Lock()
-	defer q.mx.Unlock()
-
 	select {
 	case <-q.ctx.Done():
 		log.Println("queue closed, cannot enqueue")
@@ -129,14 +129,17 @@ func (q *Queue) Enqueue(item any) bool {
 			return false
 		}
 
-		pipe := q.client.Pipeline()
-		pipe.RPush(q.ctx, q.queueKey, data)
-
-		if q.expiration > 0 {
-			pipe.Expire(q.ctx, q.queueKey, q.expiration)
+		if exp := q.getExpiration(); exp > 0 {
+			_, err = q.client.Pipelined(q.ctx, func(pipe redis.Pipeliner) error {
+				pipe.RPush(q.ctx, q.queueKey, data)
+				pipe.Expire(q.ctx, q.queueKey, exp)
+				return nil
+			})
+		} else {
+			err = q.client.RPush(q.ctx, q.queueKey, data).Err()
 		}
 
-		if _, err := pipe.Exec(q.ctx); err != nil {
+		if err != nil {
 			log.Printf("Error enqueueing item: %v", err)
 			return false
 		}
@@ -148,9 +151,6 @@ func (q *Queue) Enqueue(item any) bool {
 // enqueueWith runs script to push item, with ARGV[1] the item bytes, ARGV[2]
 // the queue expiration in milliseconds (0: none) and then extra.
 func (q *Queue) enqueueWith(script *redis.Script, keys []string, item any, extra ...any) bool {
-	q.mx.Lock()
-	defer q.mx.Unlock()
-
 	if q.ctx.Err() != nil {
 		log.Println("queue closed, cannot enqueue")
 		return false
@@ -162,7 +162,7 @@ func (q *Queue) enqueueWith(script *redis.Script, keys []string, item any, extra
 		return false
 	}
 
-	args := append([]any{data, q.expiration.Milliseconds()}, extra...)
+	args := append([]any{data, q.getExpiration().Milliseconds()}, extra...)
 	if err := script.Run(q.ctx, q.client, keys, args...).Err(); err != nil {
 		log.Printf("Error enqueueing item: %v", err)
 		return false
@@ -172,9 +172,6 @@ func (q *Queue) enqueueWith(script *redis.Script, keys []string, item any, extra
 }
 
 func (q *Queue) Len() int {
-	q.mx.Lock()
-	defer q.mx.Unlock()
-
 	length, err := q.client.LLen(q.ctx, q.queueKey).Result()
 	if err != nil {
 		return 0
@@ -183,16 +180,10 @@ func (q *Queue) Len() int {
 }
 
 func (q *Queue) Purge() {
-	q.mx.Lock()
-	defer q.mx.Unlock()
-
 	q.client.Del(q.ctx, q.queueKey)
 }
 
 func (q *Queue) Values() []any {
-	q.mx.Lock()
-	defer q.mx.Unlock()
-
 	results, err := q.client.LRange(q.ctx, q.queueKey, 0, -1).Result()
 	if err != nil {
 		return []any{}
@@ -210,9 +201,6 @@ func (q *Queue) Values() []any {
 // PrepareForFutureAck adds an item to the pending list for acknowledgment tracking
 // Returns an error if the operation fails
 func (q *Queue) PrepareForFutureAck(ackID string, item any) error {
-	q.mx.Lock()
-	defer q.mx.Unlock()
-
 	select {
 	case <-q.ctx.Done():
 		return fmt.Errorf("queue closed, cannot prepare for acknowledgment")
@@ -225,9 +213,9 @@ func (q *Queue) PrepareForFutureAck(ackID string, item any) error {
 		pipe.HSet(q.ctx, pendingKey, ackID, item)
 
 		// If visibility timeout is set, track it in ZSET
-		if q.visibilityTimeout > 0 {
+		if vt := q.getVisibilityTimeout(); vt > 0 {
 			timeoutKey := q.getTimeoutKey()
-			score := unixSeconds(time.Now().Add(q.visibilityTimeout))
+			score := unixSeconds(time.Now().Add(vt))
 			pipe.ZAdd(q.ctx, timeoutKey, redis.Z{
 				Score:  score,
 				Member: ackID,
@@ -245,9 +233,6 @@ func (q *Queue) PrepareForFutureAck(ackID string, item any) error {
 
 // Acknowledge removes an item from the pending list indicating successful processing
 func (q *Queue) Acknowledge(ackID string) bool {
-	q.mx.Lock()
-	defer q.mx.Unlock()
-
 	select {
 	case <-q.ctx.Done():
 		log.Println("queue closed, cannot acknowledge")
@@ -256,7 +241,9 @@ func (q *Queue) Acknowledge(ackID string) bool {
 		pipe := q.client.Pipeline()
 		pipe.HDel(q.ctx, q.getNackedItemKey(), ackID)
 		pipe.ZRem(q.ctx, q.getTimeoutKey(), ackID)
-		pipe.HDel(q.ctx, q.getPriorityKey(), ackID) // priority queues only; a no-op otherwise
+		if q.isPriority {
+			pipe.HDel(q.ctx, q.getPriorityKey(), ackID)
+		}
 
 		_, err := pipe.Exec(q.ctx)
 
@@ -308,37 +295,35 @@ func (q *Queue) DequeueWithAckId() (any, bool, string) {
 // dequeueWithAck pops the next item with pop and marks it pending under a new
 // ack ID in the same atomic step.
 func (q *Queue) dequeueWithAck(pop *redis.Script, extraKeys ...string) (any, bool, string) {
-	q.mx.Lock()
-	defer q.mx.Unlock()
-
 	if q.ctx.Err() != nil {
 		log.Println("queue closed, cannot dequeue")
 		return nil, false, ""
 	}
 
 	var deadline float64
-	if q.visibilityTimeout > 0 {
-		deadline = unixSeconds(time.Now().Add(q.visibilityTimeout))
+	if vt := q.getVisibilityTimeout(); vt > 0 {
+		deadline = unixSeconds(time.Now().Add(vt))
 	}
 
 	// The ack ID is made once per call, so a script go-redis re-sends carries
 	// it again (see reRunGuard). After a failed call it is kept for the next
 	// one: if the failed pop ran anyway, the guard hands its item back now
 	// instead of leaving it pending until the visibility timeout.
-	ackID := q.retryAckID
-	if ackID == "" {
+	var ackID string
+	if prev := q.retryAckID.Swap(nil); prev != nil {
+		ackID = *prev
+	} else {
 		ackID = cuid.New()
 	}
 
 	keys := append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey()}, extraKeys...)
 	v, err := pop.Run(q.ctx, q.client, keys, ackID, deadline).Text()
 	if err != nil && err != redis.Nil {
-		q.retryAckID = ackID
+		q.retryAckID.Store(&ackID)
 		log.Printf("Error dequeuing with ack: %v", err)
 		return nil, false, ""
 	}
 
-	q.retryAckID = ""
 	if err == redis.Nil {
 		return nil, false, ""
 	}
@@ -402,11 +387,7 @@ func (q *Queue) sweep(requeue func() (int64, error)) {
 		case <-tick.C:
 		}
 
-		q.mx.Lock()
-		vt := q.visibilityTimeout
-		q.mx.Unlock()
-
-		if vt <= 0 {
+		if q.getVisibilityTimeout() <= 0 {
 			continue
 		}
 
@@ -416,12 +397,8 @@ func (q *Queue) sweep(requeue func() (int64, error)) {
 		}
 
 		if n > 0 {
-			q.mx.Lock()
-			onRequeue := q.onRequeue
-			q.mx.Unlock()
-
-			if onRequeue != nil {
-				onRequeue(n)
+			if onRequeue := q.onRequeue.Load(); onRequeue != nil {
+				(*onRequeue)(n)
 			}
 		}
 	}
@@ -429,22 +406,17 @@ func (q *Queue) sweep(requeue func() (int64, error)) {
 
 // setOnRequeue sets the callback the sweeper runs after requeueing items.
 func (q *Queue) setOnRequeue(fn func(n int64)) {
-	q.mx.Lock()
-	defer q.mx.Unlock()
-	q.onRequeue = fn
+	q.onRequeue.Store(&fn)
 }
 
 func (q *Queue) requeue(script *redis.Script, extraKeys ...string) (int64, error) {
-	q.mx.Lock()
-	defer q.mx.Unlock()
-
 	if q.ctx.Err() != nil {
 		log.Println("queue closed, cannot requeue idle items")
 		return 0, fmt.Errorf("queue closed")
 	}
 
 	var now float64
-	if q.visibilityTimeout > 0 {
+	if q.getVisibilityTimeout() > 0 {
 		now = unixSeconds(time.Now())
 	}
 
@@ -460,9 +432,6 @@ func (q *Queue) requeue(script *redis.Script, extraKeys ...string) (int64, error
 
 // GetNackedItemsCount returns the number of items in the nacked list
 func (q *Queue) GetNackedItemsCount() int {
-	q.mx.Lock()
-	defer q.mx.Unlock()
-
 	count, err := q.client.HLen(q.ctx, q.getNackedItemKey()).Result()
 	if err != nil {
 		return 0
@@ -499,9 +468,6 @@ func (q *Queue) Close() error {
 }
 
 func (q *Queue) Remove(item any) bool {
-	q.mx.Lock()
-	defer q.mx.Unlock()
-
 	_, err := q.client.LRem(q.ctx, q.queueKey, 1, item).Result()
 
 	return err == nil
