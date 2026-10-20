@@ -134,12 +134,11 @@ data, ok := dq.Dequeue()
 // Create a queue with acknowledgment support
 queue := qs.NewQueue("ack-queue")
 
-// Set acknowledgment timeout (how long before unacknowledged items are requeued)
-queue.SetAckTimeout(time.Minute * 5)
+// How long a dequeued item stays pending before it can be requeued
+queue.SetVisibilityTimeout(time.Minute * 5)
 
-// Dequeue an item with a unique acknowledgment ID
-ackID := "job-123"
-item, ok := queue.Dequeue()
+// Dequeue an item; it stays pending under ackID until acknowledged
+item, ok, ackID := queue.DequeueWithAckId()
 if ok {
     // Process the item
     processItem(item)

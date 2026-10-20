@@ -220,7 +220,6 @@ func TestPrepareForFutureAckWithTimeout(t *testing.T) {
 	q.SetVisibilityTimeout(1 * time.Second)
 	q.SetAckTimeout(5 * time.Second)
 
-	// Prepare for ack - this should set expiration on both keys
 	err := q.PrepareForFutureAck("ack-with-timeout", "test-item")
 	assert.NoError(t, err, "PrepareForFutureAck should succeed with timeouts set")
 
@@ -668,4 +667,26 @@ func TestDequeueWithAckIdNeverDropsItem(t *testing.T) {
 			return
 		}
 	}
+}
+
+// Unacknowledged jobs must outlive the ack timeout so they can be requeued;
+// it used to expire the whole pending hash and delete them.
+func TestAckTimeoutKeepsPendingForRequeue(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	q.SetAckTimeout(time.Second)
+	require.True(t, q.Enqueue("a"))
+	require.True(t, q.Enqueue("b"))
+	for range 2 {
+		_, ok, _ := q.DequeueWithAckId()
+		require.True(t, ok)
+	}
+
+	time.Sleep(2100 * time.Millisecond)
+	assert.Equal(t, 2, q.GetNackedItemsCount(), "pending jobs were deleted")
+
+	require.NoError(t, q.RequeueNackedItems())
+	assert.Equal(t, 2, q.Len(), "expired jobs should be back in the queue")
+	assert.Equal(t, 0, q.GetNackedItemsCount())
 }
