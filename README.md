@@ -171,6 +171,24 @@ queue.RequeueNackedItems()
 pendingCount := queue.GetNackedItemsCount()
 ```
 
+#### Network errors and retries
+
+go-redis re-sends a command whose reply was lost (a read timeout or a dropped
+connection), up to 3 times by default. What that means per call:
+
+- **`DequeueWithAckId`** is safe: a re-sent pop hands back the item the first
+  attempt took, and after a call that failed outright, the next call returns
+  that item. Delivery is at least once.
+- **`Enqueue`** can store a job twice, and returning `false` after a network
+  error does not prove the job was not stored. Make handlers idempotent.
+- **`Dequeue`** (no ack) is at most once: an item whose reply never arrives is
+  gone. Use `DequeueWithAckId` for jobs you can't lose.
+- **`Remove`** can remove a second identical item if its call is re-sent.
+- Keep the visibility timeout well above the client's retry window
+  (`(retries + 1) × read timeout`, 12s with the defaults). A pop that reaches
+  Redis only after its item was requeued, which takes a stall longer than the
+  visibility timeout, can still lose a job.
+
 ## Testing
 
 ```bash

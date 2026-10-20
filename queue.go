@@ -24,6 +24,7 @@ type Queue struct {
 	expiration        time.Duration
 	visibilityTimeout time.Duration
 	onRequeue         func(n int64) // called after the sweeper requeues n items; guarded by mx
+	retryAckID        string        // ack ID of a pop that failed with an error, reused by the next pop; guarded by mx
 }
 
 func newQueue(c *redis.Client, queueKey string) *Queue {
@@ -216,9 +217,10 @@ func (q *Queue) PrepareForFutureAck(ackID string, item any) error {
 	case <-q.ctx.Done():
 		return fmt.Errorf("queue closed, cannot prepare for acknowledgment")
 	default:
-		// Store in pending list with the ack ID
+		// Store in pending list with the ack ID. MULTI/EXEC, so a lost reply
+		// can't leave a pending entry without its deadline.
 		pendingKey := q.getNackedItemKey()
-		pipe := q.client.Pipeline()
+		pipe := q.client.TxPipeline()
 
 		pipe.HSet(q.ctx, pendingKey, ackID, item)
 
@@ -275,14 +277,24 @@ redis.call('HSET', KEYS[2], ARGV[1], v)
 if tonumber(ARGV[2]) > 0 then redis.call('ZADD', KEYS[3], ARGV[2], ARGV[1]) end
 return v`
 
+// reRunGuard heads the ack pop scripts. go-redis re-sends a command whose
+// reply was lost (a read timeout or a dropped connection), with the same
+// ARGV, so a script can run twice for one call. If this call's ack ID is
+// already pending, the first run popped: return its item and pop nothing,
+// or the second run would pop the next item under the same ack ID and the
+// first item would be in neither the queue nor the pending hash.
+const reRunGuard = `local prev = redis.call('HGET', KEYS[2], ARGV[1])
+if prev then return prev end
+`
+
 // Pop and pending run as one script, so an item is always in the queue or in
 // the pending hash: a client that dies between two round trips can't lose it.
 var (
-	listAckPop = redis.NewScript(`local v = redis.call('LPOP', KEYS[1])
+	listAckPop = redis.NewScript(reRunGuard + `local v = redis.call('LPOP', KEYS[1])
 if not v then return false end` + ackPending)
 	// zsetAckPop also keeps the popped score in KEYS[4] under the ack ID, so
 	// a requeue restores the item's priority.
-	zsetAckPop = redis.NewScript(`local r = redis.call('ZPOPMIN', KEYS[1])
+	zsetAckPop = redis.NewScript(reRunGuard + `local r = redis.call('ZPOPMIN', KEYS[1])
 local v = r[1]
 if not v then return false end
 redis.call('HSET', KEYS[4], ARGV[1], r[2])
@@ -309,15 +321,25 @@ func (q *Queue) dequeueWithAck(pop *redis.Script, extraKeys ...string) (any, boo
 		deadline = unixSeconds(time.Now().Add(q.visibilityTimeout))
 	}
 
-	ackID := cuid.New()
+	// The ack ID is made once per call, so a script go-redis re-sends carries
+	// it again (see reRunGuard). After a failed call it is kept for the next
+	// one: if the failed pop ran anyway, the guard hands its item back now
+	// instead of leaving it pending until the visibility timeout.
+	ackID := q.retryAckID
+	if ackID == "" {
+		ackID = cuid.New()
+	}
+
 	keys := append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey()}, extraKeys...)
 	v, err := pop.Run(q.ctx, q.client, keys, ackID, deadline).Text()
-	if err == redis.Nil {
+	if err != nil && err != redis.Nil {
+		q.retryAckID = ackID
+		log.Printf("Error dequeuing with ack: %v", err)
 		return nil, false, ""
 	}
 
-	if err != nil {
-		log.Printf("Error dequeuing with ack: %v", err)
+	q.retryAckID = ""
+	if err == redis.Nil {
 		return nil, false, ""
 	}
 
