@@ -47,14 +47,17 @@ func (q *DistributedPriorityQueue) Dequeue() (any, bool) {
 	return item, ok
 }
 
+// DequeueWithAckId pops one item; a consumer that finds the queue empty joins
+// the idle set in the same step.
 func (q *DistributedPriorityQueue) DequeueWithAckId() (any, bool, string) {
-	item, ok, ackID := q.PriorityQueue.DequeueWithAckId()
+	return q.dequeueOne(zsetAckPop, q.consumerID(), q.getPriorityKey())
+}
 
-	if !ok {
-		q.markIdle()
-	}
-
-	return item, ok, ackID
+// DequeueBatchWithAckIds pops up to len(items) items (see
+// PriorityQueue.DequeueBatchWithAckIds); a consumer whose pop comes up short
+// joins the idle set in the same step.
+func (q *DistributedPriorityQueue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n, remaining int, err error) {
+	return q.dequeueBatch(zsetAckPop, items, ackIDs, q.consumerID(), q.getPriorityKey())
 }
 
 func (q *DistributedPriorityQueue) Close() error {

@@ -129,7 +129,14 @@ func (pq *PriorityQueue) Values() []any {
 }
 
 func (pq *PriorityQueue) DequeueWithAckId() (any, bool, string) {
-	return pq.dequeueWithAck(zsetAckPop, pq.getPriorityKey())
+	return pq.dequeueOne(zsetAckPop, "", pq.getPriorityKey())
+}
+
+// DequeueBatchWithAckIds moves up to len(items) items, lowest score first and
+// FIFO within a score, to pending in one atomic step (see
+// Queue.DequeueBatchWithAckIds).
+func (pq *PriorityQueue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n, remaining int, err error) {
+	return pq.dequeueBatch(zsetAckPop, items, ackIDs, "", pq.getPriorityKey())
 }
 
 // zsetRequeue re-adds requeued items at the priority they were dequeued at

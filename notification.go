@@ -177,6 +177,14 @@ func (n *Notification) len() int {
 	return length
 }
 
+// consumerID is this instance's ID if it is a consumer, else ”.
+func (n *Notification) consumerID() string {
+	if n.consumer.Load() {
+		return n.id
+	}
+	return ""
+}
+
 // markIdle adds this consumer to the idle set after a dequeue found nothing.
 // An enqueue between the miss and this call sends no wake; nudgeLoop catches
 // it.
