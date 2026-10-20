@@ -1,8 +1,12 @@
 package redisq
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -738,4 +742,37 @@ func TestConcurrentRequeueNoDuplicates(t *testing.T) {
 
 	assert.Equal(t, n, q.Len(), "each expired item should be requeued once")
 	assert.Equal(t, 0, q.GetNackedItemsCount())
+}
+
+// Closing the client without closing the queue must stop the sweeper, not
+// log a failed requeue every second forever.
+func TestSweeperStopsWhenClientClosed(t *testing.T) {
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	qs := New(getTestRedisURL())
+	_ = qs.NewQueue("test_sweeper_closed_client")
+	require.NoError(t, qs.Close())
+	time.Sleep(3500 * time.Millisecond)
+
+	assert.LessOrEqual(t, strings.Count(buf.String(), "Error requeueing"), 1)
+}
+
+// lockedBuffer collects log output written by other goroutines.
+type lockedBuffer struct {
+	mx  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mx.Lock()
+	defer b.mx.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mx.Lock()
+	defer b.mx.Unlock()
+	return b.buf.String()
 }

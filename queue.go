@@ -2,6 +2,7 @@ package redisq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -307,6 +308,7 @@ if tonumber(ARGV[1]) > 0 then
 else
 	ids = redis.call('HKEYS', KEYS[2])
 end
+local n = 0
 for _, id in ipairs(ids) do
 	local v = redis.call('HGET', KEYS[2], id)
 	redis.call('HDEL', KEYS[2], id)
@@ -314,9 +316,10 @@ for _, id in ipairs(ids) do
 	if v then
 `
 	requeueEnd = `
+		n = n + 1
 	end
 end
-return #ids`
+return n`
 )
 
 // listRequeue pushes requeued items to the front, ahead of newer work.
@@ -354,7 +357,12 @@ func (q *Queue) sweep(requeue func() (int64, error)) {
 			continue
 		}
 
-		if n, _ := requeue(); n > 0 {
+		n, err := requeue()
+		if errors.Is(err, redis.ErrClosed) {
+			return // the client was closed without closing this queue
+		}
+
+		if n > 0 {
 			q.mx.Lock()
 			onRequeue := q.onRequeue
 			q.mx.Unlock()
@@ -391,7 +399,7 @@ func (q *Queue) requeue(script *redis.Script, extraKeys ...string) (int64, error
 	n, err := script.Run(q.ctx, q.client, keys, now).Int64()
 	if err != nil {
 		log.Printf("Error requeueing pending items: %v", err)
-		return 0, fmt.Errorf("error requeueing pending items: %v", err)
+		return 0, fmt.Errorf("error requeueing pending items: %w", err)
 	}
 
 	return n, nil
