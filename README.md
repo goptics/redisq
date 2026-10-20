@@ -179,6 +179,11 @@ round trip, each pending under its own ack ID, and reports how many are left.
 Size the buffers to the work you can start right away: items taken but not
 started are invisible to other consumers while their visibility timeout runs.
 
+A call takes at most as many items as the previous call on the same queue
+object left behind (a full batch on its first call). After the queue was seen
+empty, a call takes one item, cheaply, and `remaining` says whether to call
+again. Keep calling while `remaining > 0` and you have room.
+
 ```go
 items := make([]any, 8)
 ackIDs := make([]string, 8)
