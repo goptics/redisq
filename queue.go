@@ -24,6 +24,7 @@ type Queue struct {
 	expiration        time.Duration
 	visibilityTimeout time.Duration
 	onRequeue         func(n int64) // called after the sweeper requeues n items; guarded by mx
+	retryAckID        string        // ack ID of a pop that failed with an error, reused by the next pop; guarded by mx
 }
 
 func newQueue(c *redis.Client, queueKey string) *Queue {
@@ -216,9 +217,10 @@ func (q *Queue) PrepareForFutureAck(ackID string, item any) error {
 	case <-q.ctx.Done():
 		return fmt.Errorf("queue closed, cannot prepare for acknowledgment")
 	default:
-		// Store in pending list with the ack ID
+		// Store in pending list with the ack ID. MULTI/EXEC, so a lost reply
+		// can't leave a pending entry without its deadline.
 		pendingKey := q.getNackedItemKey()
-		pipe := q.client.Pipeline()
+		pipe := q.client.TxPipeline()
 
 		pipe.HSet(q.ctx, pendingKey, ackID, item)
 
@@ -319,15 +321,25 @@ func (q *Queue) dequeueWithAck(pop *redis.Script, extraKeys ...string) (any, boo
 		deadline = unixSeconds(time.Now().Add(q.visibilityTimeout))
 	}
 
-	ackID := cuid.New() // made once per call, so a re-sent script carries it again (see reRunGuard)
+	// The ack ID is made once per call, so a script go-redis re-sends carries
+	// it again (see reRunGuard). After a failed call it is kept for the next
+	// one: if the failed pop ran anyway, the guard hands its item back now
+	// instead of leaving it pending until the visibility timeout.
+	ackID := q.retryAckID
+	if ackID == "" {
+		ackID = cuid.New()
+	}
+
 	keys := append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey()}, extraKeys...)
 	v, err := pop.Run(q.ctx, q.client, keys, ackID, deadline).Text()
-	if err == redis.Nil {
+	if err != nil && err != redis.Nil {
+		q.retryAckID = ackID
+		log.Printf("Error dequeuing with ack: %v", err)
 		return nil, false, ""
 	}
 
-	if err != nil {
-		log.Printf("Error dequeuing with ack: %v", err)
+	q.retryAckID = ""
+	if err == redis.Nil {
 		return nil, false, ""
 	}
 

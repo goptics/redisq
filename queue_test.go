@@ -805,16 +805,19 @@ func TestVisibilityTimeoutNotCutShort(t *testing.T) {
 	assert.Equal(t, 1, q.Len())
 }
 
-// dropProxy forwards TCP to Redis. Armed, it lets the next script call reach
-// Redis and run, then drops the connection before the reply gets back, the
-// way a network blip or a read timeout does. go-redis then re-sends the call.
+// dropProxy forwards TCP to Redis. It watches for one script, by hash: each
+// call of it that reaches Redis counts in sends, and while drops > 0 the
+// call runs on Redis but its connection is cut before the reply gets back,
+// the way a network blip or a read timeout does. go-redis then re-sends it.
 type dropProxy struct {
 	ln     net.Listener
 	target string
-	arm    atomic.Bool
+	hash   []byte
+	sends  atomic.Int32
+	drops  atomic.Int32
 }
 
-func newDropProxy(t *testing.T) *dropProxy {
+func newDropProxy(t *testing.T, script *redis.Script) *dropProxy {
 	t.Helper()
 	opts, err := redis.ParseURL(getTestRedisURL())
 	require.NoError(t, err)
@@ -823,7 +826,7 @@ func newDropProxy(t *testing.T) *dropProxy {
 	require.NoError(t, err)
 	t.Cleanup(func() { ln.Close() })
 
-	p := &dropProxy{ln: ln, target: opts.Addr}
+	p := &dropProxy{ln: ln, target: opts.Addr, hash: []byte(script.Hash())}
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -854,8 +857,11 @@ func (p *dropProxy) handle(c net.Conn) {
 		for {
 			n, err := c.Read(buf)
 			if n > 0 {
-				if bytes.Contains(bytes.ToLower(buf[:n]), []byte("evalsha")) && p.arm.CompareAndSwap(true, false) {
-					drop.Store(true)
+				if bytes.Contains(buf[:n], p.hash) {
+					p.sends.Add(1)
+					if p.drops.Add(-1) >= 0 {
+						drop.Store(true)
+					}
 				}
 				if _, err := r.Write(buf[:n]); err != nil {
 					break
@@ -885,59 +891,112 @@ func (p *dropProxy) handle(c net.Conn) {
 	}
 }
 
+// retryCase is a list or priority queue behind a dropProxy, holding "a"
+// then "b" at the same priority.
+type retryCase struct {
+	name  string
+	pop   *redis.Script
+	setup func(t *testing.T, url string) (q *Queue, push func(string) bool, cleanup func())
+}
+
+var retryCases = []retryCase{
+	{"list", listAckPop, func(t *testing.T, url string) (*Queue, func(string) bool, func()) {
+		qs := New(url)
+		q := qs.NewQueue("test_retry_pop_list")
+		return q, func(s string) bool { return q.Enqueue(s) }, func() { q.Close(); qs.Close() }
+	}},
+	{"priority", zsetAckPop, func(t *testing.T, url string) (*Queue, func(string) bool, func()) {
+		qs := New(url)
+		pq := qs.NewPriorityQueue("test_retry_pop_prio")
+		return pq.Queue, func(s string) bool { return pq.Enqueue(s, 1) }, func() { pq.Close(); qs.Close() }
+	}},
+}
+
+func (c retryCase) run(t *testing.T, drops int32, check func(t *testing.T, q *Queue, p *dropProxy, dequeue func() (string, bool, string), size func() int)) {
+	t.Run(c.name, func(t *testing.T) {
+		ctx := context.Background()
+		p := newDropProxy(t, c.pop)
+		q, push, cleanup := c.setup(t, p.url())
+		defer cleanup()
+
+		keys := []string{q.queueKey, q.queueKey + ":seq", q.getNackedItemKey(), q.getTimeoutKey(), q.getPriorityKey()}
+		q.client.Del(ctx, keys...)
+		defer q.client.Del(ctx, keys...)
+
+		require.True(t, push("a"))
+		require.True(t, push("b"))
+		require.NoError(t, c.pop.Load(ctx, q.client).Err()) // so every pop is an EVALSHA the proxy sees
+
+		dequeue := func() (string, bool, string) {
+			var item any
+			var ok bool
+			var ackID string
+			if c.name == "priority" {
+				item, ok, ackID = (&PriorityQueue{Queue: q}).DequeueWithAckId()
+			} else {
+				item, ok, ackID = q.DequeueWithAckId()
+			}
+			if !ok {
+				return "", false, ""
+			}
+			return string(item.([]byte)), true, ackID
+		}
+
+		size := q.Len
+		if c.name == "priority" {
+			size = (&PriorityQueue{Queue: q}).Len
+		}
+
+		p.drops.Store(drops)
+		check(t, q, p, dequeue, size)
+	})
+}
+
 // A pop whose reply is lost is re-sent by go-redis. The re-run must hand back
 // the item the first run popped, not pop the next one under the same ack ID,
 // which used to lose the first item.
 func TestPopRetryAfterLostReplyKeepsEveryItem(t *testing.T) {
-	ctx := context.Background()
+	for _, c := range retryCases {
+		c.run(t, 1, func(t *testing.T, q *Queue, p *dropProxy, dequeue func() (string, bool, string), size func() int) {
+			item, ok, ackID := dequeue()
+			require.True(t, ok)
+			assert.EqualValues(t, 2, p.sends.Load(), "the pop should run, lose its reply and be re-sent once")
 
-	t.Run("list", func(t *testing.T) {
-		p := newDropProxy(t)
-		qs := New(p.url())
-		defer qs.Close()
-		q := qs.NewQueue("test_retry_pop_list")
-		defer q.Close()
-		defer q.client.Del(ctx, q.queueKey, q.getNackedItemKey(), q.getTimeoutKey())
-		q.client.Del(ctx, q.queueKey, q.getNackedItemKey(), q.getTimeoutKey())
+			assert.Equal(t, "a", item)
+			assert.Equal(t, 1, size(), "b must still be queued")
+			assert.Equal(t, 1, q.GetNackedItemsCount())
+			pending, err := q.client.HGet(context.Background(), q.getNackedItemKey(), ackID).Result()
+			require.NoError(t, err)
+			assert.Equal(t, "a", pending)
+			if c.name == "priority" {
+				score, err := q.client.HGet(context.Background(), q.getPriorityKey(), ackID).Result()
+				require.NoError(t, err)
+				assert.Equal(t, "1", score, "the priority must be kept for a requeue")
+			}
+		})
+	}
+}
 
-		require.True(t, q.Enqueue("a"))
-		require.True(t, q.Enqueue("b"))
-		require.NoError(t, listAckPop.Load(ctx, q.client).Err()) // so the next call is an EVALSHA
+// When every attempt loses its reply, the call fails but its pop ran. The
+// next call reuses the ack ID and gets that item back at once, instead of it
+// waiting pending for the visibility timeout.
+func TestPopAfterFailedCallReturnsItsItem(t *testing.T) {
+	for _, c := range retryCases {
+		c.run(t, 4, func(t *testing.T, q *Queue, p *dropProxy, dequeue func() (string, bool, string), size func() int) { // 4 = go-redis's 1 try + 3 retries
+			_, ok, _ := dequeue()
+			require.False(t, ok, "every reply was dropped")
+			assert.EqualValues(t, 4, p.sends.Load())
+			assert.Equal(t, 1, q.GetNackedItemsCount(), "the first attempt popped a")
 
-		p.arm.Store(true)
-		item, ok, ackID := q.DequeueWithAckId()
-		require.True(t, ok)
-		assert.False(t, p.arm.Load(), "the reply was never dropped")
+			item, ok, _ := dequeue()
+			require.True(t, ok)
+			assert.Equal(t, "a", item)
+			assert.Equal(t, 1, size(), "b must still be queued")
+			assert.Equal(t, 1, q.GetNackedItemsCount())
 
-		assert.Equal(t, "a", string(item.([]byte)))
-		assert.Equal(t, 1, q.Len(), "b must still be queued")
-		assert.Equal(t, 1, q.GetNackedItemsCount())
-		pending, err := q.client.HGet(ctx, q.getNackedItemKey(), ackID).Result()
-		require.NoError(t, err)
-		assert.Equal(t, "a", pending)
-	})
-
-	t.Run("priority", func(t *testing.T) {
-		p := newDropProxy(t)
-		qs := New(p.url())
-		defer qs.Close()
-		pq := qs.NewPriorityQueue("test_retry_pop_prio")
-		defer pq.Close()
-		keys := []string{pq.queueKey, pq.queueKey + ":seq", pq.getNackedItemKey(), pq.getTimeoutKey(), pq.getPriorityKey()}
-		defer pq.client.Del(ctx, keys...)
-		pq.client.Del(ctx, keys...)
-
-		require.True(t, pq.Enqueue("a", 1))
-		require.True(t, pq.Enqueue("b", 1))
-		require.NoError(t, zsetAckPop.Load(ctx, pq.client).Err())
-
-		p.arm.Store(true)
-		item, ok, _ := pq.DequeueWithAckId()
-		require.True(t, ok)
-		assert.False(t, p.arm.Load(), "the reply was never dropped")
-
-		assert.Equal(t, "a", string(item.([]byte)))
-		assert.Equal(t, 1, pq.Len(), "b must still be queued")
-		assert.Equal(t, 1, pq.GetNackedItemsCount())
-	})
+			item, ok, _ = dequeue()
+			require.True(t, ok)
+			assert.Equal(t, "b", item, "the next call is an ordinary pop")
+		})
+	}
 }
