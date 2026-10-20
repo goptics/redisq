@@ -149,3 +149,23 @@ func TestDistributedPriorityQueue(t *testing.T) {
 		})
 	})
 }
+
+// A failed enqueue must not wake workers or count as submitted in varmq.
+func TestDistributedPriorityQueueNoNotifyOnFailedEnqueue(t *testing.T) {
+	qs := New(getTestRedisURL())
+	defer qs.Close()
+
+	dpq := qs.NewDistributedPriorityQueue("test_failed_enqueue_notify")
+	defer dpq.Close()
+
+	got := make(chan string, 1)
+	dpq.Subscribe(func(action string) { got <- action })
+
+	assert.False(t, dpq.Enqueue(42, 1), "unsupported type should fail")
+
+	select {
+	case action := <-got:
+		t.Fatalf("got %q notification for a failed enqueue", action)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
