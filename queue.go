@@ -242,23 +242,61 @@ func (q *Queue) Acknowledge(ackID string) bool {
 	}
 }
 
-func (q *Queue) DequeueWithAckId() (any, bool, string) {
-	v, ok := q.Dequeue()
+// ackPending is the tail of the ack pop scripts: it stores the popped item v
+// in the pending hash under ARGV[1], with the same bookkeeping as
+// PrepareForFutureAck. ARGV[2] is the visibility deadline in Unix seconds
+// (0: none) and ARGV[3] the ack timeout in milliseconds (0: none).
+const ackPending = `
+redis.call('HSET', KEYS[2], ARGV[1], v)
+if tonumber(ARGV[2]) > 0 then
+	redis.call('ZADD', KEYS[3], ARGV[2], ARGV[1])
+	if tonumber(ARGV[3]) > 0 then redis.call('PEXPIRE', KEYS[3], ARGV[3]) end
+end
+if tonumber(ARGV[3]) > 0 then redis.call('PEXPIRE', KEYS[2], ARGV[3]) end
+return v`
 
-	if !ok {
+// Pop and pending run as one script, so an item is always in the queue or in
+// the pending hash: a client that dies between two round trips can't lose it.
+var (
+	listAckPop = redis.NewScript(`local v = redis.call('LPOP', KEYS[1])
+if not v then return false end` + ackPending)
+	zsetAckPop = redis.NewScript(`local v = redis.call('ZPOPMIN', KEYS[1])[1]
+if not v then return false end` + ackPending)
+)
+
+func (q *Queue) DequeueWithAckId() (any, bool, string) {
+	return q.dequeueWithAck(listAckPop)
+}
+
+// dequeueWithAck pops the next item with pop and marks it pending under a new
+// ack ID in the same atomic step.
+func (q *Queue) dequeueWithAck(pop *redis.Script) (any, bool, string) {
+	q.mx.Lock()
+	defer q.mx.Unlock()
+
+	if q.ctx.Err() != nil {
+		log.Println("queue closed, cannot dequeue")
 		return nil, false, ""
 	}
 
-	// Prepare for acknowledgment
+	var deadline int64
+	if q.visibilityTimeout > 0 {
+		deadline = time.Now().Add(q.visibilityTimeout).Unix()
+	}
+
 	ackID := cuid.New()
-	err := q.PrepareForFutureAck(ackID, v)
+	keys := []string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey()}
+	v, err := pop.Run(q.ctx, q.client, keys, ackID, deadline, q.ackTimeout.Milliseconds()).Text()
+	if err == redis.Nil {
+		return nil, false, ""
+	}
 
 	if err != nil {
-		log.Printf("Error preparing for acknowledgment: %v", err)
+		log.Printf("Error dequeuing with ack: %v", err)
 		return nil, false, ""
 	}
 
-	return v, true, ackID
+	return []byte(v), true, ackID
 }
 
 // requeueNackedItems checks for un-acknowledged items in the nacked list
