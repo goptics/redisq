@@ -113,3 +113,37 @@ func TestDistributedQueueConcurrency(t *testing.T) {
 
 	assert.Equal(t, numGoroutines*numOperations, q.Len())
 }
+
+// A job whose consumer never acknowledges it must come back on its own, and
+// wake distributed workers, without waiting for a process restart.
+func TestDistributedQueueSweeperRequeues(t *testing.T) {
+	qs := New(getTestRedisURL())
+	defer qs.Close()
+
+	key := "test_sweeper_queue"
+	dq := qs.NewDistributedQueue(key)
+	defer dq.Close()
+	defer dq.Queue.client.Del(context.Background(), key, dq.getNackedItemKey(), dq.getTimeoutKey())
+
+	enqueued := make(chan struct{}, 10)
+	dq.Subscribe(func(action string) {
+		if action == "enqueued" {
+			enqueued <- struct{}{}
+		}
+	})
+
+	dq.SetVisibilityTimeout(time.Second)
+	require.True(t, dq.Enqueue("job"))
+	<-enqueued
+
+	_, ok, _ := dq.DequeueWithAckId()
+	require.True(t, ok)
+
+	select {
+	case <-enqueued:
+	case <-time.After(4 * time.Second):
+		t.Fatal("sweeper did not requeue the expired job")
+	}
+	assert.Equal(t, 1, dq.Len())
+	assert.Equal(t, 0, dq.GetNackedItemsCount())
+}

@@ -1,8 +1,12 @@
 package redisq
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -684,9 +688,7 @@ func TestAckTimeoutKeepsPendingForRequeue(t *testing.T) {
 	}
 
 	time.Sleep(2100 * time.Millisecond)
-	assert.Equal(t, 2, q.GetNackedItemsCount(), "pending jobs were deleted")
-
-	require.NoError(t, q.RequeueNackedItems())
+	require.NoError(t, q.RequeueNackedItems()) // the sweeper may have done it already
 	assert.Equal(t, 2, q.Len(), "expired jobs should be back in the queue")
 	assert.Equal(t, 0, q.GetNackedItemsCount())
 }
@@ -740,4 +742,63 @@ func TestConcurrentRequeueNoDuplicates(t *testing.T) {
 
 	assert.Equal(t, n, q.Len(), "each expired item should be requeued once")
 	assert.Equal(t, 0, q.GetNackedItemsCount())
+}
+
+// Closing the client without closing the queue must stop the sweeper, not
+// log a failed requeue every second forever.
+func TestSweeperStopsWhenClientClosed(t *testing.T) {
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	qs := New(getTestRedisURL())
+	_ = qs.NewQueue("test_sweeper_closed_client")
+	require.NoError(t, qs.Close())
+	time.Sleep(3500 * time.Millisecond)
+
+	assert.LessOrEqual(t, strings.Count(buf.String(), "Error requeueing"), 1)
+}
+
+// lockedBuffer collects log output written by other goroutines.
+type lockedBuffer struct {
+	mx  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mx.Lock()
+	defer b.mx.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mx.Lock()
+	defer b.mx.Unlock()
+	return b.buf.String()
+}
+
+// A job must stay pending for its whole visibility timeout. Deadlines rounded
+// down to whole seconds let it be requeued up to a second early.
+func TestVisibilityTimeoutNotCutShort(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	q.SetVisibilityTimeout(time.Second)
+	// Start half way into a second, where a whole-second deadline would pass
+	// after about 500ms.
+	for ns := time.Now().Nanosecond(); ns < 5e8 || ns > 6e8; ns = time.Now().Nanosecond() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	require.True(t, q.Enqueue("job"))
+	start := time.Now()
+	_, ok, _ := q.DequeueWithAckId()
+	require.True(t, ok)
+
+	for q.GetNackedItemsCount() == 1 && time.Since(start) < 3*time.Second {
+		require.NoError(t, q.RequeueNackedItems())
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	assert.GreaterOrEqual(t, time.Since(start), 990*time.Millisecond, "requeued before its visibility timeout")
+	assert.Equal(t, 1, q.Len())
 }

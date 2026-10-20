@@ -12,6 +12,7 @@ func newDistributedPriorityQueue(client *redis.Client, queueKey string) *Distrib
 		PriorityQueue: newPriorityQueue(client, queueKey),
 		Notification:  newNotification(client, queueKey),
 	}
+	q.setOnRequeue(func() { q.Send("enqueued") })
 	defer q.Start()
 
 	return q

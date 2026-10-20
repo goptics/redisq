@@ -48,6 +48,7 @@ func newPriorityQueue(client *redis.Client, queueKey string) *PriorityQueue {
 	}
 
 	q.RequeueNackedItems()
+	go q.sweep(func() (int64, error) { return q.requeue(zsetRequeue, q.queueKey+":seq") })
 	return q
 }
 
@@ -154,5 +155,6 @@ var zsetRequeue = redis.NewScript(requeueLoop + `local s = redis.call('INCR', KE
 // RequeueNackedItems returns un-acknowledged items whose visibility timeout
 // has passed (every pending item when it is 0) to the priority queue.
 func (pq *PriorityQueue) RequeueNackedItems() error {
-	return pq.requeue(zsetRequeue, pq.queueKey+":seq")
+	_, err := pq.requeue(zsetRequeue, pq.queueKey+":seq")
+	return err
 }

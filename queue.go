@@ -2,6 +2,7 @@ package redisq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -22,6 +23,7 @@ type Queue struct {
 	cancel            context.CancelFunc
 	expiration        time.Duration
 	visibilityTimeout time.Duration
+	onRequeue         func() // called after the sweeper requeues items; guarded by mx
 }
 
 func newQueue(c *redis.Client, queueKey string) *Queue {
@@ -29,6 +31,7 @@ func newQueue(c *redis.Client, queueKey string) *Queue {
 
 	// requeue nacked items
 	q.RequeueNackedItems()
+	go q.sweep(func() (int64, error) { return q.requeue(listRequeue) })
 
 	return q
 }
@@ -196,7 +199,7 @@ func (q *Queue) PrepareForFutureAck(ackID string, item any) error {
 		// If visibility timeout is set, track it in ZSET
 		if q.visibilityTimeout > 0 {
 			timeoutKey := q.getTimeoutKey()
-			score := float64(time.Now().Add(q.visibilityTimeout).Unix())
+			score := unixSeconds(time.Now().Add(q.visibilityTimeout))
 			pipe.ZAdd(q.ctx, timeoutKey, redis.Z{
 				Score:  score,
 				Member: ackID,
@@ -238,8 +241,8 @@ func (q *Queue) Acknowledge(ackID string) bool {
 
 // ackPending is the tail of the ack pop scripts: it stores the popped item v
 // in the pending hash under ARGV[1], with the same bookkeeping as
-// PrepareForFutureAck. ARGV[2] is the visibility deadline in Unix seconds
-// (0: none).
+// PrepareForFutureAck. ARGV[2] is the visibility deadline (see
+// unixSeconds; 0: none).
 const ackPending = `
 redis.call('HSET', KEYS[2], ARGV[1], v)
 if tonumber(ARGV[2]) > 0 then redis.call('ZADD', KEYS[3], ARGV[2], ARGV[1]) end
@@ -270,9 +273,9 @@ func (q *Queue) dequeueWithAck(pop *redis.Script) (any, bool, string) {
 		return nil, false, ""
 	}
 
-	var deadline int64
+	var deadline float64
 	if q.visibilityTimeout > 0 {
-		deadline = time.Now().Add(q.visibilityTimeout).Unix()
+		deadline = unixSeconds(time.Now().Add(q.visibilityTimeout))
 	}
 
 	ackID := cuid.New()
@@ -292,9 +295,9 @@ func (q *Queue) dequeueWithAck(pop *redis.Script) (any, bool, string) {
 
 // requeueLoop and requeueEnd wrap a push of item v back onto the queue. With
 // ARGV[1] > 0 they requeue pending items whose visibility deadline is at or
-// before ARGV[1] (Unix seconds), else every pending item. An item leaves the
-// pending hash in the same script that pushes it, so processes requeueing at
-// once can't push it twice.
+// before ARGV[1] (see unixSeconds), else every pending item. An item leaves
+// the pending hash in the same script that pushes it, so processes
+// requeueing at once can't push it twice.
 // ponytail: one script for all expired items blocks Redis for that long;
 // batch with ZRANGEBYSCORE LIMIT if pending runs to millions.
 const (
@@ -305,6 +308,7 @@ if tonumber(ARGV[1]) > 0 then
 else
 	ids = redis.call('HKEYS', KEYS[2])
 end
+local n = 0
 for _, id in ipairs(ids) do
 	local v = redis.call('HGET', KEYS[2], id)
 	redis.call('HDEL', KEYS[2], id)
@@ -312,9 +316,10 @@ for _, id in ipairs(ids) do
 	if v then
 `
 	requeueEnd = `
+		n = n + 1
 	end
 end
-return #ids`
+return n`
 )
 
 // listRequeue pushes requeued items to the front, ahead of newer work.
@@ -323,30 +328,81 @@ var listRequeue = redis.NewScript(requeueLoop + `redis.call('LPUSH', KEYS[1], v)
 // RequeueNackedItems returns un-acknowledged items whose visibility timeout
 // has passed (every pending item when it is 0) to the queue.
 func (q *Queue) RequeueNackedItems() error {
-	return q.requeue(listRequeue)
+	_, err := q.requeue(listRequeue)
+	return err
 }
 
-func (q *Queue) requeue(script *redis.Script, extraKeys ...string) error {
+// sweep runs requeue every second until Close, and calls onRequeue after it
+// moves any item. Without it an item whose consumer died stayed pending until
+// the next process start. It skips a zero visibility timeout, where requeue
+// takes every pending item, including ones still being processed.
+// ponytail: one script call per queue per second; tie the tick to the
+// visibility timeout if that load ever shows up.
+func (q *Queue) sweep(requeue func() (int64, error)) {
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-q.ctx.Done():
+			return
+		case <-tick.C:
+		}
+
+		q.mx.Lock()
+		vt := q.visibilityTimeout
+		q.mx.Unlock()
+
+		if vt <= 0 {
+			continue
+		}
+
+		n, err := requeue()
+		if errors.Is(err, redis.ErrClosed) {
+			return // the client was closed without closing this queue
+		}
+
+		if n > 0 {
+			q.mx.Lock()
+			onRequeue := q.onRequeue
+			q.mx.Unlock()
+
+			if onRequeue != nil {
+				onRequeue()
+			}
+		}
+	}
+}
+
+// setOnRequeue sets the callback the sweeper runs after requeueing items.
+func (q *Queue) setOnRequeue(fn func()) {
+	q.mx.Lock()
+	defer q.mx.Unlock()
+	q.onRequeue = fn
+}
+
+func (q *Queue) requeue(script *redis.Script, extraKeys ...string) (int64, error) {
 	q.mx.Lock()
 	defer q.mx.Unlock()
 
 	if q.ctx.Err() != nil {
 		log.Println("queue closed, cannot requeue idle items")
-		return fmt.Errorf("queue closed")
+		return 0, fmt.Errorf("queue closed")
 	}
 
-	var now int64
+	var now float64
 	if q.visibilityTimeout > 0 {
-		now = time.Now().Unix()
+		now = unixSeconds(time.Now())
 	}
 
 	keys := append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey()}, extraKeys...)
-	if err := script.Run(q.ctx, q.client, keys, now).Err(); err != nil {
+	n, err := script.Run(q.ctx, q.client, keys, now).Int64()
+	if err != nil {
 		log.Printf("Error requeueing pending items: %v", err)
-		return fmt.Errorf("error requeueing pending items: %v", err)
+		return 0, fmt.Errorf("error requeueing pending items: %w", err)
 	}
 
-	return nil
+	return n, nil
 }
 
 // GetNackedItemsCount returns the number of items in the nacked list
@@ -359,6 +415,14 @@ func (q *Queue) GetNackedItemsCount() int {
 		return 0
 	}
 	return int(count)
+}
+
+// unixSeconds is t in Unix seconds with millisecond precision, the unit of
+// visibility deadlines. Whole seconds would let the sweeper requeue a job up
+// to a second early, while it is still being processed. Deadlines stored in
+// whole seconds by older versions compare correctly.
+func unixSeconds(t time.Time) float64 {
+	return float64(t.UnixMilli()) / 1000
 }
 
 // getNackedItemKey returns the Redis key for the nacked items list
