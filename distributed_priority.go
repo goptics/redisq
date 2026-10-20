@@ -2,6 +2,14 @@ package redisq
 
 import "github.com/redis/go-redis/v9"
 
+// zsetPushWake is zsetPush plus waking idle consumers, up to one per waiting
+// item, in a single round trip. ARGV[3] is the priority and ARGV[4] the wake
+// channel prefix (see Queue.enqueueWith for ARGV[1] and ARGV[2]).
+var zsetPushWake = redis.NewScript(wakeFn + `local s = redis.call('INCR', KEYS[2])
+redis.call('ZADD', KEYS[1], ARGV[3], '\255' .. string.format('%016x', s) .. ARGV[1])
+if tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
+return wake(KEYS[3], ARGV[4], redis.call('ZCARD', KEYS[1]))`)
+
 type DistributedPriorityQueue struct {
 	*PriorityQueue
 	*Notification
@@ -10,32 +18,43 @@ type DistributedPriorityQueue struct {
 func newDistributedPriorityQueue(client *redis.Client, queueKey string) *DistributedPriorityQueue {
 	q := &DistributedPriorityQueue{
 		PriorityQueue: newPriorityQueue(client, queueKey),
-		Notification:  newNotification(client, queueKey),
+		Notification:  newNotification(client, queueKey, "ZCARD"),
 	}
-	q.setOnRequeue(func() { q.Send("enqueued") })
+	q.setOnRequeue(q.wake)
 	defer q.Start()
 
 	return q
 }
 
 func (q *DistributedPriorityQueue) Enqueue(item any, priority int) bool {
-	ok := q.PriorityQueue.Enqueue(item, priority)
+	keys := []string{q.Notification.queueKey, q.Notification.queueKey + ":seq", q.idleKey}
+	return q.enqueueWith(zsetPushWake, keys, item, priority, q.wakePrefix)
+}
 
-	if ok {
-		defer q.Send("enqueued")
-	}
-
-	return ok
+// Len returns the number of items in the queue; a consumer that finds it
+// empty joins the idle set.
+func (q *DistributedPriorityQueue) Len() int {
+	return q.Notification.len()
 }
 
 func (q *DistributedPriorityQueue) Dequeue() (any, bool) {
 	item, ok := q.PriorityQueue.Dequeue()
 
-	if ok {
-		defer q.Send("dequeued")
+	if !ok {
+		q.markIdle()
 	}
 
 	return item, ok
+}
+
+func (q *DistributedPriorityQueue) DequeueWithAckId() (any, bool, string) {
+	item, ok, ackID := q.PriorityQueue.DequeueWithAckId()
+
+	if !ok {
+		q.markIdle()
+	}
+
+	return item, ok, ackID
 }
 
 func (q *DistributedPriorityQueue) Close() error {
