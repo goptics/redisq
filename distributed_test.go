@@ -263,3 +263,54 @@ func TestEnqueueOntoBacklogWakesAllIdle(t *testing.T) {
 		}
 	}
 }
+
+// A consumer whose dequeue finds nothing joins the idle set, so the next
+// enqueue wakes it.
+func TestEmptyDequeueMarksConsumerIdle(t *testing.T) {
+	qs := New(getTestRedisURL())
+	defer qs.Close()
+	ctx := context.Background()
+
+	dq := qs.NewDistributedQueue("test_empty_dequeue_list")
+	defer dq.Close()
+	dpq := qs.NewDistributedPriorityQueue("test_empty_dequeue_prio")
+	defer dpq.Close()
+
+	for _, c := range []struct {
+		n       *Notification
+		dequeue func() bool
+	}{
+		{dq.Notification, func() bool { _, ok := dq.Dequeue(); return ok }},
+		{dq.Notification, func() bool { _, ok, _ := dq.DequeueWithAckId(); return ok }},
+		{dpq.Notification, func() bool { _, ok := dpq.Dequeue(); return ok }},
+		{dpq.Notification, func() bool { _, ok, _ := dpq.DequeueWithAckId(); return ok }},
+	} {
+		c.n.Subscribe(func(string) {})
+		require.NoError(t, c.n.client.SRem(ctx, c.n.idleKey, c.n.id).Err())
+
+		assert.False(t, c.dequeue())
+		member, err := c.n.client.SIsMember(ctx, c.n.idleKey, c.n.id).Result()
+		require.NoError(t, err)
+		assert.True(t, member, "%s: empty dequeue should mark the consumer idle", c.n.queueKey)
+	}
+}
+
+// Enqueue refuses work once the queue or its client is closed, and Len
+// reads 0 instead of failing.
+func TestDistributedQueueClosed(t *testing.T) {
+	qs := New(getTestRedisURL())
+	dq := qs.NewDistributedQueue("test_closed_dq")
+	dpq := qs.NewDistributedPriorityQueue("test_closed_dpq")
+	dpq.Subscribe(func(string) {}) // a consumer, so its nudge loop runs
+
+	require.NoError(t, dq.Close())
+	assert.False(t, dq.Enqueue("job"), "enqueue on a closed queue")
+
+	require.NoError(t, qs.Close())
+	assert.False(t, dpq.Enqueue("job", 1), "enqueue on a closed client")
+	assert.Equal(t, 0, dpq.Len())
+
+	// The nudge loop must stop on the closed client rather than spin.
+	time.Sleep(1200 * time.Millisecond)
+	_ = dpq.Close()
+}
