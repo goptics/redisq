@@ -815,6 +815,7 @@ type dropProxy struct {
 	hash   []byte
 	sends  atomic.Int32
 	drops  atomic.Int32
+	onDrop func() // if set, runs after Redis ran a call whose reply is being dropped
 }
 
 func newDropProxy(t *testing.T, script *redis.Script) *dropProxy {
@@ -879,6 +880,9 @@ func (p *dropProxy) handle(c net.Conn) {
 		n, err := r.Read(buf)
 		if n > 0 {
 			if drop.Load() {
+				if p.onDrop != nil {
+					p.onDrop()
+				}
 				return // Redis ran the script; the client never hears back
 			}
 			if _, err := c.Write(buf[:n]); err != nil {
@@ -894,18 +898,19 @@ func (p *dropProxy) handle(c net.Conn) {
 // retryCase is a list or priority queue behind a dropProxy, holding "a"
 // then "b" at the same priority.
 type retryCase struct {
-	name  string
-	pop   *redis.Script
-	setup func(t *testing.T, url string) (q *Queue, push func(string) bool, cleanup func())
+	name   string
+	pop    *redis.Script // batch pop
+	popOne *redis.Script // single pop
+	setup  func(t *testing.T, url string) (q *Queue, push func(string) bool, cleanup func())
 }
 
 var retryCases = []retryCase{
-	{"list", listAckPop, func(t *testing.T, url string) (*Queue, func(string) bool, func()) {
+	{"list", listAckPop, listAckPopOne, func(t *testing.T, url string) (*Queue, func(string) bool, func()) {
 		qs := New(url)
 		q := qs.NewQueue("test_retry_pop_list")
 		return q, func(s string) bool { return q.Enqueue(s) }, func() { q.Close(); qs.Close() }
 	}},
-	{"priority", zsetAckPop, func(t *testing.T, url string) (*Queue, func(string) bool, func()) {
+	{"priority", zsetAckPop, zsetAckPopOne, func(t *testing.T, url string) (*Queue, func(string) bool, func()) {
 		qs := New(url)
 		pq := qs.NewPriorityQueue("test_retry_pop_prio")
 		return pq.Queue, func(s string) bool { return pq.Enqueue(s, 1) }, func() { pq.Close(); qs.Close() }
@@ -915,7 +920,7 @@ var retryCases = []retryCase{
 func (c retryCase) run(t *testing.T, drops int32, check func(t *testing.T, q *Queue, p *dropProxy, dequeue func() (string, bool, string), size func() int)) {
 	t.Run(c.name, func(t *testing.T) {
 		ctx := context.Background()
-		p := newDropProxy(t, c.pop)
+		p := newDropProxy(t, c.popOne)
 		q, push, cleanup := c.setup(t, p.url())
 		defer cleanup()
 
@@ -925,7 +930,7 @@ func (c retryCase) run(t *testing.T, drops int32, check func(t *testing.T, q *Qu
 
 		require.True(t, push("a"))
 		require.True(t, push("b"))
-		require.NoError(t, c.pop.Load(ctx, q.client).Err()) // so every pop is an EVALSHA the proxy sees
+		require.NoError(t, c.popOne.Load(ctx, q.client).Err()) // so every pop is an EVALSHA the proxy sees
 
 		dequeue := func() (string, bool, string) {
 			var item any
