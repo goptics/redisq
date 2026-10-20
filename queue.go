@@ -459,16 +459,11 @@ func (q *Queue) Remove(item any) bool {
 	return err == nil
 }
 
+// Listen blocks until the process gets SIGINT or SIGTERM.
 func (q *Queue) Listen() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	if r := recover(); r != nil {
-		q.Close()
-		signal.Stop(sigChan)
-		close(sigChan)
-		panic("Redis queue listener terminated due to panic")
-	}
+	defer signal.Stop(sigChan)
 
 	<-sigChan
 }
