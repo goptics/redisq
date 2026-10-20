@@ -690,3 +690,20 @@ func TestAckTimeoutKeepsPendingForRequeue(t *testing.T) {
 	assert.Equal(t, 2, q.Len(), "expired jobs should be back in the queue")
 	assert.Equal(t, 0, q.GetNackedItemsCount())
 }
+
+// SetAckTimeout(0) meant "no expiry"; it must not turn the visibility timeout
+// off, which would requeue jobs that are still being processed.
+func TestAckTimeoutZeroKeepsVisibility(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	q.SetVisibilityTimeout(time.Minute)
+	q.SetAckTimeout(0)
+	require.True(t, q.Enqueue("job"))
+	_, ok, _ := q.DequeueWithAckId()
+	require.True(t, ok)
+
+	require.NoError(t, q.RequeueNackedItems())
+	assert.Equal(t, 0, q.Len(), "an in-progress job was requeued")
+	assert.Equal(t, 1, q.GetNackedItemsCount())
+}

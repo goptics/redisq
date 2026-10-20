@@ -56,9 +56,12 @@ func (q *Queue) SetExpiration(expiration time.Duration) {
 //
 // Deprecated: use SetVisibilityTimeout, which this calls. It used to expire
 // the whole pending hash, which deleted every unacknowledged job instead of
-// requeueing it.
+// requeueing it. A value <= 0 meant "no expiry" and is ignored: a zero
+// visibility timeout would requeue every pending job, even ones in progress.
 func (q *Queue) SetAckTimeout(ackTimeout time.Duration) {
-	q.SetVisibilityTimeout(ackTimeout)
+	if ackTimeout > 0 {
+		q.SetVisibilityTimeout(ackTimeout)
+	}
 }
 
 // SetVisibilityTimeout sets the visibility timeout for jobs
