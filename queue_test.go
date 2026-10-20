@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -625,4 +626,46 @@ func TestRequeueNackedItemsEmptyWithVisibilityTimeout(t *testing.T) {
 
 	// Verify queue is still empty
 	assert.Equal(t, 0, q.Len(), "Queue should be empty")
+}
+
+// An item popped with an ack ID must never be in neither the queue nor the
+// pending hash, or a client crash at that moment would lose it.
+func TestDequeueWithAckIdNeverDropsItem(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	const n = 300
+	for i := range n {
+		require.True(t, q.Enqueue(fmt.Sprintf("item-%d", i)))
+	}
+
+	ctx := context.Background()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range n {
+			_, ok, _ := q.DequeueWithAckId()
+			assert.True(t, ok)
+		}
+	}()
+
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		var llen, hlen *redis.IntCmd
+		_, err := q.client.TxPipelined(ctx, func(p redis.Pipeliner) error {
+			llen = p.LLen(ctx, q.queueKey)
+			hlen = p.HLen(ctx, q.getNackedItemKey())
+			return nil
+		})
+		require.NoError(t, err)
+		if got := llen.Val() + hlen.Val(); got != n {
+			t.Errorf("queue+pending = %d, want %d: an item was in neither", got, n)
+			<-done
+			return
+		}
+	}
 }
