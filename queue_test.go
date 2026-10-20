@@ -5,9 +5,11 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -801,4 +803,141 @@ func TestVisibilityTimeoutNotCutShort(t *testing.T) {
 
 	assert.GreaterOrEqual(t, time.Since(start), 990*time.Millisecond, "requeued before its visibility timeout")
 	assert.Equal(t, 1, q.Len())
+}
+
+// dropProxy forwards TCP to Redis. Armed, it lets the next script call reach
+// Redis and run, then drops the connection before the reply gets back, the
+// way a network blip or a read timeout does. go-redis then re-sends the call.
+type dropProxy struct {
+	ln     net.Listener
+	target string
+	arm    atomic.Bool
+}
+
+func newDropProxy(t *testing.T) *dropProxy {
+	t.Helper()
+	opts, err := redis.ParseURL(getTestRedisURL())
+	require.NoError(t, err)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { ln.Close() })
+
+	p := &dropProxy{ln: ln, target: opts.Addr}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go p.handle(c)
+		}
+	}()
+
+	return p
+}
+
+func (p *dropProxy) url() string { return "redis://" + p.ln.Addr().String() }
+
+func (p *dropProxy) handle(c net.Conn) {
+	r, err := net.Dial("tcp", p.target)
+	if err != nil {
+		c.Close()
+		return
+	}
+	defer c.Close()
+	defer r.Close()
+
+	var drop atomic.Bool
+	go func() { // client -> Redis
+		buf := make([]byte, 64<<10)
+		for {
+			n, err := c.Read(buf)
+			if n > 0 {
+				if bytes.Contains(bytes.ToLower(buf[:n]), []byte("evalsha")) && p.arm.CompareAndSwap(true, false) {
+					drop.Store(true)
+				}
+				if _, err := r.Write(buf[:n]); err != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		r.Close()
+	}()
+
+	buf := make([]byte, 64<<10)
+	for { // Redis -> client
+		n, err := r.Read(buf)
+		if n > 0 {
+			if drop.Load() {
+				return // Redis ran the script; the client never hears back
+			}
+			if _, err := c.Write(buf[:n]); err != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// A pop whose reply is lost is re-sent by go-redis. The re-run must hand back
+// the item the first run popped, not pop the next one under the same ack ID,
+// which used to lose the first item.
+func TestPopRetryAfterLostReplyKeepsEveryItem(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("list", func(t *testing.T) {
+		p := newDropProxy(t)
+		qs := New(p.url())
+		defer qs.Close()
+		q := qs.NewQueue("test_retry_pop_list")
+		defer q.Close()
+		defer q.client.Del(ctx, q.queueKey, q.getNackedItemKey(), q.getTimeoutKey())
+		q.client.Del(ctx, q.queueKey, q.getNackedItemKey(), q.getTimeoutKey())
+
+		require.True(t, q.Enqueue("a"))
+		require.True(t, q.Enqueue("b"))
+		require.NoError(t, listAckPop.Load(ctx, q.client).Err()) // so the next call is an EVALSHA
+
+		p.arm.Store(true)
+		item, ok, ackID := q.DequeueWithAckId()
+		require.True(t, ok)
+		assert.False(t, p.arm.Load(), "the reply was never dropped")
+
+		assert.Equal(t, "a", string(item.([]byte)))
+		assert.Equal(t, 1, q.Len(), "b must still be queued")
+		assert.Equal(t, 1, q.GetNackedItemsCount())
+		pending, err := q.client.HGet(ctx, q.getNackedItemKey(), ackID).Result()
+		require.NoError(t, err)
+		assert.Equal(t, "a", pending)
+	})
+
+	t.Run("priority", func(t *testing.T) {
+		p := newDropProxy(t)
+		qs := New(p.url())
+		defer qs.Close()
+		pq := qs.NewPriorityQueue("test_retry_pop_prio")
+		defer pq.Close()
+		keys := []string{pq.queueKey, pq.queueKey + ":seq", pq.getNackedItemKey(), pq.getTimeoutKey(), pq.getPriorityKey()}
+		defer pq.client.Del(ctx, keys...)
+		pq.client.Del(ctx, keys...)
+
+		require.True(t, pq.Enqueue("a", 1))
+		require.True(t, pq.Enqueue("b", 1))
+		require.NoError(t, zsetAckPop.Load(ctx, pq.client).Err())
+
+		p.arm.Store(true)
+		item, ok, _ := pq.DequeueWithAckId()
+		require.True(t, ok)
+		assert.False(t, p.arm.Load(), "the reply was never dropped")
+
+		assert.Equal(t, "a", string(item.([]byte)))
+		assert.Equal(t, 1, pq.Len(), "b must still be queued")
+		assert.Equal(t, 1, pq.GetNackedItemsCount())
+	})
 }
