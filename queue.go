@@ -21,7 +21,6 @@ type Queue struct {
 	ctx               context.Context
 	cancel            context.CancelFunc
 	expiration        time.Duration
-	ackTimeout        time.Duration
 	visibilityTimeout time.Duration
 }
 
@@ -53,12 +52,16 @@ func (q *Queue) SetExpiration(expiration time.Duration) {
 	q.expiration = expiration
 }
 
-// SetAckTimeout sets the acknowledgment timeout for jobs
-// This controls how long a job can be processing before being requeued
+// SetAckTimeout sets how long a job can be processing before being requeued.
+//
+// Deprecated: use SetVisibilityTimeout, which this calls. It used to expire
+// the whole pending hash, which deleted every unacknowledged job instead of
+// requeueing it. A value <= 0 meant "no expiry" and is ignored: a zero
+// visibility timeout would requeue every pending job, even ones in progress.
 func (q *Queue) SetAckTimeout(ackTimeout time.Duration) {
-	q.mx.Lock()
-	defer q.mx.Unlock()
-	q.ackTimeout = ackTimeout
+	if ackTimeout > 0 {
+		q.SetVisibilityTimeout(ackTimeout)
+	}
 }
 
 // SetVisibilityTimeout sets the visibility timeout for jobs
@@ -198,15 +201,6 @@ func (q *Queue) PrepareForFutureAck(ackID string, item any) error {
 				Score:  score,
 				Member: ackID,
 			})
-			// Expire the timeout key eventually too, matching ackTimeout or just being safe
-			if q.ackTimeout > 0 {
-				pipe.Expire(q.ctx, timeoutKey, q.ackTimeout)
-			}
-		}
-
-		// Set the expiration for the pending entry
-		if q.ackTimeout > 0 {
-			pipe.Expire(q.ctx, pendingKey, q.ackTimeout)
 		}
 
 		_, err := pipe.Exec(q.ctx)
@@ -245,14 +239,10 @@ func (q *Queue) Acknowledge(ackID string) bool {
 // ackPending is the tail of the ack pop scripts: it stores the popped item v
 // in the pending hash under ARGV[1], with the same bookkeeping as
 // PrepareForFutureAck. ARGV[2] is the visibility deadline in Unix seconds
-// (0: none) and ARGV[3] the ack timeout in milliseconds (0: none).
+// (0: none).
 const ackPending = `
 redis.call('HSET', KEYS[2], ARGV[1], v)
-if tonumber(ARGV[2]) > 0 then
-	redis.call('ZADD', KEYS[3], ARGV[2], ARGV[1])
-	if tonumber(ARGV[3]) > 0 then redis.call('PEXPIRE', KEYS[3], ARGV[3]) end
-end
-if tonumber(ARGV[3]) > 0 then redis.call('PEXPIRE', KEYS[2], ARGV[3]) end
+if tonumber(ARGV[2]) > 0 then redis.call('ZADD', KEYS[3], ARGV[2], ARGV[1]) end
 return v`
 
 // Pop and pending run as one script, so an item is always in the queue or in
@@ -286,7 +276,7 @@ func (q *Queue) dequeueWithAck(pop *redis.Script) (any, bool, string) {
 
 	ackID := cuid.New()
 	keys := []string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey()}
-	v, err := pop.Run(q.ctx, q.client, keys, ackID, deadline, q.ackTimeout.Milliseconds()).Text()
+	v, err := pop.Run(q.ctx, q.client, keys, ackID, deadline).Text()
 	if err == redis.Nil {
 		return nil, false, ""
 	}
