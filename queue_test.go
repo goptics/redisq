@@ -776,3 +776,29 @@ func (b *lockedBuffer) String() string {
 	defer b.mx.Unlock()
 	return b.buf.String()
 }
+
+// A job must stay pending for its whole visibility timeout. Deadlines rounded
+// down to whole seconds let it be requeued up to a second early.
+func TestVisibilityTimeoutNotCutShort(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	q.SetVisibilityTimeout(time.Second)
+	// Start half way into a second, where a whole-second deadline would pass
+	// after about 500ms.
+	for ns := time.Now().Nanosecond(); ns < 5e8 || ns > 6e8; ns = time.Now().Nanosecond() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	require.True(t, q.Enqueue("job"))
+	start := time.Now()
+	_, ok, _ := q.DequeueWithAckId()
+	require.True(t, ok)
+
+	for q.GetNackedItemsCount() == 1 && time.Since(start) < 3*time.Second {
+		require.NoError(t, q.RequeueNackedItems())
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	assert.GreaterOrEqual(t, time.Since(start), 990*time.Millisecond, "requeued before its visibility timeout")
+	assert.Equal(t, 1, q.Len())
+}
