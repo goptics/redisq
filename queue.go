@@ -26,7 +26,7 @@ type Queue struct {
 	expiration        atomic.Int64                // time.Duration
 	visibilityTimeout atomic.Int64                // time.Duration
 	onRequeue         atomic.Pointer[func(int64)] // called after the sweeper requeues n items
-	ackPrefix         string                      // ack IDs are <ackPrefix>:<n>, unique per Queue object
+	ackPrefix         string                      // ack IDs are <ackPrefix>:<reservation>:<index>, unique per Queue object
 	ackSeq            atomic.Uint64               // last reservation number handed out
 	retryPop          atomic.Pointer[reservation] // ack IDs of a pop that failed with an error, reused by the next pop
 	isPriority        bool                        // a zset queue, with :prio entries to clear on ack; set before any goroutine starts
@@ -284,10 +284,16 @@ const maxPop = 1000
 // leading run of those items with their deadlines raised to this call's. A
 // batch shares one deadline, so a requeue moves all of it or none.
 //
-// A pop that leaves the queue empty while the caller had free slots left
-// makes a distributed consumer join the idle set, in the same step, so an
-// enqueue right after it wakes it.
+// A call that leaves the queue empty with fewer items than the caller's free
+// slots makes a distributed consumer join the idle set, in the same step, so
+// an enqueue right after it wakes it. A hand-back counts too: a reused
+// reservation can be smaller than the call.
 const popHead = `local want, pre, resv = tonumber(ARGV[1]), ARGV[3], ARGV[4]
+local function reply(items)
+	local len = redis.call(__LEN__, KEYS[1])
+	if ARGV[5] ~= '' and len == 0 and #items < tonumber(ARGV[6]) then redis.call('SADD', KEYS[4], ARGV[5]) end
+	return {len, items}
+end
 local ids = {}
 for i = 1, want do ids[i] = pre .. ':' .. resv .. ':' .. string.format('%04d', i) end
 local held = redis.call('HMGET', KEYS[2], unpack(ids))
@@ -302,7 +308,7 @@ for i = 1, want do
 				if not d or tonumber(d) < tonumber(ARGV[2]) then redis.call('ZADD', KEYS[3], ARGV[2], ids[j]) end
 			end
 		end
-		return {redis.call(__LEN__, KEYS[1]), items}
+		return reply(items)
 	end
 end
 local items = {}
@@ -319,9 +325,7 @@ if n > 0 then
 	redis.call('HSET', KEYS[2], unpack(h))
 	if tonumber(ARGV[2]) > 0 then redis.call('ZADD', KEYS[3], unpack(z)) end
 end
-local len = redis.call(__LEN__, KEYS[1])
-if ARGV[5] ~= '' and len == 0 and n < tonumber(ARGV[6]) then redis.call('SADD', KEYS[4], ARGV[5]) end
-return {len, items}`
+return reply(items)`
 
 // popScript builds an ack pop script whose body pops into `items`, for
 // storage whose length command is lenCmd.
@@ -409,6 +413,8 @@ func (q *Queue) DequeueWithAckId() (any, bool, string) {
 // capacity was given (remaining is then 0 and means nothing). n can be below
 // that count while remaining > 0 only right after a failed call: the next call
 // of at least that call's size reuses its ack IDs and gets its items back.
+// One failed call is kept at a time; the items of another that failed with
+// it stay pending until they are requeued.
 func (q *Queue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n, remaining int, err error) {
 	return q.dequeueBatch(listAckPop, items, ackIDs, "")
 }
@@ -472,7 +478,8 @@ func (q *Queue) deadline() float64 {
 // dequeueBatch runs pop for up to len(items) items, marking them pending in
 // the same step (see popHead).
 func (q *Queue) dequeueBatch(pop *redis.Script, items []any, ackIDs []string, consumer string, extraKeys ...string) (int, int, error) {
-	want := min(len(items), len(ackIDs), maxPop)
+	slots := min(len(items), len(ackIDs))
+	want := min(slots, maxPop)
 	if want == 0 {
 		return 0, 0, nil
 	}
@@ -484,7 +491,7 @@ func (q *Queue) dequeueBatch(pop *redis.Script, items []any, ackIDs []string, co
 	r := q.reserve(want)
 	resv := fmt.Sprintf("%020d", r.start)
 	keys := append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey()}, extraKeys...)
-	reply, err := pop.Run(q.ctx, q.client, keys, r.want, q.deadline(), q.ackPrefix, resv, consumer, want).Slice()
+	reply, err := pop.Run(q.ctx, q.client, keys, r.want, q.deadline(), q.ackPrefix, resv, consumer, slots).Slice()
 	if err != nil {
 		q.retryPop.CompareAndSwap(nil, r)
 		return 0, 0, err

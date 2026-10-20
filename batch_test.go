@@ -472,8 +472,9 @@ func TestDequeueBatchLargerCallAfterFailedCall(t *testing.T) {
 	}
 }
 
-// A distributed consumer with free slots left joins the idle set when the
-// pop empties the queue, even when it reused a smaller failed reservation.
+// A distributed consumer joins the idle set when a call leaves the queue
+// empty with fewer items than its free slots, also when the call reused a
+// smaller failed reservation, and only then.
 func TestDequeueBatchReusedReservationMarksIdle(t *testing.T) {
 	ctx := context.Background()
 	p := newDropProxy(t, listAckPop)
@@ -483,30 +484,138 @@ func TestDequeueBatchReusedReservationMarksIdle(t *testing.T) {
 	defer dq.Close()
 	delKeys(t, dq.Queue.client, dq.Queue.queueKey)
 	defer delKeys(t, dq.Queue.client, dq.Queue.queueKey)
-
 	dq.Subscribe(func(string) {})
-	require.True(t, dq.Enqueue("a"))
-	require.True(t, dq.Enqueue("b"))
 	require.NoError(t, listAckPop.Load(ctx, dq.Queue.client).Err())
-	require.NoError(t, dq.Queue.client.SRem(ctx, dq.idleKey, dq.id).Err())
 
-	p.drops.Store(4)
-	_, _, err := dq.DequeueBatchWithAckIds(make([]any, 2), make([]string, 2))
-	require.Error(t, err)
+	member := func() bool {
+		ok, err := dq.Queue.client.SIsMember(ctx, dq.idleKey, dq.id).Result()
+		require.NoError(t, err)
+		return ok
+	}
+	// failPop queues vs and loses every reply of a 2-slot pop, which takes
+	// the first two; wipe drops its pending items so the next call's reused
+	// reservation pops afresh instead of handing them back.
+	failPop := func(wipe bool, vs ...string) {
+		for _, v := range vs {
+			require.True(t, dq.Enqueue(v))
+		}
+		p.drops.Store(4)
+		_, _, err := dq.DequeueBatchWithAckIds(make([]any, 2), make([]string, 2))
+		require.Error(t, err)
+		if wipe {
+			require.NoError(t, dq.Queue.client.Del(ctx, dq.getNackedItemKey(), dq.getTimeoutKey()).Err())
+		}
+		require.NoError(t, dq.Queue.client.SRem(ctx, dq.idleKey, dq.id).Err())
+	}
 
-	// Wipe the guard's view of the first run so the reused reservation pops
-	// afresh: its pop of 2 is full for the reservation but short for 5 slots.
-	require.NoError(t, dq.Queue.client.Del(ctx, dq.getNackedItemKey(), dq.getTimeoutKey()).Err())
-	require.True(t, dq.Enqueue("c"))
-	require.True(t, dq.Enqueue("d"))
-	require.NoError(t, dq.Queue.client.SRem(ctx, dq.idleKey, dq.id).Err())
-
+	failPop(false, "a", "b")
 	items, _, remaining := popBatch(t, dq, 5)
-	assert.Equal(t, []string{"c", "d"}, items)
+	assert.Equal(t, []string{"a", "b"}, items, "handed back")
+	assert.Equal(t, 0, remaining)
+	assert.True(t, member(), "a hand-back short of the free slots that leaves the queue empty")
+
+	failPop(true, "c", "d")
+	require.True(t, dq.Enqueue("e"))
+	require.NoError(t, dq.Queue.client.SRem(ctx, dq.idleKey, dq.id).Err())
+	items, _, remaining = popBatch(t, dq, 5)
+	assert.Equal(t, []string{"e"}, items)
+	assert.Equal(t, 0, remaining)
+	assert.True(t, member(), "a fresh pop short of the free slots that leaves the queue empty")
+
+	failPop(true, "f", "g")
+	for _, v := range []string{"h", "i", "j"} {
+		require.True(t, dq.Enqueue(v))
+	}
+	require.NoError(t, dq.Queue.client.SRem(ctx, dq.idleKey, dq.id).Err())
+	items, _, remaining = popBatch(t, dq, 5)
+	assert.Equal(t, []string{"h", "i"}, items, "the reused reservation takes 2")
+	assert.Equal(t, 1, remaining)
+	assert.False(t, member(), "items still wait")
+}
+
+// A buffer bigger than maxPop that empties the queue still has free slots,
+// so the consumer joins the idle set.
+func TestDequeueBatchMaxPopMarksIdle(t *testing.T) {
+	ctx := context.Background()
+	qs := New(getTestRedisURL())
+	defer qs.Close()
+	dq := qs.NewDistributedQueue("test_batch_maxpop_idle")
+	defer dq.Close()
+	delKeys(t, dq.Queue.client, dq.Queue.queueKey)
+	defer delKeys(t, dq.Queue.client, dq.Queue.queueKey)
+	dq.Subscribe(func(string) {})
+
+	vs := make([]any, maxPop)
+	for i := range vs {
+		vs[i] = fmt.Sprintf("j%04d", i)
+	}
+	require.NoError(t, dq.Queue.client.RPush(ctx, dq.Queue.queueKey, vs...).Err())
+	require.NoError(t, dq.Queue.client.SRem(ctx, dq.idleKey, dq.id).Err())
+
+	n, remaining, err := dq.DequeueBatchWithAckIds(make([]any, 1500), make([]string, 1500))
+	require.NoError(t, err)
+	assert.Equal(t, maxPop, n)
 	assert.Equal(t, 0, remaining)
 	member, err := dq.Queue.client.SIsMember(ctx, dq.idleKey, dq.id).Result()
 	require.NoError(t, err)
-	assert.True(t, member, "the consumer still had free slots and the queue is empty")
+	assert.True(t, member, "1500 slots, 1000 items, queue empty")
+}
+
+// A failed single pop's item comes back from the next batch call, and a
+// failed batch's from the next single pop: both share reservations and the
+// ack ID format.
+func TestFailedPopHandsBackAcrossKinds(t *testing.T) {
+	for _, c := range retryCases {
+		c.run(t, 4, func(t *testing.T, q *Queue, p *dropProxy, dequeue func() (string, bool, string), size func() int) {
+			_, ok, _ := dequeue()
+			require.False(t, ok)
+			items, _, remaining := popBatch(t, batcherFor(c, q), 3)
+			assert.Equal(t, []string{"a"}, items, "single pop failed, batch gets its item back")
+			assert.Equal(t, 1, remaining)
+			assert.Equal(t, 1, q.GetNackedItemsCount())
+		})
+	}
+	for _, c := range retryCases {
+		t.Run(c.name+"/batch-then-single", func(t *testing.T) {
+			p := newDropProxy(t, c.pop)
+			q, push, cleanup := c.setup(t, p.url())
+			defer cleanup()
+			delKeys(t, q.client, q.queueKey)
+			defer delKeys(t, q.client, q.queueKey)
+			require.True(t, push("a"))
+			require.True(t, push("b"))
+			require.NoError(t, c.pop.Load(context.Background(), q.client).Err())
+			b := batcherFor(c, q)
+
+			p.drops.Store(4)
+			_, _, err := b.DequeueBatchWithAckIds(make([]any, 1), make([]string, 1))
+			require.Error(t, err)
+			item, ok, _ := b.(interface{ DequeueWithAckId() (any, bool, string) }).DequeueWithAckId()
+			require.True(t, ok)
+			assert.Equal(t, "a", string(item.([]byte)), "batch failed, single pop gets its item back")
+			assert.Equal(t, 1, q.GetNackedItemsCount())
+		})
+	}
+}
+
+// A single pop that hands back a failed call's item gives it a fresh
+// visibility deadline.
+func TestPopHandBackRaisesDeadline(t *testing.T) {
+	for _, c := range retryCases {
+		c.run(t, 4, func(t *testing.T, q *Queue, p *dropProxy, dequeue func() (string, bool, string), size func() int) {
+			q.SetVisibilityTimeout(10 * time.Second)
+			_, ok, _ := dequeue()
+			require.False(t, ok)
+			time.Sleep(1500 * time.Millisecond)
+
+			item, ok, ackID := dequeue()
+			require.True(t, ok)
+			assert.Equal(t, "a", item)
+			d, err := q.client.ZScore(context.Background(), q.getTimeoutKey(), ackID).Result()
+			require.NoError(t, err)
+			assert.GreaterOrEqual(t, d, unixSeconds(time.Now().Add(10*time.Second-300*time.Millisecond)))
+		})
+	}
 }
 
 // A buffer bigger than maxPop takes maxPop items and loses none.

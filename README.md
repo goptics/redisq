@@ -198,7 +198,9 @@ connection), up to 3 times by default. What that means per call:
 - **`DequeueWithAckId`** and **`DequeueBatchWithAckIds`** are safe: a re-sent
   pop hands back the items the first attempt took, and after a call that
   failed outright, the next call of at least its size returns those items (a
-  smaller call leaves them for a later one). Delivery is at least once.
+  smaller call leaves them for a later one). Only one failed call is kept at
+  a time: if two fail together, the other's items stay pending until they
+  are requeued. Delivery is at least once.
 - **`Enqueue`** can store a job twice, and returning `false` after a network
   error does not prove the job was not stored. Make handlers idempotent.
 - **`Dequeue`** (no ack) is at most once: an item whose reply never arrives is
