@@ -29,7 +29,8 @@ type Queue struct {
 	ackPrefix         string                      // ack IDs are <ackPrefix>:<reservation>:<index>, unique per Queue object
 	ackSeq            atomic.Uint64               // last reservation number handed out
 	retryPop          atomic.Pointer[reservation] // ack IDs of a pop that failed with an error, reused by the next pop
-	popLen            atomic.Int64                // queue length after this object's last batch pop; maxPop until the first
+	popLen            atomic.Int64                // items the next batch pop expects (see dequeueBatch); maxPop until the first
+	popRun            atomic.Int64                // items batch pops took since the queue was last seen empty
 	isPriority        bool                        // a zset queue, with :prio entries to clear on ack; set before any goroutine starts
 }
 
@@ -449,13 +450,16 @@ func (q *Queue) DequeueWithAckId() (any, bool, string) {
 // the move. n is 0 with a nil error when the queue is empty, or when no
 // capacity was given (remaining is then 0 and means nothing).
 //
-// A call takes at most as many items as this object's previous call left in
-// the queue (the full count on its first call): after the queue was seen
-// empty, a call takes one item and remaining says how many more wait. So n
-// can be below the count while remaining > 0. So it can right after a failed
-// call: the next call with at least that call's slots reuses its ack IDs and
-// gets its items back. One failed call is kept at a time; the items of
-// another that failed with it stay pending until they are requeued.
+// A call takes about as many items as this object's previous batch calls
+// suggest (the full count on its first call): what the last call left in the
+// queue, or once the queue was emptied, as many as were taken since it was
+// last seen empty. A trickle thus pops one item per call, cheaply, and a
+// burst like the last one is taken in one call. So n can be below the count
+// while remaining > 0, and the caller should call again. A call can also
+// reuse a failed call's ack IDs and get that call's items back: the next
+// call with at least that call's slots does. One failed call is kept at a
+// time; the items of another that failed with it stay pending until they are
+// requeued.
 func (q *Queue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n, remaining int, err error) {
 	return q.dequeueBatch(listAckPop, listAckPopOneLen, items, ackIDs, "")
 }
@@ -519,9 +523,11 @@ func (q *Queue) deadline() float64 {
 
 // dequeueBatch runs pop for up to len(items) items, marking them pending in
 // the same step (see popHead), or popOne when it takes one item. It sizes the
-// pop by the length the last call saw: a trickle then pops one item with the
-// lean script, instead of building and checking an ack ID for every slot.
-// A guess that is too small costs one more call, and remaining says so.
+// pop by popLen: the length the last call left, or after the queue emptied,
+// the items taken since it was last seen empty (an empty call keeps it). A
+// trickle then pops one item with the lean script instead of building and
+// checking an ack ID for every slot, and a burst like the last one takes one
+// call. A guess that is too small costs one more call, and remaining says so.
 func (q *Queue) dequeueBatch(pop, popOne *redis.Script, items []any, ackIDs []string, consumer string, extraKeys ...string) (int, int, error) {
 	slots := min(len(items), len(ackIDs))
 	limit := min(slots, maxPop)
@@ -555,7 +561,12 @@ func (q *Queue) dequeueBatch(pop, popOne *redis.Script, items []any, ackIDs []st
 	}
 
 	remaining := int(reply[0].(int64))
-	q.popLen.Store(int64(remaining))
+	if remaining > 0 {
+		q.popRun.Add(int64(len(popped)))
+		q.popLen.Store(int64(remaining))
+	} else if run := q.popRun.Swap(0) + int64(len(popped)); run > 0 {
+		q.popLen.Store(run)
+	}
 
 	return len(popped), remaining, nil
 }

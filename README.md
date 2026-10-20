@@ -179,19 +179,24 @@ round trip, each pending under its own ack ID, and reports how many are left.
 Size the buffers to the work you can start right away: items taken but not
 started are invisible to other consumers while their visibility timeout runs.
 
-A call takes at most as many items as the previous call on the same queue
-object left behind (a full batch on its first call). After the queue was seen
-empty, a call takes one item, cheaply, and `remaining` says whether to call
-again. Keep calling while `remaining > 0` and you have room.
+A call sizes itself by the previous batch calls on the same queue object (a
+full batch on its first call): a trickle takes one item per call, cheaply, and
+a burst like the last one is taken in one call. A call can take fewer items
+than the queue holds, so keep calling while `remaining > 0` and you have room.
 
 ```go
 items := make([]any, 8)
 ackIDs := make([]string, 8)
 
-n, remaining, err := queue.DequeueBatchWithAckIds(items, ackIDs)
-for i := range n {
-    processItem(items[i])
-    queue.Acknowledge(ackIDs[i])
+for {
+    n, remaining, err := queue.DequeueBatchWithAckIds(items, ackIDs)
+    for i := range n {
+        processItem(items[i])
+        queue.Acknowledge(ackIDs[i])
+    }
+    if err != nil || remaining == 0 {
+        break
+    }
 }
 ```
 

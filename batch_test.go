@@ -166,12 +166,11 @@ func TestDequeueBatchShortPopMarksConsumerIdle(t *testing.T) {
 				require.True(t, c.push(v))
 			}
 
-			items, _, _ := popBatch(t, c.q, 2)
-			assert.Equal(t, []string{"a"}, items, "the queue was last seen empty: one item, then remaining says more")
-			assert.False(t, member(), "items still wait")
-			items, _, _ = popBatch(t, c.q, 5)
-			assert.Equal(t, []string{"b", "c"}, items)
-			assert.True(t, member(), "a short pop that empties the queue marks the consumer idle")
+			popBatch(t, c.q, 2)
+			assert.False(t, member(), "a full pop leaves the consumer busy")
+			items, _, _ := popBatch(t, c.q, 5)
+			assert.Equal(t, []string{"c"}, items)
+			assert.True(t, member(), "a short pop marks the consumer idle")
 		})
 	}
 }
@@ -764,10 +763,11 @@ func TestDequeueBatchLargeCounter(t *testing.T) {
 	}
 }
 
-// A call takes at most what the previous call left in the queue (everything
-// up to the cap on a fresh object), so after the queue was seen empty it pops
-// one item, with the lean script, and remaining tells the caller to go on.
-func TestDequeueBatchSizesByLastLength(t *testing.T) {
+// A call sizes itself by the previous ones: a fresh object fills the call,
+// a trickle pops one item per call with the lean script, a burst after a
+// trickle takes two calls, a burst like the last one takes one, and an empty
+// call keeps the estimate.
+func TestDequeueBatchSizesByRun(t *testing.T) {
 	for _, c := range retryCases {
 		t.Run(c.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -778,27 +778,32 @@ func TestDequeueBatchSizesByLastLength(t *testing.T) {
 			defer delKeys(t, q.client, q.queueKey)
 			require.NoError(t, c.popOneLen.Load(ctx, q.client).Err())
 			b := batcherFor(c, q)
-
-			for _, v := range []string{"a", "b", "c"} {
-				require.True(t, push(v))
+			pushAll := func(vs ...string) {
+				for _, v := range vs {
+					require.True(t, push(v))
+				}
 			}
-			items, _, remaining := popBatch(t, b, 10)
-			assert.Equal(t, []string{"a", "b", "c"}, items, "a fresh object fills the call")
-			assert.Equal(t, 0, remaining)
-			assert.EqualValues(t, 0, p.sends.Load())
-
-			for _, v := range []string{"d", "e", "f"} {
-				require.True(t, push(v))
+			pop := func(want []string, remaining int, lean int32, msg string) []string {
+				t.Helper()
+				before := p.sends.Load()
+				items, ids, rem := popBatch(t, b, 10)
+				assert.Equal(t, want, items, msg)
+				assert.Equal(t, remaining, rem, msg)
+				assert.Equal(t, lean, p.sends.Load()-before, msg+": lean calls")
+				return ids
 			}
-			items, ids, remaining := popBatch(t, b, 10)
-			assert.Equal(t, []string{"d"}, items, "the queue was last seen empty")
-			assert.Equal(t, 2, remaining)
-			assert.EqualValues(t, 1, p.sends.Load(), "one item: the lean script")
+
+			pushAll("a", "b", "c")
+			pop([]string{"a", "b", "c"}, 0, 0, "a fresh object fills the call")
+			pushAll("d")
+			pop([]string{"d"}, 0, 0, "sized by the last run of 3")
+			pushAll("e")
+			ids := pop([]string{"e"}, 0, 1, "a trickle: one item, lean")
 			require.Len(t, ids, 1)
 			assert.True(t, strings.HasSuffix(ids[0], ":0001"))
 			v, err := q.client.HGet(ctx, q.getNackedItemKey(), ids[0]).Result()
 			require.NoError(t, err)
-			assert.Equal(t, "d", v)
+			assert.Equal(t, "e", v)
 			_, err = q.client.ZScore(ctx, q.getTimeoutKey(), ids[0]).Result()
 			assert.NoError(t, err, "the item has a deadline")
 			if c.name == "priority" {
@@ -807,10 +812,112 @@ func TestDequeueBatchSizesByLastLength(t *testing.T) {
 				assert.Equal(t, "1", score)
 			}
 
-			items, _, remaining = popBatch(t, b, 10)
-			assert.Equal(t, []string{"e", "f"}, items, "remaining sized this call")
-			assert.Equal(t, 0, remaining)
-			assert.Equal(t, 6, q.GetNackedItemsCount(), "every popped item is pending")
+			pushAll("f", "g", "h")
+			pop([]string{"f"}, 2, 1, "a burst after a trickle: one item first")
+			pop([]string{"g", "h"}, 0, 0, "then what remained")
+			pop(nil, 0, 0, "an empty call")
+			pushAll("i", "j", "k")
+			pop([]string{"i", "j", "k"}, 0, 0, "a burst like the last run, in one call, despite the empty call")
+			assert.Equal(t, 11, q.GetNackedItemsCount(), "every popped item is pending")
+		})
+	}
+}
+
+// The lean one-item script's rules, run directly with a consumer ID no
+// Notification owns, so the nudge loop can't touch the idle set: an empty
+// pop joins it, a pop leaving an item or filling its only slot does not, a
+// caller that is not a consumer never does, and a hand-back that empties the
+// queue with slots to spare joins it and gets a fresh deadline.
+func TestDequeueBatchLeanScriptRules(t *testing.T) {
+	for _, c := range retryCases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			q, push, cleanup := c.setup(t, getTestRedisURL())
+			defer cleanup()
+			delKeys(t, q.client, q.queueKey)
+			defer delKeys(t, q.client, q.queueKey)
+			keys := []string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey(), q.getPriorityKey()}
+			const cons = "synthetic-consumer"
+			member := func() bool {
+				ok, err := q.client.SIsMember(ctx, q.getIdleKey(), cons).Result()
+				require.NoError(t, err)
+				return ok
+			}
+			resv := 0
+			run := func(consumer string, slots int, id string) (int64, []any) {
+				t.Helper()
+				if id == "" {
+					resv++
+					id = q.ackIDOf(fmt.Sprintf("%020d", resv), 1)
+				}
+				r, err := c.popOneLen.Run(ctx, q.client, keys, unixSeconds(time.Now().Add(time.Minute)), id, consumer, slots).Slice()
+				require.NoError(t, err)
+				return r[0].(int64), r[1].([]any)
+			}
+
+			n, items := run("", 5, "")
+			assert.EqualValues(t, 0, n)
+			assert.Empty(t, items)
+			assert.Zero(t, q.client.SCard(ctx, q.getIdleKey()).Val(), "not a consumer")
+
+			n, items = run(cons, 5, "")
+			assert.EqualValues(t, 0, n)
+			assert.Empty(t, items)
+			assert.True(t, member(), "empty pop")
+
+			require.NoError(t, q.client.SRem(ctx, q.getIdleKey(), cons).Err())
+			require.True(t, push("a"))
+			require.True(t, push("b"))
+			n, items = run(cons, 5, "")
+			assert.EqualValues(t, 1, n)
+			assert.Equal(t, []any{"a"}, items)
+			assert.False(t, member(), "an item still waits")
+
+			n, items = run(cons, 1, "")
+			assert.EqualValues(t, 0, n)
+			assert.Equal(t, []any{"b"}, items)
+			assert.False(t, member(), "no slot to spare")
+
+			id := q.ackIDOf(fmt.Sprintf("%020d", 99), 1)
+			require.NoError(t, q.client.HSet(ctx, q.getNackedItemKey(), id, "held").Err())
+			old := unixSeconds(time.Now().Add(time.Second))
+			require.NoError(t, q.client.ZAdd(ctx, q.getTimeoutKey(), redis.Z{Score: old, Member: id}).Err())
+			n, items = run(cons, 5, id)
+			assert.EqualValues(t, 0, n)
+			assert.Equal(t, []any{"held"}, items)
+			assert.True(t, member(), "a hand-back short of the slots that empties the queue")
+			d, err := q.client.ZScore(ctx, q.getTimeoutKey(), id).Result()
+			require.NoError(t, err)
+			assert.Greater(t, d, old+30, "the hand-back raises the deadline")
+		})
+	}
+}
+
+// A single pop leaves a failed batch call's kept reservation alone: the next
+// batch call with room for it gets its items back.
+func TestDequeueBatchSinglePopLeavesKeptBatch(t *testing.T) {
+	for _, c := range retryCases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			p := newDropProxy(t, c.pop, c.popOneLen)
+			q, push, cleanup := c.setup(t, p.url())
+			defer cleanup()
+			delKeys(t, q.client, q.queueKey)
+			defer delKeys(t, q.client, q.queueKey)
+			for _, v := range []string{"a", "b", "c"} {
+				require.True(t, push(v))
+			}
+			require.NoError(t, c.pop.Load(ctx, q.client).Err())
+			b := batcherFor(c, q)
+			p.drops.Store(4)
+			_, _, err := b.DequeueBatchWithAckIds(make([]any, 2), make([]string, 2))
+			require.Error(t, err) // a, b pending under the kept reservation
+
+			item, ok, _ := b.(interface{ DequeueWithAckId() (any, bool, string) }).DequeueWithAckId()
+			require.True(t, ok)
+			assert.Equal(t, "c", string(item.([]byte)))
+			items, _, _ := popBatch(t, b, 2)
+			assert.Equal(t, []string{"a", "b"}, items)
 		})
 	}
 }
