@@ -352,6 +352,43 @@ end
 if #items > 0 then redis.call('HSET', KEYS[5], unpack(p)) end`)
 )
 
+// popOneHead and popOneTail wrap the lean single-item pop that DequeueWithAckId
+// runs, which leaves the popped item, as stored, in v (nil when the queue is
+// empty). Same keys, ack IDs and rules as the batch scripts (see popHead),
+// with none of the batch bookkeeping: per call it costs what a single pop did
+// before batches.
+//
+// ARGV: deadline (0: no visibility timeout), ack ID, consumer ID (” if the
+// caller is not a distributed consumer).
+const popOneHead = `local held = redis.call('HGET', KEYS[2], ARGV[2])
+if held then
+	if tonumber(ARGV[1]) > 0 then
+		local d = redis.call('ZSCORE', KEYS[3], ARGV[2])
+		if not d or tonumber(d) < tonumber(ARGV[1]) then redis.call('ZADD', KEYS[3], ARGV[1], ARGV[2]) end
+	end
+	return held
+end
+`
+
+const popOneTail = `
+if not v then
+	if ARGV[3] ~= '' then redis.call('SADD', KEYS[4], ARGV[3]) end
+	return false
+end
+redis.call('HSET', KEYS[2], ARGV[2], v)
+if tonumber(ARGV[1]) > 0 then redis.call('ZADD', KEYS[3], ARGV[1], ARGV[2]) end
+return v`
+
+var (
+	listAckPopOne = redis.NewScript(popOneHead + `local v = redis.call('LPOP', KEYS[1])` + popOneTail)
+	zsetAckPopOne = redis.NewScript(popOneHead + `local r = redis.call('ZPOPMIN', KEYS[1])
+local v = r[1]
+if v then
+	redis.call('HSET', KEYS[5], ARGV[2], r[2])
+	if #v >= 17 and string.byte(v, 1) == 255 then v = string.sub(v, 18) end
+end` + popOneTail)
+)
+
 // reservation is the ack IDs <prefix>:<start>:0001..<start>:<want> of one pop
 // call; start is unique per Queue object.
 type reservation struct {
@@ -362,7 +399,7 @@ type reservation struct {
 var errQueueClosed = errors.New("queue closed")
 
 func (q *Queue) DequeueWithAckId() (any, bool, string) {
-	return q.dequeueOne(listAckPop, "")
+	return q.dequeueOne(listAckPopOne, "")
 }
 
 // DequeueBatchWithAckIds moves up to min(len(items), len(ackIDs), 1000) items
@@ -376,22 +413,60 @@ func (q *Queue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n, remaini
 	return q.dequeueBatch(listAckPop, items, ackIDs, "")
 }
 
-// dequeueOne is a batch of one.
+// dequeueOne pops one item with a lean single-item script (see popOneHead).
 func (q *Queue) dequeueOne(pop *redis.Script, consumer string, extraKeys ...string) (any, bool, string) {
-	var items [1]any
-	var ackIDs [1]string
+	if q.ctx.Err() != nil {
+		log.Println("queue closed, cannot dequeue")
+		return nil, false, ""
+	}
 
-	n, _, err := q.dequeueBatch(pop, items[:], ackIDs[:], consumer, extraKeys...)
+	r := q.reserve(1)
+	ackID := q.ackIDOf(fmt.Sprintf("%020d", r.start), 1)
+	keys := append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey()}, extraKeys...)
+	v, err := pop.Run(q.ctx, q.client, keys, q.deadline(), ackID, consumer).Text()
+	if err == redis.Nil {
+		return nil, false, ""
+	}
+
 	if err != nil {
+		q.retryPop.CompareAndSwap(nil, r)
 		log.Printf("Error dequeuing with ack: %v", err)
 		return nil, false, ""
 	}
 
-	if n == 0 {
-		return nil, false, ""
-	}
+	return []byte(v), true, ackID
+}
 
-	return items[0], true, ackIDs[0]
+// reserve returns the ack IDs for a pop of up to want items. The IDs are
+// reserved once per call, so a script go-redis re-sends carries them again.
+// After a failed call they are kept (retryPop) for the next one: if the
+// failed pop ran anyway, the script hands its items back now instead of
+// leaving them pending until the visibility timeout. A call smaller than the
+// kept reservation leaves it for a later call, and a failure that finds one
+// already kept drops its own: those items wait for the timeout.
+func (q *Queue) reserve(want int) *reservation {
+	r := q.retryPop.Swap(nil)
+	if r != nil && r.want > want {
+		q.retryPop.CompareAndSwap(nil, r)
+		r = nil
+	}
+	if r == nil {
+		r = &reservation{start: q.ackSeq.Add(1), want: want}
+	}
+	return r
+}
+
+// ackIDOf is the ack ID of item i (from 1) of reservation resv.
+func (q *Queue) ackIDOf(resv string, i int) string {
+	return fmt.Sprintf("%s:%s:%04d", q.ackPrefix, resv, i)
+}
+
+// deadline is the visibility deadline of an item popped now, or 0 for none.
+func (q *Queue) deadline() float64 {
+	if vt := q.getVisibilityTimeout(); vt > 0 {
+		return unixSeconds(time.Now().Add(vt))
+	}
+	return 0
 }
 
 // dequeueBatch runs pop for up to len(items) items, marking them pending in
@@ -406,30 +481,10 @@ func (q *Queue) dequeueBatch(pop *redis.Script, items []any, ackIDs []string, co
 		return 0, 0, errQueueClosed
 	}
 
-	var deadline float64
-	if vt := q.getVisibilityTimeout(); vt > 0 {
-		deadline = unixSeconds(time.Now().Add(vt))
-	}
-
-	// The ack IDs are reserved once per call, so a script go-redis re-sends
-	// carries them again. After a failed call they are kept for the next one:
-	// if the failed pop ran anyway, popHead hands its items back now instead
-	// of leaving them pending until the visibility timeout. A call smaller
-	// than the kept reservation leaves it for a later call, and a failure
-	// that finds one already kept drops its own: those items wait for the
-	// timeout.
-	r := q.retryPop.Swap(nil)
-	if r != nil && r.want > want {
-		q.retryPop.CompareAndSwap(nil, r)
-		r = nil
-	}
-	if r == nil {
-		r = &reservation{start: q.ackSeq.Add(1), want: want}
-	}
-
+	r := q.reserve(want)
 	resv := fmt.Sprintf("%020d", r.start)
 	keys := append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey()}, extraKeys...)
-	reply, err := pop.Run(q.ctx, q.client, keys, r.want, deadline, q.ackPrefix, resv, consumer, want).Slice()
+	reply, err := pop.Run(q.ctx, q.client, keys, r.want, q.deadline(), q.ackPrefix, resv, consumer, want).Slice()
 	if err != nil {
 		q.retryPop.CompareAndSwap(nil, r)
 		return 0, 0, err
@@ -438,7 +493,7 @@ func (q *Queue) dequeueBatch(pop *redis.Script, items []any, ackIDs []string, co
 	popped := reply[1].([]any)
 	for i, v := range popped {
 		items[i] = []byte(v.(string))
-		ackIDs[i] = fmt.Sprintf("%s:%s:%04d", q.ackPrefix, resv, i+1)
+		ackIDs[i] = q.ackIDOf(resv, i+1)
 	}
 
 	return len(popped), int(reply[0].(int64)), nil

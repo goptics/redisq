@@ -50,7 +50,7 @@ func (q *DistributedQueue) Dequeue() (any, bool) {
 // DequeueWithAckId pops one item; a consumer that finds the queue empty joins
 // the idle set in the same step.
 func (q *DistributedQueue) DequeueWithAckId() (any, bool, string) {
-	return q.Queue.dequeueOne(listAckPop, q.consumerID())
+	return q.Queue.dequeueOne(listAckPopOne, q.consumerID())
 }
 
 // DequeueBatchWithAckIds pops up to len(items) items (see

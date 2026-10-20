@@ -129,7 +129,7 @@ func (pq *PriorityQueue) Values() []any {
 }
 
 func (pq *PriorityQueue) DequeueWithAckId() (any, bool, string) {
-	return pq.dequeueOne(zsetAckPop, "", pq.getPriorityKey())
+	return pq.dequeueOne(zsetAckPopOne, "", pq.getPriorityKey())
 }
 
 // DequeueBatchWithAckIds moves up to len(items) items, lowest score first and

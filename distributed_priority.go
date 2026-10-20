@@ -50,7 +50,7 @@ func (q *DistributedPriorityQueue) Dequeue() (any, bool) {
 // DequeueWithAckId pops one item; a consumer that finds the queue empty joins
 // the idle set in the same step.
 func (q *DistributedPriorityQueue) DequeueWithAckId() (any, bool, string) {
-	return q.dequeueOne(zsetAckPop, q.consumerID(), q.getPriorityKey())
+	return q.dequeueOne(zsetAckPopOne, q.consumerID(), q.getPriorityKey())
 }
 
 // DequeueBatchWithAckIds pops up to len(items) items (see
