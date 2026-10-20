@@ -17,9 +17,11 @@ type PriorityQueue struct {
 // by older versions are still read as is, and drain first.
 const seqPrefixLen = 17
 
-// zsetPush adds item ARGV[2] at score ARGV[1] under the next sequence number.
+// zsetPush adds item ARGV[2] at score ARGV[1] under the next sequence number,
+// and sets the queue to expire in ARGV[3] ms when that is above 0.
 var zsetPush = redis.NewScript(`local s = redis.call('INCR', KEYS[2])
 redis.call('ZADD', KEYS[1], ARGV[1], '\255' .. string.format('%016x', s) .. ARGV[2])
+if tonumber(ARGV[3]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[3]) end
 return s`)
 
 // zsetRemove removes the first member holding item ARGV[1].
@@ -46,6 +48,7 @@ func newPriorityQueue(client *redis.Client, queueKey string) *PriorityQueue {
 	q := &PriorityQueue{
 		Queue: newQueueBase(client, queueKey),
 	}
+	q.isPriority = true
 
 	q.RequeueNackedItems()
 	go q.sweep(func() (int64, error) { return q.requeue(zsetRequeue, q.queueKey+":seq", q.getPriorityKey()) })
@@ -66,13 +69,9 @@ func (pq *PriorityQueue) Enqueue(item any, priority int) bool {
 			return false
 		}
 
-		if err := zsetPush.Run(pq.ctx, pq.client, pq.pushKeys(), priority, data).Err(); err != nil {
+		if err := zsetPush.Run(pq.ctx, pq.client, pq.pushKeys(), priority, data, pq.getExpiration().Milliseconds()).Err(); err != nil {
 			log.Printf("Error enqueueing item with priority: %v", err)
 			return false
-		}
-
-		if exp := pq.getExpiration(); exp > 0 {
-			pq.client.Expire(pq.ctx, pq.queueKey, exp)
 		}
 
 		return true

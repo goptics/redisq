@@ -26,6 +26,7 @@ type Queue struct {
 	visibilityTimeout atomic.Int64                // time.Duration
 	onRequeue         atomic.Pointer[func(int64)] // called after the sweeper requeues n items
 	retryAckID        atomic.Pointer[string]      // ack ID of a pop that failed with an error, reused by the next pop
+	isPriority        bool                        // a zset queue, with :prio entries to clear on ack; set before any goroutine starts
 }
 
 func newQueue(c *redis.Client, queueKey string) *Queue {
@@ -128,14 +129,17 @@ func (q *Queue) Enqueue(item any) bool {
 			return false
 		}
 
-		pipe := q.client.Pipeline()
-		pipe.RPush(q.ctx, q.queueKey, data)
-
 		if exp := q.getExpiration(); exp > 0 {
-			pipe.Expire(q.ctx, q.queueKey, exp)
+			_, err = q.client.Pipelined(q.ctx, func(pipe redis.Pipeliner) error {
+				pipe.RPush(q.ctx, q.queueKey, data)
+				pipe.Expire(q.ctx, q.queueKey, exp)
+				return nil
+			})
+		} else {
+			err = q.client.RPush(q.ctx, q.queueKey, data).Err()
 		}
 
-		if _, err := pipe.Exec(q.ctx); err != nil {
+		if err != nil {
 			log.Printf("Error enqueueing item: %v", err)
 			return false
 		}
@@ -237,7 +241,9 @@ func (q *Queue) Acknowledge(ackID string) bool {
 		pipe := q.client.Pipeline()
 		pipe.HDel(q.ctx, q.getNackedItemKey(), ackID)
 		pipe.ZRem(q.ctx, q.getTimeoutKey(), ackID)
-		pipe.HDel(q.ctx, q.getPriorityKey(), ackID) // priority queues only; a no-op otherwise
+		if q.isPriority {
+			pipe.HDel(q.ctx, q.getPriorityKey(), ackID)
+		}
 
 		_, err := pipe.Exec(q.ctx)
 
