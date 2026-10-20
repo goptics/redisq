@@ -1,6 +1,7 @@
 package redisq
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -48,9 +49,9 @@ func TestMain(m *testing.M) {
 	// Exponential backoff-retry, because the application in the container
 	// might not be ready to accept connections yet
 	if err := pool.Retry(func() error {
-		qs := New(testRedisURL)
+		qs := New(testRedisURL).(*queues)
 		defer qs.Close()
-		return nil
+		return qs.client.Ping(context.Background()).Err()
 	}); err != nil {
 		log.Fatalf("Could not connect to Redis: %s", err)
 	}
