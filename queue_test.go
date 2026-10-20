@@ -684,9 +684,7 @@ func TestAckTimeoutKeepsPendingForRequeue(t *testing.T) {
 	}
 
 	time.Sleep(2100 * time.Millisecond)
-	assert.Equal(t, 2, q.GetNackedItemsCount(), "pending jobs were deleted")
-
-	require.NoError(t, q.RequeueNackedItems())
+	require.NoError(t, q.RequeueNackedItems()) // the sweeper may have done it already
 	assert.Equal(t, 2, q.Len(), "expired jobs should be back in the queue")
 	assert.Equal(t, 0, q.GetNackedItemsCount())
 }

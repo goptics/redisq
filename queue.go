@@ -22,6 +22,7 @@ type Queue struct {
 	cancel            context.CancelFunc
 	expiration        time.Duration
 	visibilityTimeout time.Duration
+	onRequeue         func() // called after the sweeper requeues items; guarded by mx
 }
 
 func newQueue(c *redis.Client, queueKey string) *Queue {
@@ -29,6 +30,7 @@ func newQueue(c *redis.Client, queueKey string) *Queue {
 
 	// requeue nacked items
 	q.RequeueNackedItems()
+	go q.sweep(func() (int64, error) { return q.requeue(listRequeue) })
 
 	return q
 }
@@ -323,16 +325,61 @@ var listRequeue = redis.NewScript(requeueLoop + `redis.call('LPUSH', KEYS[1], v)
 // RequeueNackedItems returns un-acknowledged items whose visibility timeout
 // has passed (every pending item when it is 0) to the queue.
 func (q *Queue) RequeueNackedItems() error {
-	return q.requeue(listRequeue)
+	_, err := q.requeue(listRequeue)
+	return err
 }
 
-func (q *Queue) requeue(script *redis.Script, extraKeys ...string) error {
+// sweep runs requeue every second until Close, and calls onRequeue after it
+// moves any item. Without it an item whose consumer died stayed pending until
+// the next process start. It skips a zero visibility timeout, where requeue
+// takes every pending item, including ones still being processed.
+// ponytail: one script call per queue per second; tie the tick to the
+// visibility timeout if that load ever shows up.
+func (q *Queue) sweep(requeue func() (int64, error)) {
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-q.ctx.Done():
+			return
+		case <-tick.C:
+		}
+
+		q.mx.Lock()
+		vt := q.visibilityTimeout
+		q.mx.Unlock()
+
+		if vt <= 0 {
+			continue
+		}
+
+		if n, _ := requeue(); n > 0 {
+			q.mx.Lock()
+			onRequeue := q.onRequeue
+			q.mx.Unlock()
+
+			if onRequeue != nil {
+				onRequeue()
+			}
+		}
+	}
+}
+
+// setOnRequeue sets the callback the sweeper runs after requeueing items.
+func (q *Queue) setOnRequeue(fn func()) {
+	q.mx.Lock()
+	defer q.mx.Unlock()
+	q.onRequeue = fn
+}
+
+func (q *Queue) requeue(script *redis.Script, extraKeys ...string) (int64, error) {
 	q.mx.Lock()
 	defer q.mx.Unlock()
 
 	if q.ctx.Err() != nil {
 		log.Println("queue closed, cannot requeue idle items")
-		return fmt.Errorf("queue closed")
+		return 0, fmt.Errorf("queue closed")
 	}
 
 	var now int64
@@ -341,12 +388,13 @@ func (q *Queue) requeue(script *redis.Script, extraKeys ...string) error {
 	}
 
 	keys := append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey()}, extraKeys...)
-	if err := script.Run(q.ctx, q.client, keys, now).Err(); err != nil {
+	n, err := script.Run(q.ctx, q.client, keys, now).Int64()
+	if err != nil {
 		log.Printf("Error requeueing pending items: %v", err)
-		return fmt.Errorf("error requeueing pending items: %v", err)
+		return 0, fmt.Errorf("error requeueing pending items: %v", err)
 	}
 
-	return nil
+	return n, nil
 }
 
 // GetNackedItemsCount returns the number of items in the nacked list

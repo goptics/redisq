@@ -12,6 +12,7 @@ func newDistributedQueue(client *redis.Client, queueKey string) *DistributedQueu
 		Queue:        newQueue(client, queueKey),
 		Notification: newNotification(client, queueKey),
 	}
+	q.setOnRequeue(func() { q.Send("enqueued") })
 	defer q.Start()
 
 	return q
