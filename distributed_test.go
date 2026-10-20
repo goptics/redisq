@@ -2,10 +2,13 @@ package redisq
 
 import (
 	"context"
+	"crypto/sha1"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -44,7 +47,7 @@ func TestDistributedQueueEnqueueDequeue(t *testing.T) {
 	q.Subscribe(func(action string) {
 		notifications <- action
 	})
-	q.Start()
+	assert.Equal(t, 0, q.Len(), "an empty queue marks the consumer idle")
 
 	// Test Enqueue with notification
 	assert.True(t, q.Enqueue("test data"))
@@ -62,9 +65,8 @@ func TestDistributedQueueEnqueueDequeue(t *testing.T) {
 
 	select {
 	case action := <-notifications:
-		assert.Equal(t, "dequeued", action)
-	case <-time.After(time.Second):
-		t.Fatal("Timeout waiting for dequeue notification")
+		t.Fatalf("unexpected %q notification after dequeue", action)
+	case <-time.After(300 * time.Millisecond):
 	}
 }
 
@@ -75,11 +77,11 @@ func TestDistributedQueueConcurrency(t *testing.T) {
 	const numGoroutines = 10
 	const numOperations = 100
 
-	notifications := make(chan string, numGoroutines*numOperations*2) // *2 for enqueue and dequeue
+	notifications := make(chan string, numGoroutines*numOperations)
 	q.Subscribe(func(action string) {
 		notifications <- action
 	})
-	q.Start()
+	assert.Equal(t, 0, q.Len())
 
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines)
@@ -96,21 +98,9 @@ func TestDistributedQueueConcurrency(t *testing.T) {
 
 	wg.Wait()
 
-	// Count notifications
-	enqueueCount := 0
-	timeout := time.After(5 * time.Second)
-
-	for enqueueCount < numGoroutines*numOperations {
-		select {
-		case action := <-notifications:
-			if action == "enqueued" {
-				enqueueCount++
-			}
-		case <-timeout:
-			t.Fatalf("Timeout waiting for notifications. Got %d of %d", enqueueCount, numGoroutines*numOperations)
-		}
-	}
-
+	// One idle consumer gets one wake for the whole burst, not one per item:
+	// once woken it keeps pulling on its own.
+	assert.Equal(t, 1, signals(notifications, 500*time.Millisecond))
 	assert.Equal(t, numGoroutines*numOperations, q.Len())
 }
 
@@ -133,11 +123,13 @@ func TestDistributedQueueSweeperRequeues(t *testing.T) {
 	})
 
 	dq.SetVisibilityTimeout(time.Second)
+	dq.Len() // idle
 	require.True(t, dq.Enqueue("job"))
 	<-enqueued
 
 	_, ok, _ := dq.DequeueWithAckId()
 	require.True(t, ok)
+	dq.Len() // the consumer's loop finds the queue empty again: idle
 
 	select {
 	case <-enqueued:
@@ -146,4 +138,95 @@ func TestDistributedQueueSweeperRequeues(t *testing.T) {
 	}
 	assert.Equal(t, 1, dq.Len())
 	assert.Equal(t, 0, dq.GetNackedItemsCount())
+}
+
+// cmdCounter counts the commands a client sends, except the background
+// sweep and nudge scripts.
+type cmdCounter struct {
+	mx   sync.Mutex
+	n    int
+	skip map[string]bool // script hashes
+}
+
+func newCmdCounter() *cmdCounter {
+	return &cmdCounter{skip: map[string]bool{
+		nudge.Hash(): true, listRequeue.Hash(): true, zsetRequeue.Hash(): true,
+	}}
+}
+
+func (c *cmdCounter) record(cmd redis.Cmder) {
+	args := cmd.Args()
+	if len(args) > 1 {
+		switch cmd.Name() {
+		case "evalsha":
+			if c.skip[fmt.Sprint(args[1])] {
+				return
+			}
+		case "eval":
+			if c.skip[fmt.Sprintf("%x", sha1.Sum([]byte(fmt.Sprint(args[1]))))] {
+				return
+			}
+		}
+	}
+	c.mx.Lock()
+	c.n++
+	c.mx.Unlock()
+}
+
+func (c *cmdCounter) count() int {
+	c.mx.Lock()
+	defer c.mx.Unlock()
+	return c.n
+}
+
+func (c *cmdCounter) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (c *cmdCounter) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		c.record(cmd)
+		return next(ctx, cmd)
+	}
+}
+
+func (c *cmdCounter) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		for _, cmd := range cmds {
+			c.record(cmd)
+		}
+		return next(ctx, cmds)
+	}
+}
+
+// An enqueue on a distributed queue is one round trip: the push and the wake
+// run in one script.
+func TestDistributedEnqueueIsOneRoundTrip(t *testing.T) {
+	const n = 100
+
+	t.Run("list", func(t *testing.T) {
+		q, cleanup := setupTestDistributedQueue(t)
+		defer cleanup()
+		q.SetExpiration(time.Minute)
+		require.True(t, q.Enqueue("warm-up")) // loads the script
+
+		c := newCmdCounter()
+		q.Queue.client.AddHook(c)
+		for i := range n {
+			require.True(t, q.Enqueue(fmt.Sprint(i)))
+		}
+		assert.Equal(t, n, c.count())
+	})
+
+	t.Run("priority", func(t *testing.T) {
+		q, cleanup := setupTestDistributedPriorityQueue(t)
+		defer cleanup()
+		q.SetExpiration(time.Minute)
+		require.True(t, q.Enqueue("warm-up", 1))
+
+		c := newCmdCounter()
+		q.Queue.client.AddHook(c)
+		for i := range n {
+			require.True(t, q.Enqueue(fmt.Sprint(i), i))
+		}
+		assert.Equal(t, n, c.count())
+	})
 }

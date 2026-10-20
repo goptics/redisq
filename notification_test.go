@@ -1,6 +1,7 @@
 package redisq
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -9,95 +10,158 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func setupTestNotification(t *testing.T) (*Notification, func()) {
-	redisURL := getTestRedisURL()
-	opts, err := redis.ParseURL(redisURL)
+const testWakeKey = "test_wake_queue"
+
+// newTestNotification returns a started notification on testWakeKey and, for
+// a consumer, a channel of the signals it receives.
+func newTestNotification(t *testing.T, consumer bool) (*Notification, chan string) {
+	opts, err := redis.ParseURL(getTestRedisURL())
 	require.NoError(t, err)
 
 	client := redis.NewClient(opts)
-	n := newNotification(client, testQueueKey)
+	n := newNotification(client, testWakeKey, "LLEN")
+	got := make(chan string, 10)
+	if consumer {
+		n.Subscribe(func(action string) { got <- action })
+	}
+	n.Start()
 
-	cleanup := func() {
+	// The subscription is asynchronous; wait until Redis has it.
+	require.NoError(t, n.pubsub.Ping(context.Background()))
+
+	t.Cleanup(func() {
 		n.Stop()
 		client.Close()
-	}
-
-	return n, cleanup
-}
-
-func TestNotificationSubscribe(t *testing.T) {
-	n, cleanup := setupTestNotification(t)
-	defer cleanup()
-
-	received := make(chan struct{})
-	expectedAction := "test_action"
-
-	n.Subscribe(func(action string) {
-		assert.Equal(t, expectedAction, action)
-		received <- struct{}{}
 	})
 
-	n.Start()
-
-	// Send notification
-	n.Send(expectedAction)
-
-	select {
-	case <-received:
-		// Test passed
-	case <-time.After(time.Second):
-		t.Fatal("Timeout waiting for notification")
-	}
+	return n, got
 }
 
-func TestNotificationMultipleSubscribers(t *testing.T) {
-	n, cleanup := setupTestNotification(t)
-	defer cleanup()
+func resetWakeKeys(t *testing.T) {
+	opts, err := redis.ParseURL(getTestRedisURL())
+	require.NoError(t, err)
 
-	numSubscribers := 3
-	received := make(chan struct{}, numSubscribers)
+	client := redis.NewClient(opts)
+	defer client.Close()
+	require.NoError(t, client.Del(context.Background(), testWakeKey, testWakeKey+":idle").Err())
+}
 
-	for i := 0; i < numSubscribers; i++ {
-		n.Subscribe(func(action string) {
-			received <- struct{}{}
-		})
-	}
-
-	n.Start()
-
-	// Send notification
-	n.Send("test")
-
-	// Wait for all subscribers
-	for i := 0; i < numSubscribers; i++ {
+// signals returns how many signals arrive on got within d.
+func signals(got chan string, d time.Duration) int {
+	n := 0
+	deadline := time.After(d)
+	for {
 		select {
-		case <-received:
-			// Subscriber received notification
-		case <-time.After(time.Second):
-			t.Fatal("Timeout waiting for notification")
+		case action := <-got:
+			if action == "enqueued" {
+				n++
+			}
+		case <-deadline:
+			return n
 		}
 	}
 }
 
-func TestNotificationStop(t *testing.T) {
-	n, cleanup := setupTestNotification(t)
-	defer cleanup()
+func TestWakeReachesOneIdleConsumerEach(t *testing.T) {
+	resetWakeKeys(t)
+	a, gotA := newTestNotification(t, true)
+	b, gotB := newTestNotification(t, true)
+	producer, _ := newTestNotification(t, false)
 
-	received := make(chan struct{})
-	n.Subscribe(func(action string) {
-		received <- struct{}{}
-	})
+	assert.Equal(t, 0, a.len())
+	assert.Equal(t, 0, b.len())
 
-	n.Start()
-	n.Stop()
+	producer.wake(1)
+	producer.wake(1)
+	producer.wake(1) // nobody idle left
 
-	// Send notification after stop
-	n.Send("test")
+	assert.Equal(t, 1, signals(gotA, 300*time.Millisecond))
+	assert.Equal(t, 1, signals(gotB, 300*time.Millisecond))
+}
 
-	select {
-	case <-received:
-		t.Fatal("Should not receive notification after stop")
-	case <-time.After(100 * time.Millisecond):
-		// Test passed
+func TestWakeSkipsBusyConsumers(t *testing.T) {
+	resetWakeKeys(t)
+	_, got := newTestNotification(t, true) // never found the queue empty
+	producer, _ := newTestNotification(t, false)
+
+	producer.wake(1)
+	assert.Zero(t, signals(got, 300*time.Millisecond))
+}
+
+func TestWakeCount(t *testing.T) {
+	resetWakeKeys(t)
+	producer, _ := newTestNotification(t, false)
+	var gots []chan string
+	for range 3 {
+		c, got := newTestNotification(t, true)
+		c.len()
+		gots = append(gots, got)
 	}
+
+	producer.wake(2)
+
+	total := 0
+	for _, got := range gots {
+		total += signals(got, 200*time.Millisecond)
+	}
+	assert.Equal(t, 2, total)
+}
+
+func TestProducerNeverJoinsIdleSet(t *testing.T) {
+	resetWakeKeys(t)
+	producer, _ := newTestNotification(t, false)
+
+	assert.Equal(t, 0, producer.len())
+	n, err := producer.client.SCard(context.Background(), producer.idleKey).Result()
+	require.NoError(t, err)
+	assert.Zero(t, n)
+}
+
+func TestWakeSkipsGoneConsumer(t *testing.T) {
+	resetWakeKeys(t)
+	a, got := newTestNotification(t, true)
+	ctx := context.Background()
+
+	// Only a gone consumer idle: it is dropped and nobody is woken.
+	require.NoError(t, a.client.SAdd(ctx, a.idleKey, "crashed-instance").Err())
+	a.wake(1)
+	n, err := a.client.SCard(ctx, a.idleKey).Result()
+	require.NoError(t, err)
+	assert.Zero(t, n, "the gone consumer should be dropped from the idle set")
+
+	// A gone and a live consumer idle: whichever SPOP picks first, the live
+	// one gets the wake.
+	require.NoError(t, a.client.SAdd(ctx, a.idleKey, "crashed-instance").Err())
+	a.len()
+	a.wake(1)
+	assert.Equal(t, 1, signals(got, 300*time.Millisecond))
+}
+
+func TestStopLeavesIdleSet(t *testing.T) {
+	resetWakeKeys(t)
+	a, got := newTestNotification(t, true)
+	a.len()
+	a.Stop()
+
+	member, err := a.client.SIsMember(context.Background(), a.idleKey, a.id).Result()
+	require.NoError(t, err)
+	assert.False(t, member)
+
+	a.wake(1)
+	assert.Zero(t, signals(got, 200*time.Millisecond))
+}
+
+// Items that arrive without a wake (an older producer, another client) reach
+// an idle consumer within about a second.
+func TestNudgeWakesIdleConsumerWithWaitingItems(t *testing.T) {
+	resetWakeKeys(t)
+	a, got := newTestNotification(t, true)
+	a.len()
+
+	require.NoError(t, a.client.RPush(context.Background(), testWakeKey, "job").Err())
+	assert.Equal(t, 1, signals(got, 2500*time.Millisecond))
+
+	member, err := a.client.SIsMember(context.Background(), a.idleKey, a.id).Result()
+	require.NoError(t, err)
+	assert.False(t, member, "a nudged consumer is no longer idle")
 }

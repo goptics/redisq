@@ -38,7 +38,6 @@ func TestDistributedPriorityQueue(t *testing.T) {
 		q.Subscribe(func(action string) {
 			notifications <- action
 		})
-		q.Start()
 
 		testCases := []struct {
 			name     string
@@ -53,6 +52,7 @@ func TestDistributedPriorityQueue(t *testing.T) {
 		// Test Enqueue
 		for _, tc := range testCases {
 			t.Run("enqueue_"+tc.name, func(t *testing.T) {
+				q.markIdle() // as if the consumer's loop went idle again
 				assert.True(t, q.Enqueue(tc.data, tc.priority))
 
 				select {
@@ -74,9 +74,8 @@ func TestDistributedPriorityQueue(t *testing.T) {
 
 				select {
 				case action := <-notifications:
-					assert.Equal(t, "dequeued", action)
-				case <-time.After(time.Second):
-					t.Fatal("Timeout waiting for dequeue notification")
+					t.Fatalf("unexpected %q notification after dequeue", action)
+				case <-time.After(100 * time.Millisecond):
 				}
 			})
 		}
@@ -92,11 +91,11 @@ func TestDistributedPriorityQueue(t *testing.T) {
 			totalOperations = numGoroutines * numOperations
 		)
 
-		notifications := make(chan string, totalOperations*2) // *2 for enqueue and dequeue
+		notifications := make(chan string, totalOperations)
 		q.Subscribe(func(action string) {
 			notifications <- action
 		})
-		q.Start()
+		assert.Equal(t, 0, q.Len())
 
 		// Test concurrent enqueue
 		t.Run("concurrent_enqueue", func(t *testing.T) {
@@ -115,21 +114,8 @@ func TestDistributedPriorityQueue(t *testing.T) {
 
 			wg.Wait()
 
-			// Verify notifications
-			enqueueCount := 0
-			timeout := time.After(5 * time.Second)
-
-			for enqueueCount < totalOperations {
-				select {
-				case action := <-notifications:
-					if action == "enqueued" {
-						enqueueCount++
-					}
-				case <-timeout:
-					t.Fatalf("Timeout waiting for notifications. Got %d of %d", enqueueCount, totalOperations)
-				}
-			}
-
+			// One wake for the whole burst
+			assert.Equal(t, 1, signals(notifications, 500*time.Millisecond))
 			assert.Equal(t, totalOperations, q.Len())
 		})
 	})
@@ -160,6 +146,7 @@ func TestDistributedPriorityQueueNoNotifyOnFailedEnqueue(t *testing.T) {
 
 	got := make(chan string, 1)
 	dpq.Subscribe(func(action string) { got <- action })
+	dpq.Len() // idle, so a successful enqueue would wake it
 
 	assert.False(t, dpq.Enqueue(42, 1), "unsupported type should fail")
 

@@ -23,7 +23,7 @@ type Queue struct {
 	cancel            context.CancelFunc
 	expiration        time.Duration
 	visibilityTimeout time.Duration
-	onRequeue         func() // called after the sweeper requeues items; guarded by mx
+	onRequeue         func(n int64) // called after the sweeper requeues n items; guarded by mx
 }
 
 func newQueue(c *redis.Client, queueKey string) *Queue {
@@ -142,6 +142,32 @@ func (q *Queue) Enqueue(item any) bool {
 
 		return true
 	}
+}
+
+// enqueueWith runs script to push item, with ARGV[1] the item bytes, ARGV[2]
+// the queue expiration in milliseconds (0: none) and then extra.
+func (q *Queue) enqueueWith(script *redis.Script, keys []string, item any, extra ...any) bool {
+	q.mx.Lock()
+	defer q.mx.Unlock()
+
+	if q.ctx.Err() != nil {
+		log.Println("queue closed, cannot enqueue")
+		return false
+	}
+
+	data, err := q.toBytes(item)
+	if err != nil {
+		log.Printf("Error converting item to bytes: %v", err)
+		return false
+	}
+
+	args := append([]any{data, q.expiration.Milliseconds()}, extra...)
+	if err := script.Run(q.ctx, q.client, keys, args...).Err(); err != nil {
+		log.Printf("Error enqueueing item: %v", err)
+		return false
+	}
+
+	return true
 }
 
 func (q *Queue) Len() int {
@@ -373,14 +399,14 @@ func (q *Queue) sweep(requeue func() (int64, error)) {
 			q.mx.Unlock()
 
 			if onRequeue != nil {
-				onRequeue()
+				onRequeue(n)
 			}
 		}
 	}
 }
 
 // setOnRequeue sets the callback the sweeper runs after requeueing items.
-func (q *Queue) setOnRequeue(fn func()) {
+func (q *Queue) setOnRequeue(fn func(n int64)) {
 	q.mx.Lock()
 	defer q.mx.Unlock()
 	q.onRequeue = fn

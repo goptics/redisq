@@ -96,16 +96,14 @@ data, ok := pq.Dequeue() // Returns "high priority"
 // Create a distributed priority queue
 dpq := qs.NewDistributedPriorityQueue("distributed-priority-queue")
 
-// Subscribe to notifications for queue and dequeue events
+// Subscribing makes this instance a consumer that can be woken
 dpq.Subscribe(func(action string) {
-    fmt.Printf("Action: %s\n", action)
+    fmt.Printf("Action: %s\n", action) // "enqueued"
 })
 
-
-// Enqueue with priority will trigger "enqueued" notification
+// Wakes one idle consumer, if any
 dpq.Enqueue("important message", 1)
 
-// Dequeue will trigger "dequeued" notification
 data, ok := dpq.Dequeue()
 
 ```
@@ -116,17 +114,27 @@ data, ok := dpq.Dequeue()
 // Create a distributed queue
 dq := qs.NewDistributedQueue("distributed-queue")
 
-// Subscribe to notifications for queue and dequeue events
+// Subscribing makes this instance a consumer that can be woken
 dq.Subscribe(func(action string) {
-    fmt.Printf("Action: %s\n", action)
+    fmt.Printf("Action: %s\n", action) // "enqueued"
 })
 
-// Enqueue will trigger "enqueued" notification
+// Wakes one idle consumer, if any
 dq.Enqueue("test message")
 
-// Dequeue will trigger "dequeued" notification
 data, ok := dq.Dequeue()
 ```
+
+#### How consumers are woken
+
+A busy consumer keeps pulling on its own, so only idle ones need a signal.
+A consumer that finds the queue empty (`Len()` returns 0, or a dequeue finds
+nothing) joins the idle set `<key>:idle`. Each enqueue wakes **at most one**
+idle consumer on its own channel `<key>:wake:<id>`; when every consumer is
+busy, nothing is published. A requeue of `n` expired items wakes up to `n`.
+A consumer that is idle while items wait (for example after a wake reached a
+paused instance) is nudged within a second. There is no `"dequeued"`
+notification.
 
 ### Queue with Acknowledgment (Reliable Processing)
 
