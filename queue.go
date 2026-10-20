@@ -228,6 +228,7 @@ func (q *Queue) Acknowledge(ackID string) bool {
 		pipe := q.client.Pipeline()
 		pipe.HDel(q.ctx, q.getNackedItemKey(), ackID)
 		pipe.ZRem(q.ctx, q.getTimeoutKey(), ackID)
+		pipe.HDel(q.ctx, q.getPriorityKey(), ackID) // priority queues only; a no-op otherwise
 
 		_, err := pipe.Exec(q.ctx)
 
@@ -253,8 +254,12 @@ return v`
 var (
 	listAckPop = redis.NewScript(`local v = redis.call('LPOP', KEYS[1])
 if not v then return false end` + ackPending)
-	zsetAckPop = redis.NewScript(`local v = redis.call('ZPOPMIN', KEYS[1])[1]
+	// zsetAckPop also keeps the popped score in KEYS[4] under the ack ID, so
+	// a requeue restores the item's priority.
+	zsetAckPop = redis.NewScript(`local r = redis.call('ZPOPMIN', KEYS[1])
+local v = r[1]
 if not v then return false end
+redis.call('HSET', KEYS[4], ARGV[1], r[2])
 if #v >= 17 and string.byte(v, 1) == 255 then v = string.sub(v, 18) end` + ackPending)
 )
 
@@ -264,7 +269,7 @@ func (q *Queue) DequeueWithAckId() (any, bool, string) {
 
 // dequeueWithAck pops the next item with pop and marks it pending under a new
 // ack ID in the same atomic step.
-func (q *Queue) dequeueWithAck(pop *redis.Script) (any, bool, string) {
+func (q *Queue) dequeueWithAck(pop *redis.Script, extraKeys ...string) (any, bool, string) {
 	q.mx.Lock()
 	defer q.mx.Unlock()
 
@@ -279,7 +284,7 @@ func (q *Queue) dequeueWithAck(pop *redis.Script) (any, bool, string) {
 	}
 
 	ackID := cuid.New()
-	keys := []string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey()}
+	keys := append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey()}, extraKeys...)
 	v, err := pop.Run(q.ctx, q.client, keys, ackID, deadline).Text()
 	if err == redis.Nil {
 		return nil, false, ""
@@ -428,6 +433,11 @@ func unixSeconds(t time.Time) float64 {
 // getNackedItemKey returns the Redis key for the nacked items list
 func (q *Queue) getNackedItemKey() string {
 	return q.queueKey + ":nacked"
+}
+
+// getPriorityKey returns the Redis key for the priorities of pending items
+func (q *Queue) getPriorityKey() string {
+	return q.queueKey + ":prio"
 }
 
 // getTimeoutKey returns the Redis key for the visibility timeout ZSET

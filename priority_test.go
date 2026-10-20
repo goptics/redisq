@@ -137,11 +137,13 @@ func setupTestPriorityQueue(t *testing.T) (*PriorityQueue, func()) {
 	require.NoError(t, pq.client.Del(ctx, testQueueKey).Err(), "Failed to clear test queue")
 	require.NoError(t, pq.client.Del(ctx, pq.getNackedItemKey()).Err(), "Failed to clear nacked queue")
 	require.NoError(t, pq.client.Del(ctx, pq.getTimeoutKey()).Err(), "Failed to clear timeout key")
+	require.NoError(t, pq.client.Del(ctx, pq.getPriorityKey()).Err(), "Failed to clear priority key")
 
 	cleanup := func() {
 		pq.client.Del(ctx, testQueueKey)
 		pq.client.Del(ctx, pq.getNackedItemKey())
 		pq.client.Del(ctx, pq.getTimeoutKey())
+		pq.client.Del(ctx, pq.getPriorityKey())
 		pq.Close()
 		qs.Close()
 	}
@@ -472,4 +474,42 @@ func TestPriorityQueueAckRequeueKeepsItem(t *testing.T) {
 	for _, v := range pq.Values() {
 		assert.Equal(t, "job", string(v.([]byte)))
 	}
+}
+
+// A requeued item goes back at the priority it had, not at 1.
+func TestPriorityQueueRequeueKeepsPriority(t *testing.T) {
+	pq, cleanup := setupTestPriorityQueue(t)
+	defer cleanup()
+
+	pq.SetVisibilityTimeout(100 * time.Millisecond)
+	require.True(t, pq.Enqueue("low", 9))
+	_, ok, _ := pq.DequeueWithAckId()
+	require.True(t, ok)
+	require.True(t, pq.Enqueue("high", 2))
+
+	time.Sleep(1100 * time.Millisecond)
+	require.NoError(t, pq.RequeueNackedItems())
+
+	item, ok := pq.Dequeue()
+	require.True(t, ok)
+	assert.Equal(t, "high", string(item.([]byte)), "requeued low-priority item jumped the queue")
+
+	n, err := pq.client.HLen(context.Background(), pq.getPriorityKey()).Result()
+	require.NoError(t, err)
+	assert.Zero(t, n, "priority entry should be cleared on requeue")
+}
+
+// Acknowledging clears the remembered priority.
+func TestPriorityQueueAckClearsPriority(t *testing.T) {
+	pq, cleanup := setupTestPriorityQueue(t)
+	defer cleanup()
+
+	require.True(t, pq.Enqueue("job", 4))
+	_, ok, ackID := pq.DequeueWithAckId()
+	require.True(t, ok)
+	require.True(t, pq.Acknowledge(ackID))
+
+	n, err := pq.client.HLen(context.Background(), pq.getPriorityKey()).Result()
+	require.NoError(t, err)
+	assert.Zero(t, n)
 }
