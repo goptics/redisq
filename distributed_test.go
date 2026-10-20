@@ -82,6 +82,7 @@ func TestDistributedQueueConcurrency(t *testing.T) {
 		notifications <- action
 	})
 	assert.Equal(t, 0, q.Len())
+	before := publishes(t, q.Queue.client)
 
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines)
@@ -100,7 +101,7 @@ func TestDistributedQueueConcurrency(t *testing.T) {
 
 	// One idle consumer gets one wake for the whole burst, not one per item:
 	// once woken it keeps pulling on its own.
-	assert.Equal(t, 1, signals(notifications, 500*time.Millisecond))
+	assert.Equal(t, 1, publishes(t, q.Queue.client)-before)
 	assert.Equal(t, numGoroutines*numOperations, q.Len())
 }
 
@@ -229,4 +230,36 @@ func TestDistributedEnqueueIsOneRoundTrip(t *testing.T) {
 		}
 		assert.Equal(t, n, c.count())
 	})
+}
+
+// An enqueue onto a backlog wakes every idle consumer, not just one, so they
+// share the backlog at once instead of waiting for the nudge.
+func TestEnqueueOntoBacklogWakesAllIdle(t *testing.T) {
+	qs := New(getTestRedisURL())
+	defer qs.Close()
+	key := "test_backlog_wake"
+	ctx := context.Background()
+
+	var consumers []chan string
+	for range 3 {
+		c := qs.NewDistributedQueue(key)
+		defer c.Close()
+		got := make(chan string, 10)
+		c.Subscribe(func(action string) { got <- action }) // idle
+		consumers = append(consumers, got)
+	}
+	producer := qs.NewDistributedQueue(key)
+	defer producer.Close()
+	defer producer.Queue.client.Del(ctx, key, key+":idle")
+
+	require.NoError(t, producer.Queue.client.RPush(ctx, key, "a", "b", "c", "d").Err()) // no wake
+	require.True(t, producer.Enqueue("e"))
+
+	for i, got := range consumers {
+		select {
+		case <-got:
+		case <-time.After(300 * time.Millisecond):
+			t.Fatalf("consumer %d was not woken", i)
+		}
+	}
 }

@@ -61,13 +61,13 @@ end
 // wakeIdle wakes up to ARGV[2] idle consumers of idle set KEYS[1].
 var wakeIdle = redis.NewScript(wakeFn + `return wake(KEYS[1], ARGV[1], tonumber(ARGV[2]))`)
 
-// nudge reports whether consumer ARGV[2] sits in the idle set while the queue
-// holds items, which means a wake went astray; it then leaves the idle set.
-var nudge = redis.NewScript(`if redis.call('SISMEMBER', KEYS[2], ARGV[2]) == 1 and redis.call(ARGV[1], KEYS[1]) > 0 then
-	redis.call('SREM', KEYS[2], ARGV[2])
-	return 1
-end
-return 0`)
+// nudge brings consumer ARGV[2]'s idle-set membership in line with the
+// queue and returns its length: with the queue empty the consumer is (back)
+// in the idle set, with items waiting it leaves it, since it is about to be
+// poked to pull them.
+var nudge = redis.NewScript(`local n = redis.call(ARGV[1], KEYS[1])
+if n == 0 then redis.call('SADD', KEYS[2], ARGV[2]) else redis.call('SREM', KEYS[2], ARGV[2]) end
+return n`)
 
 func newNotification(client *redis.Client, queueKey, lenCmd string) *Notification {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -107,10 +107,13 @@ func (n *Notification) Start() {
 	})
 }
 
-// nudgeLoop wakes this consumer once a second if it is idle while items
-// wait. A wake can go to a consumer that can't take work (paused, or full but
-// marked idle by a Len call from elsewhere), and items pushed by older
-// versions or other clients send none.
+// nudgeLoop pokes this consumer once a second while items wait, and puts it
+// back in the idle set while the queue is empty. Wakes can be lost: one can
+// reach a consumer that can't take work (paused, or full but marked idle by
+// a Len call from elsewhere), a consumer whose pub/sub connection was
+// reconnecting is dropped from the idle set as gone, and items pushed by
+// older versions or other clients send none. A busy consumer just ignores
+// the poke.
 // ponytail: one script call per consumer per second.
 func (n *Notification) nudgeLoop() {
 	tick := time.NewTicker(time.Second)
@@ -127,12 +130,12 @@ func (n *Notification) nudgeLoop() {
 			continue
 		}
 
-		woke, err := nudge.Run(n.ctx, n.client, []string{n.queueKey, n.idleKey}, n.lenCmd, n.id).Int()
+		waiting, err := nudge.Run(n.ctx, n.client, []string{n.queueKey, n.idleKey}, n.lenCmd, n.id).Int()
 		if errors.Is(err, redis.ErrClosed) {
 			return // the client was closed without closing this queue
 		}
 
-		if woke == 1 {
+		if waiting > 0 {
 			n.broadcast("enqueued")
 		}
 	}

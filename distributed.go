@@ -2,12 +2,13 @@ package redisq
 
 import "github.com/redis/go-redis/v9"
 
-// listPushWake pushes an item and wakes one idle consumer in a single round
-// trip (see Queue.enqueueWith for ARGV[1] and ARGV[2]; ARGV[3] is the wake
-// channel prefix).
-var listPushWake = redis.NewScript(wakeFn + `redis.call('RPUSH', KEYS[1], ARGV[1])
+// listPushWake pushes an item and wakes idle consumers in a single round
+// trip, up to one per waiting item, so a backlog wakes them all (see
+// Queue.enqueueWith for ARGV[1] and ARGV[2]; ARGV[3] is the wake channel
+// prefix).
+var listPushWake = redis.NewScript(wakeFn + `local n = redis.call('RPUSH', KEYS[1], ARGV[1])
 if tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
-return wake(KEYS[2], ARGV[3], 1)`)
+return wake(KEYS[2], ARGV[3], n)`)
 
 type DistributedQueue struct {
 	*Queue

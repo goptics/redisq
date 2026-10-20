@@ -2,6 +2,8 @@ package redisq
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,6 +46,16 @@ func resetWakeKeys(t *testing.T) {
 	client := redis.NewClient(opts)
 	defer client.Close()
 	require.NoError(t, client.Del(context.Background(), testWakeKey, testWakeKey+":idle").Err())
+}
+
+// woken reports whether a signal arrives on got within d.
+func woken(got chan string, d time.Duration) bool {
+	select {
+	case <-got:
+		return true
+	case <-time.After(d):
+		return false
+	}
 }
 
 // signals returns how many signals arrive on got within d.
@@ -161,7 +173,7 @@ func TestNudgeWakesIdleConsumerWithWaitingItems(t *testing.T) {
 	a.len()
 
 	require.NoError(t, a.client.RPush(context.Background(), testWakeKey, "job").Err())
-	assert.Equal(t, 1, signals(got, 2500*time.Millisecond))
+	assert.True(t, woken(got, 2500*time.Millisecond))
 
 	member, err := a.client.SIsMember(context.Background(), a.idleKey, a.id).Result()
 	require.NoError(t, err)
@@ -176,5 +188,47 @@ func TestSubscribeOnBacklogGetsWoken(t *testing.T) {
 	require.NoError(t, producer.client.RPush(context.Background(), testWakeKey, "a", "b").Err())
 
 	_, got := newTestNotification(t, true)
-	assert.Equal(t, 1, signals(got, 2500*time.Millisecond))
+	assert.True(t, woken(got, 2500*time.Millisecond))
+}
+
+// A consumer dropped from the idle set without being woken (its pub/sub
+// connection was reconnecting when a wake went out) still gets work.
+func TestDroppedConsumerRecovers(t *testing.T) {
+	resetWakeKeys(t)
+	a, got := newTestNotification(t, true)
+	producer, _ := newTestNotification(t, false)
+	ctx := context.Background()
+
+	require.NoError(t, a.client.SRem(ctx, a.idleKey, a.id).Err()) // as if PUBLISH reached nobody
+	require.NoError(t, producer.client.RPush(ctx, testWakeKey, "job").Err())
+	producer.wake(1) // nobody idle to wake
+
+	assert.True(t, woken(got, 2500*time.Millisecond), "consumer never woken")
+}
+
+// The nudge puts a consumer that left the idle set back once the queue is
+// empty, so later enqueues wake it at once.
+func TestNudgeRejoinsIdleSetWhenEmpty(t *testing.T) {
+	resetWakeKeys(t)
+	a, _ := newTestNotification(t, true)
+	ctx := context.Background()
+	require.NoError(t, a.client.SRem(ctx, a.idleKey, a.id).Err())
+
+	assert.Eventually(t, func() bool {
+		member, err := a.client.SIsMember(ctx, a.idleKey, a.id).Result()
+		return err == nil && member
+	}, 2500*time.Millisecond, 50*time.Millisecond)
+}
+
+// publishes returns how many PUBLISH commands the server has run.
+func publishes(t *testing.T, c *redis.Client) int {
+	t.Helper()
+	for _, line := range strings.Split(c.Info(context.Background(), "commandstats").Val(), "\n") {
+		if rest, ok := strings.CutPrefix(line, "cmdstat_publish:calls="); ok {
+			n, err := strconv.Atoi(strings.SplitN(rest, ",", 2)[0])
+			require.NoError(t, err)
+			return n
+		}
+	}
+	return 0
 }

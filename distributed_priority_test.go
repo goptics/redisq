@@ -96,6 +96,7 @@ func TestDistributedPriorityQueue(t *testing.T) {
 			notifications <- action
 		})
 		assert.Equal(t, 0, q.Len())
+		before := publishes(t, q.Queue.client)
 
 		// Test concurrent enqueue
 		t.Run("concurrent_enqueue", func(t *testing.T) {
@@ -115,7 +116,7 @@ func TestDistributedPriorityQueue(t *testing.T) {
 			wg.Wait()
 
 			// One wake for the whole burst
-			assert.Equal(t, 1, signals(notifications, 500*time.Millisecond))
+			assert.Equal(t, 1, publishes(t, q.Queue.client)-before)
 			assert.Equal(t, totalOperations, q.Len())
 		})
 	})
