@@ -2,6 +2,7 @@ package redisq
 
 import (
 	"context"
+	crand "crypto/rand"
 	"errors"
 	"fmt"
 	"log"
@@ -12,7 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/lucsky/cuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -32,6 +32,7 @@ type Queue struct {
 	popLen            atomic.Int64                // items the next batch pop expects (see dequeueBatch); maxPop until the first
 	popRun            atomic.Int64                // items batch pops took since the queue was last seen empty
 	isPriority        bool                        // a zset queue, with :prio entries to clear on ack; set before any goroutine starts
+	dedupWindow       atomic.Int64                // time.Duration EnqueueOnce remembers an id for
 }
 
 func newQueue(c *redis.Client, queueKey string) *Queue {
@@ -51,11 +52,20 @@ func newQueueBase(c *redis.Client, queueKey string) *Queue {
 		queueKey:  queueKey,
 		ctx:       ctx,
 		cancel:    cancel,
-		ackPrefix: cuid.New(),
+		ackPrefix: newID(),
 	}
 	q.visibilityTimeout.Store(int64(5 * time.Minute))
+	q.dedupWindow.Store(int64(5 * time.Minute))
 	q.popLen.Store(maxPop)
 	return q
+}
+
+// newID returns an ID unique across processes: 128 random bits from
+// crypto/rand. cuid.New, used before, seeded math/rand with the start second,
+// so containers with the same pid and host started together could share IDs,
+// and a pop's re-send guard could hand one consumer the items another holds.
+func newID() string {
+	return crand.Text()
 }
 
 func (q *Queue) getExpiration() time.Duration {
@@ -153,6 +163,59 @@ func (q *Queue) Enqueue(item any) bool {
 
 		return true
 	}
+}
+
+// SetDedupWindow sets how long EnqueueOnce remembers an id: a push of the
+// same id within it stores nothing. Keep it above the client's re-send window,
+// or a late re-send can store the item again: with go-redis's default timeouts
+// up to 7 sends of a script (3 re-sends as EVALSHA, then up to 4 as EVAL after
+// a NOSCRIPT), each after a read timeout, a backoff, a pool wait, a dial and
+// a connection's setup, about 4 minutes at worst. 0 or less turns EnqueueOnce into Enqueue. Each id
+// costs about 100 bytes of Redis memory for the window.
+func (q *Queue) SetDedupWindow(d time.Duration) {
+	q.dedupWindow.Store(int64(d))
+}
+
+// once wraps a push script body so it stores its item once per id:
+// KEYS[#KEYS] is the id's key and ARGV[#ARGV] the dedupe window in ms. A key
+// already there means a push of the id (an earlier call, or a copy of this
+// one that go-redis re-sent) ran within the window, and nothing is pushed.
+// The key is set only after the push: Redis keeps a script's earlier writes
+// when a later command fails, so a push that fails (a key of the wrong type)
+// leaves the id free for a retry instead of silently taken.
+func once(body string) string {
+	return `if redis.call('EXISTS', KEYS[#KEYS]) == 1 then return 0 end
+local r = (function()
+` + body + `
+end)()
+redis.call('SET', KEYS[#KEYS], '1', 'PX', ARGV[#ARGV])
+return r`
+}
+
+// listPushOnce is Enqueue's push, once per id (see once), with ARGV[1] the
+// item and ARGV[2] the queue expiration in ms (0: none).
+var listPushOnce = redis.NewScript(once(`redis.call('RPUSH', KEYS[1], ARGV[1])
+if tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
+return 1`))
+
+// EnqueueOnce is Enqueue for a job with an id: it stores item unless an item
+// with the same id was pushed to this queue within the dedupe window (see
+// SetDedupWindow), and returns true in both cases. A retried call, or
+// go-redis's re-send of a push whose reply was lost, then stores the item
+// once. The id is remembered for the whole window, even if its item is
+// handled, removed or purged sooner. An empty id is a plain Enqueue.
+func (q *Queue) EnqueueOnce(item any, id string) bool {
+	if id == "" || q.dedupWindow.Load() <= 0 {
+		return q.Enqueue(item)
+	}
+	return q.enqueueOnceWith(listPushOnce, []string{q.queueKey}, item, id)
+}
+
+// enqueueOnceWith is enqueueWith for a script built with once: it
+// adds id's key to keys and the dedupe window to the arguments.
+func (q *Queue) enqueueOnceWith(script *redis.Script, keys []string, item any, id string, extra ...any) bool {
+	window := max(1, time.Duration(q.dedupWindow.Load()).Milliseconds())
+	return q.enqueueWith(script, append(keys, q.queueKey+":dedup:"+id), item, append(extra, window)...)
 }
 
 // enqueueWith runs script to push item, with ARGV[1] the item bytes, ARGV[2]

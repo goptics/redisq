@@ -5,10 +5,15 @@ import "github.com/redis/go-redis/v9"
 // zsetPushWake is zsetPush plus waking idle consumers, up to one per waiting
 // item, in a single round trip. ARGV[3] is the priority and ARGV[4] the wake
 // channel prefix (see Queue.enqueueWith for ARGV[1] and ARGV[2]).
-var zsetPushWake = redis.NewScript(wakeFn + `local s = redis.call('INCR', KEYS[2])
+const zsetPushWakeBody = `local s = redis.call('INCR', KEYS[2])
 redis.call('ZADD', KEYS[1], ARGV[3], '\255' .. string.format('%016x', s) .. ARGV[1])
 if tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
-return wake(KEYS[3], ARGV[4], redis.call('ZCARD', KEYS[1]))`)
+return wake(KEYS[3], ARGV[4], redis.call('ZCARD', KEYS[1]))`
+
+var (
+	zsetPushWake     = redis.NewScript(wakeFn + zsetPushWakeBody)
+	zsetPushWakeOnce = redis.NewScript(wakeFn + once(zsetPushWakeBody))
+)
 
 type DistributedPriorityQueue struct {
 	*PriorityQueue
@@ -29,6 +34,16 @@ func newDistributedPriorityQueue(client *redis.Client, queueKey string) *Distrib
 func (q *DistributedPriorityQueue) Enqueue(item any, priority int) bool {
 	keys := []string{q.Notification.queueKey, q.Notification.queueKey + ":seq", q.idleKey}
 	return q.enqueueWith(zsetPushWake, keys, item, priority, q.wakePrefix)
+}
+
+// EnqueueOnce is Enqueue for a job with an id (see Queue.EnqueueOnce). A
+// repeat wakes no one.
+func (q *DistributedPriorityQueue) EnqueueOnce(item any, priority int, id string) bool {
+	if id == "" || q.dedupWindow.Load() <= 0 {
+		return q.Enqueue(item, priority)
+	}
+	keys := []string{q.Notification.queueKey, q.Notification.queueKey + ":seq", q.idleKey}
+	return q.enqueueOnceWith(zsetPushWakeOnce, keys, item, id, priority, q.wakePrefix)
 }
 
 // Len returns the number of items in the queue; a consumer that finds it
