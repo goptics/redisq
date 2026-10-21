@@ -329,14 +329,10 @@ func popScript(lenCmd, body string) *redis.Script {
 
 var (
 	// listAckPop pops from the head of a list. LRANGE+LTRIM rather than
-	// LPOP with a count, which needs Redis 6.2.
-	listAckPop = popScript("LLEN", `if want == 1 then
-	local v = redis.call('LPOP', KEYS[1])
-	if v then items[1] = v end
-else
-	items = redis.call('LRANGE', KEYS[1], 0, want - 1)
-	if #items > 0 then redis.call('LTRIM', KEYS[1], #items, -1) end
-end`)
+	// LPOP with a count, which needs Redis 6.2. dequeueBatch sends every
+	// one-item call to the lean script, so want is at least 2 here.
+	listAckPop = popScript("LLEN", `items = redis.call('LRANGE', KEYS[1], 0, want - 1)
+if #items > 0 then redis.call('LTRIM', KEYS[1], #items, -1) end`)
 	// zsetAckPop pops the lowest scores, stores the bare items (without the
 	// sequence prefix) and keeps each score in KEYS[5] so a requeue restores
 	// the item's priority.
