@@ -864,10 +864,12 @@ func TestDeadlineCountsFromWhenItRuns(t *testing.T) {
 				ids := s.run()
 				require.GreaterOrEqual(t, time.Since(sent), pause-200*time.Millisecond, "%s: Redis did not hold it", s.name)
 				min := unixSeconds(time.Now().Add(vt - 100*time.Millisecond))
+				max := unixSeconds(time.Now().Add(vt + 100*time.Millisecond))
 				for _, id := range ids {
 					d, err := q.client.ZScore(ctx, q.getTimeoutKey(), id).Result()
 					require.NoError(t, err, s.name)
 					assert.GreaterOrEqual(t, d, min, "%s: deadline counted from when it was sent", s.name)
+					assert.LessOrEqual(t, d, max, "%s: deadline past the visibility timeout", s.name)
 				}
 			}
 		})
@@ -928,7 +930,11 @@ func TestScriptsUnderVerbatimReplication(t *testing.T) {
 			assert.EqualValues(t, 5, q.client.ZCard(ctx, q.getTimeoutKey()).Val(), "every pending item has its deadline")
 
 			time.Sleep(400 * time.Millisecond)
-			require.NoError(t, q.RequeueNackedItems())
+			if c.name == "priority" {
+				require.NoError(t, (&PriorityQueue{Queue: q}).RequeueNackedItems())
+			} else {
+				require.NoError(t, q.RequeueNackedItems())
+			}
 			assert.Zero(t, q.GetNackedItemsCount(), "expired items are requeued")
 		})
 	}
