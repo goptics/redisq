@@ -391,8 +391,7 @@ func TestDequeueBatchLateDuplicateAfterPartialAck(t *testing.T) {
 			require.True(t, q.Acknowledge(ids[0]))
 
 			keys := []string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey(), q.getPriorityKey()}
-			deadline := unixSeconds(time.Now().Add(time.Minute))
-			require.NoError(t, c.pop.Run(ctx, q.client, keys, 3, deadline, q.ackPrefix, resv, "", 3).Err())
+			require.NoError(t, c.pop.Run(ctx, q.client, keys, 3, 60, q.ackPrefix, resv, "", 3).Err())
 
 			pending, err := q.client.HMGet(ctx, q.getNackedItemKey(), ids[1], ids[2]).Result()
 			require.NoError(t, err)
@@ -850,7 +849,7 @@ func TestDequeueBatchLeanScriptRules(t *testing.T) {
 					resv++
 					id = q.ackIDOf(fmt.Sprintf("%020d", resv), 1)
 				}
-				r, err := c.popOneLen.Run(ctx, q.client, keys, unixSeconds(time.Now().Add(time.Minute)), id, consumer, slots).Slice()
+				r, err := c.popOneLen.Run(ctx, q.client, keys, 60, id, consumer, slots).Slice()
 				require.NoError(t, err)
 				return r[0].(int64), r[1].([]any)
 			}

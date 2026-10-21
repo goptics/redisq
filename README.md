@@ -172,6 +172,11 @@ queue.RequeueNackedItems()
 pendingCount := queue.GetNackedItemsCount()
 ```
 
+The visibility timeout counts from when Redis runs the pop, on Redis's clock,
+so a pop that waited in Redis still gets the full timeout. Once every process
+runs this version, clients whose clocks disagree share one deadline (older
+versions stamp and sweep deadlines with their own clocks).
+
 #### Taking several items at once
 
 `DequeueBatchWithAckIds` takes up to `len(items)` items (at most 1000) in one
