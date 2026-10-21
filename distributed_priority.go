@@ -12,7 +12,7 @@ return wake(KEYS[3], ARGV[4], redis.call('ZCARD', KEYS[1]))`
 
 var (
 	zsetPushWake     = redis.NewScript(wakeFn + zsetPushWakeBody)
-	zsetPushWakeOnce = redis.NewScript(wakeFn + onceFn + zsetPushWakeBody) // see onceFn
+	zsetPushWakeOnce = redis.NewScript(wakeFn + once(zsetPushWakeBody))
 )
 
 type DistributedPriorityQueue struct {

@@ -12,7 +12,7 @@ return wake(KEYS[2], ARGV[3], n)`
 
 var (
 	listPushWake     = redis.NewScript(wakeFn + listPushWakeBody)
-	listPushWakeOnce = redis.NewScript(wakeFn + onceFn + listPushWakeBody) // see onceFn
+	listPushWakeOnce = redis.NewScript(wakeFn + once(listPushWakeBody))
 )
 
 type DistributedQueue struct {

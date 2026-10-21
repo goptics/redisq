@@ -2,6 +2,7 @@ package redisq
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -154,6 +155,139 @@ func TestEnqueueOnceWindow(t *testing.T) {
 			assert.True(t, push("a", "z"))
 			assert.True(t, push("a", "z"))
 			assert.Equal(t, 4, size(), "no window: no dedupe")
+		})
+	}
+}
+
+// A push that fails after its id was checked (a key of the wrong type) must
+// leave the id free: a retry once the key is fixed stores the item.
+func TestEnqueueOnceFailedPushKeepsIdFree(t *testing.T) {
+	for _, c := range dedupCases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			qs := New(getTestRedisURL())
+			defer qs.Close()
+			client := qs.(*queues).client
+			delKeys(t, client, c.key())
+			defer delKeys(t, client, c.key())
+			_, push, size, done := c.open(qs, c.key())
+			defer done()
+
+			bad := c.key()
+			if strings.Contains(c.name, "priority") {
+				bad += ":seq" // INCR fails on it
+			}
+			require.NoError(t, client.Set(ctx, bad, "x", 0).Err())
+			assert.False(t, push("a", "id-1"), "the push fails")
+			require.NoError(t, client.Del(ctx, bad).Err())
+
+			assert.True(t, push("a", "id-1"))
+			assert.Equal(t, 1, size(), "the retry stores the item")
+		})
+	}
+}
+
+// EnqueueOnce keeps the priority it is given.
+func TestEnqueueOnceKeepsPriority(t *testing.T) {
+	for _, c := range dedupCases {
+		if !strings.Contains(c.name, "priority") {
+			continue
+		}
+		t.Run(c.name, func(t *testing.T) {
+			qs := New(getTestRedisURL())
+			defer qs.Close()
+			delKeys(t, qs.(*queues).client, c.key())
+			defer delKeys(t, qs.(*queues).client, c.key())
+			var pq *PriorityQueue
+			if c.name == "priority" {
+				pq = qs.NewPriorityQueue(c.key())
+			} else {
+				pq = qs.NewDistributedPriorityQueue(c.key()).PriorityQueue
+			}
+			defer pq.Close()
+
+			for i, p := range []int{3, 1, 2} {
+				require.True(t, pq.EnqueueOnce(fmt.Sprint(p), p, fmt.Sprint("id-", i)))
+			}
+			var got []string
+			for range 3 {
+				v, ok := pq.Dequeue()
+				require.True(t, ok)
+				got = append(got, string(v.([]byte)))
+			}
+			assert.Equal(t, []string{"1", "2", "3"}, got)
+		})
+	}
+}
+
+// A distributed EnqueueOnce wakes an idle consumer; a repeat publishes nothing
+// and leaves it idle.
+func TestEnqueueOnceWakesOnlyOnAPush(t *testing.T) {
+	for _, c := range dedupCases {
+		if !strings.HasPrefix(c.name, "distributed") {
+			continue
+		}
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			qs := New(getTestRedisURL())
+			defer qs.Close()
+			client := qs.(*queues).client
+			delKeys(t, client, c.key())
+			defer delKeys(t, client, c.key())
+
+			var n *Notification
+			var push func() bool
+			var pop func() bool
+			if c.name == "distributed" {
+				q := qs.NewDistributedQueue(c.key())
+				defer q.Close()
+				n, push = q.Notification, func() bool { return q.EnqueueOnce("a", "x") }
+				pop = func() bool { _, ok := q.Dequeue(); return ok }
+			} else {
+				q := qs.NewDistributedPriorityQueue(c.key())
+				defer q.Close()
+				n, push = q.Notification, func() bool { return q.EnqueueOnce("a", 1, "x") }
+				pop = func() bool { _, ok := q.Dequeue(); return ok }
+			}
+			woken := make(chan string, 4)
+			n.Subscribe(func(action string) { woken <- action }) // joins the idle set
+
+			require.True(t, push())
+			select {
+			case a := <-woken:
+				assert.Equal(t, "enqueued", a)
+			case <-time.After(2 * time.Second):
+				t.Fatal("the push woke no one")
+			}
+
+			require.True(t, pop())
+			assert.Zero(t, n.len()) // back in the idle set
+			before := publishes(t, client)
+			require.True(t, push())
+			assert.Equal(t, before, publishes(t, client), "a repeat publishes nothing")
+			assert.True(t, client.SIsMember(ctx, n.idleKey, n.id).Val(), "the consumer stays idle")
+		})
+	}
+}
+
+// EnqueueOnce sets the queue's expiration like Enqueue does.
+func TestEnqueueOnceSetsExpiration(t *testing.T) {
+	for _, c := range dedupCases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			qs := New(getTestRedisURL())
+			defer qs.Close()
+			client := qs.(*queues).client
+			delKeys(t, client, c.key())
+			defer delKeys(t, client, c.key())
+			q, push, _, done := c.open(qs, c.key())
+			defer done()
+
+			q.SetExpiration(10 * time.Second)
+			require.True(t, push("a", "x"))
+			ttl := client.PTTL(ctx, c.key()).Val()
+			assert.Greater(t, ttl, time.Duration(0))
+			assert.LessOrEqual(t, ttl, 10*time.Second)
 		})
 	}
 }

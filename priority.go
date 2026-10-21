@@ -26,7 +26,7 @@ return s`
 
 var (
 	zsetPush     = redis.NewScript(zsetPushBody)
-	zsetPushOnce = redis.NewScript(onceFn + zsetPushBody) // see onceFn
+	zsetPushOnce = redis.NewScript(once(zsetPushBody))
 )
 
 // zsetRemove removes the first member holding item ARGV[1].

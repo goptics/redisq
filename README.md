@@ -232,8 +232,10 @@ connection), up to 3 times by default. What that means per call:
 - **`Dequeue`** (no ack) is at most once: an item whose reply never arrives is
   gone. Use `DequeueWithAckId` for jobs you can't lose.
 - **`Remove`** can remove a second identical item if its call is re-sent.
-- Keep the visibility timeout well above the client's retry window
-  (`(retries + 1) × read timeout`, 12s with the defaults). A pop that reaches
+- Keep the visibility timeout well above the client's re-send window: about
+  4 minutes at worst with go-redis's defaults (up to 7 sends of a script, each
+  after a read timeout, a backoff, a pool wait, a dial and a connection's
+  setup), usually a few seconds. A pop that reaches
   Redis only after its item was requeued, which takes a stall longer than the
   visibility timeout, can still lose a job.
 
