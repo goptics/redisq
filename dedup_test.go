@@ -151,10 +151,14 @@ func TestEnqueueOnceWindow(t *testing.T) {
 			assert.True(t, push("a", "x"))
 			assert.Equal(t, 2, size(), "the window passed")
 
+			q.SetDedupWindow(500 * time.Microsecond) // under 1ms: kept for 1ms, not an error
+			assert.True(t, push("a", "w"))
+			assert.Equal(t, 3, size())
+
 			q.SetDedupWindow(0)
 			assert.True(t, push("a", "z"))
 			assert.True(t, push("a", "z"))
-			assert.Equal(t, 4, size(), "no window: no dedupe")
+			assert.Equal(t, 5, size(), "no window: no dedupe")
 		})
 	}
 }
@@ -198,11 +202,15 @@ func TestEnqueueOnceKeepsPriority(t *testing.T) {
 			defer qs.Close()
 			delKeys(t, qs.(*queues).client, c.key())
 			defer delKeys(t, qs.(*queues).client, c.key())
-			var pq *PriorityQueue
+			var pq interface {
+				EnqueueOnce(any, int, string) bool
+				Dequeue() (any, bool)
+				Close() error
+			}
 			if c.name == "priority" {
 				pq = qs.NewPriorityQueue(c.key())
 			} else {
-				pq = qs.NewDistributedPriorityQueue(c.key()).PriorityQueue
+				pq = qs.NewDistributedPriorityQueue(c.key()) // its own EnqueueOnce: the wake script
 			}
 			defer pq.Close()
 
@@ -249,16 +257,18 @@ func TestEnqueueOnceWakesOnlyOnAPush(t *testing.T) {
 				n, push = q.Notification, func() bool { return q.EnqueueOnce("a", 1, "x") }
 				pop = func() bool { _, ok := q.Dequeue(); return ok }
 			}
-			woken := make(chan string, 4)
-			n.Subscribe(func(action string) { woken <- action }) // joins the idle set
+			n.Subscribe(func(string) {}) // joins the idle set
+			// the consumer's own channel: only a PUBLISH reaches it, not the
+			// nudge loop's in-process broadcast
+			wake := client.Subscribe(ctx, n.wakePrefix+n.id)
+			defer wake.Close()
+			_, err := wake.Receive(ctx)
+			require.NoError(t, err)
 
 			require.True(t, push())
-			select {
-			case a := <-woken:
-				assert.Equal(t, "enqueued", a)
-			case <-time.After(2 * time.Second):
-				t.Fatal("the push woke no one")
-			}
+			msg, err := wake.ReceiveTimeout(ctx, 2*time.Second)
+			require.NoError(t, err, "the push woke no one")
+			assert.Equal(t, "enqueued", msg.(*redis.Message).Payload)
 
 			require.True(t, pop())
 			assert.Zero(t, n.len()) // back in the idle set

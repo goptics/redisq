@@ -3,7 +3,6 @@ module github.com/goptics/redisq
 go 1.24.1
 
 require (
-	github.com/lucsky/cuid v1.2.1
 	github.com/ory/dockertest/v3 v3.12.0
 	github.com/redis/go-redis/v9 v9.7.3
 	github.com/stretchr/testify v1.10.0

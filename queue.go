@@ -13,7 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/lucsky/cuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -61,16 +60,12 @@ func newQueueBase(c *redis.Client, queueKey string) *Queue {
 	return q
 }
 
-// newID returns an ID unique across processes. cuid.New's random part comes
-// from math/rand seeded with the start second, so processes with the same
-// pid and host (containers) started together could share IDs: two consumers
-// would then build the same ack IDs, and a pop's re-send guard could hand one
-// the items the other holds. crypto/rand rules that out.
+// newID returns an ID unique across processes: 128 random bits from
+// crypto/rand. cuid.New, used before, seeded math/rand with the start second,
+// so containers with the same pid and host started together could share IDs,
+// and a pop's re-send guard could hand one consumer the items another holds.
 func newID() string {
-	if id, err := cuid.NewCrypto(crand.Reader); err == nil {
-		return id
-	}
-	return cuid.New()
+	return crand.Text()
 }
 
 func (q *Queue) getExpiration() time.Duration {

@@ -948,6 +948,17 @@ func TestScriptsUnderVerbatimReplication(t *testing.T) {
 		defer delKeys(t, q.Queue.client, "test_verbatim_wake")
 		require.NoError(t, q.Queue.client.SAdd(ctx, q.idleKey, "gone-1", "gone-2").Err())
 		assert.True(t, q.Enqueue("a"), "waking past consumers that are gone")
+		require.NoError(t, q.Queue.client.SAdd(ctx, q.idleKey, "gone-1", "gone-2").Err())
+		assert.True(t, q.EnqueueOnce("b", "x"), "the same with an id")
+
+		pq := qs.NewDistributedPriorityQueue("test_verbatim_wake_prio")
+		defer pq.Close()
+		delKeys(t, pq.Queue.client, "test_verbatim_wake_prio")
+		defer delKeys(t, pq.Queue.client, "test_verbatim_wake_prio")
+		require.NoError(t, pq.Queue.client.SAdd(ctx, pq.idleKey, "gone-1", "gone-2").Err())
+		assert.True(t, pq.Enqueue("a", 1), "priority: waking past consumers that are gone")
+		require.NoError(t, pq.Queue.client.SAdd(ctx, pq.idleKey, "gone-1", "gone-2").Err())
+		assert.True(t, pq.EnqueueOnce("b", 1, "x"), "priority: the same with an id")
 	})
 }
 
