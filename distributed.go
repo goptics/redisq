@@ -57,7 +57,7 @@ func (q *DistributedQueue) DequeueWithAckId() (any, bool, string) {
 // Queue.DequeueBatchWithAckIds); a consumer whose pop comes up short joins
 // the idle set in the same step.
 func (q *DistributedQueue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n, remaining int, err error) {
-	return q.Queue.dequeueBatch(listAckPop, items, ackIDs, q.consumerID())
+	return q.Queue.dequeueBatch(listAckPop, listAckPopOneLen, items, ackIDs, q.consumerID())
 }
 
 func (q *DistributedQueue) Close() error {

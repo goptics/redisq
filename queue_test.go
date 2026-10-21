@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -812,13 +813,14 @@ func TestVisibilityTimeoutNotCutShort(t *testing.T) {
 type dropProxy struct {
 	ln     net.Listener
 	target string
-	hash   []byte
+	hashes [][]byte
 	sends  atomic.Int32
 	drops  atomic.Int32
 	onDrop func() // if set, runs after Redis ran a call whose reply is being dropped
 }
 
-func newDropProxy(t *testing.T, script *redis.Script) *dropProxy {
+// newDropProxy drops the replies of calls to any of scripts.
+func newDropProxy(t *testing.T, scripts ...*redis.Script) *dropProxy {
 	t.Helper()
 	opts, err := redis.ParseURL(getTestRedisURL())
 	require.NoError(t, err)
@@ -827,7 +829,10 @@ func newDropProxy(t *testing.T, script *redis.Script) *dropProxy {
 	require.NoError(t, err)
 	t.Cleanup(func() { ln.Close() })
 
-	p := &dropProxy{ln: ln, target: opts.Addr, hash: []byte(script.Hash())}
+	p := &dropProxy{ln: ln, target: opts.Addr}
+	for _, sc := range scripts {
+		p.hashes = append(p.hashes, []byte(sc.Hash()))
+	}
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -858,7 +863,7 @@ func (p *dropProxy) handle(c net.Conn) {
 		for {
 			n, err := c.Read(buf)
 			if n > 0 {
-				if bytes.Contains(buf[:n], p.hash) {
+				if slices.ContainsFunc(p.hashes, func(h []byte) bool { return bytes.Contains(buf[:n], h) }) {
 					p.sends.Add(1)
 					if p.drops.Add(-1) >= 0 {
 						drop.Store(true)
@@ -898,19 +903,20 @@ func (p *dropProxy) handle(c net.Conn) {
 // retryCase is a list or priority queue behind a dropProxy, holding "a"
 // then "b" at the same priority.
 type retryCase struct {
-	name   string
-	pop    *redis.Script // batch pop
-	popOne *redis.Script // single pop
-	setup  func(t *testing.T, url string) (q *Queue, push func(string) bool, cleanup func())
+	name      string
+	pop       *redis.Script // batch pop
+	popOne    *redis.Script // single pop
+	popOneLen *redis.Script // batch pop of one item
+	setup     func(t *testing.T, url string) (q *Queue, push func(string) bool, cleanup func())
 }
 
 var retryCases = []retryCase{
-	{"list", listAckPop, listAckPopOne, func(t *testing.T, url string) (*Queue, func(string) bool, func()) {
+	{"list", listAckPop, listAckPopOne, listAckPopOneLen, func(t *testing.T, url string) (*Queue, func(string) bool, func()) {
 		qs := New(url)
 		q := qs.NewQueue("test_retry_pop_list")
 		return q, func(s string) bool { return q.Enqueue(s) }, func() { q.Close(); qs.Close() }
 	}},
-	{"priority", zsetAckPop, zsetAckPopOne, func(t *testing.T, url string) (*Queue, func(string) bool, func()) {
+	{"priority", zsetAckPop, zsetAckPopOne, zsetAckPopOneLen, func(t *testing.T, url string) (*Queue, func(string) bool, func()) {
 		qs := New(url)
 		pq := qs.NewPriorityQueue("test_retry_pop_prio")
 		return pq.Queue, func(s string) bool { return pq.Enqueue(s, 1) }, func() { pq.Close(); qs.Close() }

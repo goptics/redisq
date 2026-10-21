@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -26,6 +27,22 @@ func popBatch(t *testing.T, q interface {
 		items = append(items, string(buf[i].([]byte)))
 	}
 	return items, ids[:n], remaining
+}
+
+// popAll pops slots at a time until the queue is empty, following remaining
+// as a caller does.
+func popAll(t *testing.T, q interface {
+	DequeueBatchWithAckIds([]any, []string) (int, int, error)
+}, slots int) []string {
+	t.Helper()
+	var all []string
+	for {
+		items, _, remaining := popBatch(t, q, slots)
+		all = append(all, items...)
+		if remaining == 0 || len(items) == 0 {
+			return all
+		}
+	}
 }
 
 func delKeys(t *testing.T, c *redis.Client, key string) {
@@ -164,7 +181,7 @@ func TestDequeueBatchRetryAfterLostReply(t *testing.T) {
 	for _, c := range retryCases {
 		t.Run(c.name, func(t *testing.T) {
 			ctx := context.Background()
-			p := newDropProxy(t, c.pop)
+			p := newDropProxy(t, c.pop, c.popOneLen)
 			q, push, cleanup := c.setup(t, p.url())
 			defer cleanup()
 			delKeys(t, q.client, q.queueKey)
@@ -179,6 +196,7 @@ func TestDequeueBatchRetryAfterLostReply(t *testing.T) {
 				}
 			}
 			require.NoError(t, c.pop.Load(ctx, q.client).Err())
+			require.NoError(t, c.popOneLen.Load(ctx, q.client).Err())
 
 			batcher := interface {
 				DequeueBatchWithAckIds([]any, []string) (int, int, error)
@@ -204,7 +222,7 @@ func TestDequeueBatchAfterFailedCall(t *testing.T) {
 	for _, c := range retryCases {
 		t.Run(c.name, func(t *testing.T) {
 			ctx := context.Background()
-			p := newDropProxy(t, c.pop)
+			p := newDropProxy(t, c.pop, c.popOneLen)
 			q, push, cleanup := c.setup(t, p.url())
 			defer cleanup()
 			delKeys(t, q.client, q.queueKey)
@@ -214,6 +232,7 @@ func TestDequeueBatchAfterFailedCall(t *testing.T) {
 				require.True(t, push(v))
 			}
 			require.NoError(t, c.pop.Load(ctx, q.client).Err())
+			require.NoError(t, c.popOneLen.Load(ctx, q.client).Err())
 
 			batcher := interface {
 				DequeueBatchWithAckIds([]any, []string) (int, int, error)
@@ -313,8 +332,7 @@ func TestDequeueBatchRequeue(t *testing.T) {
 	require.NoError(t, pq.RequeueNackedItems())
 	assert.Equal(t, 0, pq.GetNackedItemsCount())
 
-	items, _, _ = popBatch(t, pq, 5)
-	assert.Equal(t, []string{"high", "mid", "low"}, items, "requeued at their own priorities")
+	assert.Equal(t, []string{"high", "mid", "low"}, popAll(t, pq, 5), "requeued at their own priorities")
 }
 
 type batcher interface {
@@ -393,7 +411,7 @@ func TestDequeueBatchShortPopRetry(t *testing.T) {
 	for _, c := range retryCases {
 		t.Run(c.name, func(t *testing.T) {
 			ctx := context.Background()
-			p := newDropProxy(t, c.pop)
+			p := newDropProxy(t, c.pop, c.popOneLen)
 			q, push, cleanup := c.setup(t, p.url())
 			defer cleanup()
 			delKeys(t, q.client, q.queueKey)
@@ -420,6 +438,7 @@ func TestDequeueBatchShortPopRetry(t *testing.T) {
 				}
 			}
 			require.NoError(t, c.pop.Load(ctx, q.client).Err())
+			require.NoError(t, c.popOneLen.Load(ctx, q.client).Err())
 
 			p.drops.Store(1)
 			items, _, remaining := popBatch(t, batcherFor(c, q), 32)
@@ -438,7 +457,7 @@ func TestDequeueBatchLargerCallAfterFailedCall(t *testing.T) {
 	for _, c := range retryCases {
 		t.Run(c.name, func(t *testing.T) {
 			ctx := context.Background()
-			p := newDropProxy(t, c.pop)
+			p := newDropProxy(t, c.pop, c.popOneLen)
 			q, push, cleanup := c.setup(t, p.url())
 			defer cleanup()
 			delKeys(t, q.client, q.queueKey)
@@ -449,6 +468,7 @@ func TestDequeueBatchLargerCallAfterFailedCall(t *testing.T) {
 				require.True(t, push(v))
 			}
 			require.NoError(t, c.pop.Load(ctx, q.client).Err())
+			require.NoError(t, c.popOneLen.Load(ctx, q.client).Err())
 			b := batcherFor(c, q)
 
 			p.drops.Store(4)
@@ -477,7 +497,7 @@ func TestDequeueBatchLargerCallAfterFailedCall(t *testing.T) {
 // smaller failed reservation, and only then.
 func TestDequeueBatchReusedReservationMarksIdle(t *testing.T) {
 	ctx := context.Background()
-	p := newDropProxy(t, listAckPop)
+	p := newDropProxy(t, listAckPop, listAckPopOneLen)
 	qs := New(p.url())
 	defer qs.Close()
 	dq := qs.NewDistributedQueue("test_batch_reuse_idle")
@@ -486,6 +506,7 @@ func TestDequeueBatchReusedReservationMarksIdle(t *testing.T) {
 	defer delKeys(t, dq.Queue.client, dq.Queue.queueKey)
 	dq.Subscribe(func(string) {})
 	require.NoError(t, listAckPop.Load(ctx, dq.Queue.client).Err())
+	require.NoError(t, listAckPopOneLen.Load(ctx, dq.Queue.client).Err())
 
 	member := func() bool {
 		ok, err := dq.Queue.client.SIsMember(ctx, dq.idleKey, dq.id).Result()
@@ -499,6 +520,7 @@ func TestDequeueBatchReusedReservationMarksIdle(t *testing.T) {
 		for _, v := range vs {
 			require.True(t, dq.Enqueue(v))
 		}
+		dq.Queue.popLen.Store(maxPop) // the failing call reserves both its slots
 		p.drops.Store(4)
 		_, _, err := dq.DequeueBatchWithAckIds(make([]any, 2), make([]string, 2))
 		require.Error(t, err)
@@ -577,7 +599,7 @@ func TestFailedPopHandsBackAcrossKinds(t *testing.T) {
 	}
 	for _, c := range retryCases {
 		t.Run(c.name+"/batch-then-single", func(t *testing.T) {
-			p := newDropProxy(t, c.pop)
+			p := newDropProxy(t, c.pop, c.popOneLen)
 			q, push, cleanup := c.setup(t, p.url())
 			defer cleanup()
 			delKeys(t, q.client, q.queueKey)
@@ -585,6 +607,7 @@ func TestFailedPopHandsBackAcrossKinds(t *testing.T) {
 			require.True(t, push("a"))
 			require.True(t, push("b"))
 			require.NoError(t, c.pop.Load(context.Background(), q.client).Err())
+			require.NoError(t, c.popOneLen.Load(context.Background(), q.client).Err())
 			b := batcherFor(c, q)
 
 			p.drops.Store(4)
@@ -713,8 +736,7 @@ func TestDequeueBatchRequeueKeepsOrder(t *testing.T) {
 
 	time.Sleep(1100 * time.Millisecond)
 	require.NoError(t, pq.RequeueNackedItems())
-	items, _, _ = popBatch(t, pq, 12)
-	assert.Equal(t, want, items)
+	assert.Equal(t, want, popAll(t, pq, 12))
 }
 
 // IDs stay exact and distinct with a huge reservation counter: no number goes
@@ -738,5 +760,249 @@ func TestDequeueBatchLargeCounter(t *testing.T) {
 		v, err := q.client.HGet(ctx, q.getNackedItemKey(), id).Result()
 		require.NoError(t, err)
 		assert.Equal(t, items[i], v)
+	}
+}
+
+// A call sizes itself by the previous ones: a fresh object fills the call,
+// a trickle pops one item per call with the lean script, a burst after a
+// trickle takes two calls, a burst like the last one takes one, and an empty
+// call keeps the estimate.
+func TestDequeueBatchSizesByRun(t *testing.T) {
+	for _, c := range retryCases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			p := newDropProxy(t, c.popOneLen) // counts lean calls; drops nothing
+			q, push, cleanup := c.setup(t, p.url())
+			defer cleanup()
+			delKeys(t, q.client, q.queueKey)
+			defer delKeys(t, q.client, q.queueKey)
+			require.NoError(t, c.popOneLen.Load(ctx, q.client).Err())
+			b := batcherFor(c, q)
+			pushAll := func(vs ...string) {
+				for _, v := range vs {
+					require.True(t, push(v))
+				}
+			}
+			pop := func(want []string, remaining int, lean int32, msg string) []string {
+				t.Helper()
+				before := p.sends.Load()
+				items, ids, rem := popBatch(t, b, 10)
+				assert.Equal(t, want, items, msg)
+				assert.Equal(t, remaining, rem, msg)
+				assert.Equal(t, lean, p.sends.Load()-before, msg+": lean calls")
+				return ids
+			}
+
+			pushAll("a", "b", "c")
+			pop([]string{"a", "b", "c"}, 0, 0, "a fresh object fills the call")
+			pushAll("d")
+			pop([]string{"d"}, 0, 0, "sized by the last run of 3")
+			pushAll("e")
+			ids := pop([]string{"e"}, 0, 1, "a trickle: one item, lean")
+			require.Len(t, ids, 1)
+			assert.True(t, strings.HasSuffix(ids[0], ":0001"))
+			v, err := q.client.HGet(ctx, q.getNackedItemKey(), ids[0]).Result()
+			require.NoError(t, err)
+			assert.Equal(t, "e", v)
+			_, err = q.client.ZScore(ctx, q.getTimeoutKey(), ids[0]).Result()
+			assert.NoError(t, err, "the item has a deadline")
+			if c.name == "priority" {
+				score, err := q.client.HGet(ctx, q.getPriorityKey(), ids[0]).Result()
+				require.NoError(t, err)
+				assert.Equal(t, "1", score)
+			}
+
+			pushAll("f", "g", "h")
+			pop([]string{"f"}, 2, 1, "a burst after a trickle: one item first")
+			pop([]string{"g", "h"}, 0, 0, "then what remained")
+			pop(nil, 0, 0, "an empty call")
+			pushAll("i", "j", "k")
+			pop([]string{"i", "j", "k"}, 0, 0, "a burst like the last run, in one call, despite the empty call")
+			assert.Equal(t, 11, q.GetNackedItemsCount(), "every popped item is pending")
+		})
+	}
+}
+
+// The lean one-item script's rules, run directly with a consumer ID no
+// Notification owns, so the nudge loop can't touch the idle set: an empty
+// pop joins it, a pop leaving an item or filling its only slot does not, a
+// caller that is not a consumer never does, and a hand-back that empties the
+// queue with slots to spare joins it and gets a fresh deadline.
+func TestDequeueBatchLeanScriptRules(t *testing.T) {
+	for _, c := range retryCases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			q, push, cleanup := c.setup(t, getTestRedisURL())
+			defer cleanup()
+			delKeys(t, q.client, q.queueKey)
+			defer delKeys(t, q.client, q.queueKey)
+			keys := []string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey(), q.getPriorityKey()}
+			const cons = "synthetic-consumer"
+			member := func() bool {
+				ok, err := q.client.SIsMember(ctx, q.getIdleKey(), cons).Result()
+				require.NoError(t, err)
+				return ok
+			}
+			resv := 0
+			run := func(consumer string, slots int, id string) (int64, []any) {
+				t.Helper()
+				if id == "" {
+					resv++
+					id = q.ackIDOf(fmt.Sprintf("%020d", resv), 1)
+				}
+				r, err := c.popOneLen.Run(ctx, q.client, keys, unixSeconds(time.Now().Add(time.Minute)), id, consumer, slots).Slice()
+				require.NoError(t, err)
+				return r[0].(int64), r[1].([]any)
+			}
+
+			n, items := run("", 5, "")
+			assert.EqualValues(t, 0, n)
+			assert.Empty(t, items)
+			assert.Zero(t, q.client.SCard(ctx, q.getIdleKey()).Val(), "not a consumer")
+
+			n, items = run(cons, 5, "")
+			assert.EqualValues(t, 0, n)
+			assert.Empty(t, items)
+			assert.True(t, member(), "empty pop")
+
+			require.NoError(t, q.client.SRem(ctx, q.getIdleKey(), cons).Err())
+			require.True(t, push("a"))
+			require.True(t, push("b"))
+			n, items = run(cons, 5, "")
+			assert.EqualValues(t, 1, n)
+			assert.Equal(t, []any{"a"}, items)
+			assert.False(t, member(), "an item still waits")
+
+			n, items = run(cons, 1, "")
+			assert.EqualValues(t, 0, n)
+			assert.Equal(t, []any{"b"}, items)
+			assert.False(t, member(), "no slot to spare")
+
+			id := q.ackIDOf(fmt.Sprintf("%020d", 99), 1)
+			require.NoError(t, q.client.HSet(ctx, q.getNackedItemKey(), id, "held").Err())
+			old := unixSeconds(time.Now().Add(time.Second))
+			require.NoError(t, q.client.ZAdd(ctx, q.getTimeoutKey(), redis.Z{Score: old, Member: id}).Err())
+			n, items = run(cons, 5, id)
+			assert.EqualValues(t, 0, n)
+			assert.Equal(t, []any{"held"}, items)
+			assert.True(t, member(), "a hand-back short of the slots that empties the queue")
+			d, err := q.client.ZScore(ctx, q.getTimeoutKey(), id).Result()
+			require.NoError(t, err)
+			assert.Greater(t, d, old+30, "the hand-back raises the deadline")
+		})
+	}
+}
+
+// A single pop leaves a failed batch call's kept reservation alone: the next
+// batch call with room for it gets its items back.
+func TestDequeueBatchSinglePopLeavesKeptBatch(t *testing.T) {
+	for _, c := range retryCases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			p := newDropProxy(t, c.pop, c.popOneLen)
+			q, push, cleanup := c.setup(t, p.url())
+			defer cleanup()
+			delKeys(t, q.client, q.queueKey)
+			defer delKeys(t, q.client, q.queueKey)
+			for _, v := range []string{"a", "b", "c"} {
+				require.True(t, push(v))
+			}
+			require.NoError(t, c.pop.Load(ctx, q.client).Err())
+			b := batcherFor(c, q)
+			p.drops.Store(4)
+			_, _, err := b.DequeueBatchWithAckIds(make([]any, 2), make([]string, 2))
+			require.Error(t, err) // a, b pending under the kept reservation
+
+			item, ok, _ := b.(interface{ DequeueWithAckId() (any, bool, string) }).DequeueWithAckId()
+			require.True(t, ok)
+			assert.Equal(t, "c", string(item.([]byte)))
+			items, _, _ := popBatch(t, b, 2)
+			assert.Equal(t, []string{"a", "b"}, items)
+		})
+	}
+}
+
+// A lean one-item batch pop whose reply is lost is re-sent and hands back the
+// same item.
+func TestDequeueBatchOneItemRetry(t *testing.T) {
+	for _, c := range retryCases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			p := newDropProxy(t, c.popOneLen)
+			q, push, cleanup := c.setup(t, p.url())
+			defer cleanup()
+			delKeys(t, q.client, q.queueKey)
+			defer delKeys(t, q.client, q.queueKey)
+			require.NoError(t, c.popOneLen.Load(ctx, q.client).Err())
+			require.True(t, push("a"))
+			require.True(t, push("b"))
+			q.popLen.Store(0) // the next call takes one item
+
+			p.drops.Store(1)
+			items, _, remaining := popBatch(t, batcherFor(c, q), 5)
+			assert.EqualValues(t, 2, p.sends.Load(), "run, reply lost, re-sent")
+			assert.Equal(t, []string{"a"}, items)
+			assert.Equal(t, 1, remaining)
+			assert.Equal(t, 1, q.GetNackedItemsCount())
+		})
+	}
+}
+
+// On the one-item path, a consumer joins the idle set when the pop empties
+// the queue with slots to spare, and not when its only slot is now taken.
+func TestDequeueBatchOneItemIdleRule(t *testing.T) {
+	ctx := context.Background()
+	qs := New(getTestRedisURL())
+	defer qs.Close()
+	dq := qs.NewDistributedQueue("test_batch_one_idle")
+	defer dq.Close()
+	delKeys(t, dq.Queue.client, dq.Queue.queueKey)
+	defer delKeys(t, dq.Queue.client, dq.Queue.queueKey)
+	dq.Subscribe(func(string) {})
+	member := func() bool {
+		ok, err := dq.Queue.client.SIsMember(ctx, dq.idleKey, dq.id).Result()
+		require.NoError(t, err)
+		return ok
+	}
+
+	for _, slots := range []int{1, 5} {
+		require.True(t, dq.Enqueue("x"))
+		require.NoError(t, dq.Queue.client.SRem(ctx, dq.idleKey, dq.id).Err())
+		dq.Queue.popLen.Store(0)
+		items, _, remaining := popBatch(t, dq, slots)
+		require.Equal(t, []string{"x"}, items)
+		require.Equal(t, 0, remaining)
+		assert.Equal(t, slots > 1, member(), "slots %d", slots)
+	}
+}
+
+// A failed call's reservation is reused by any later call with room for it,
+// even one that sizes itself to a single item because the queue looked
+// empty: its items come back at once instead of waiting for the timeout.
+func TestDequeueBatchReuseAfterSmallGuess(t *testing.T) {
+	for _, c := range retryCases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			p := newDropProxy(t, c.pop, c.popOneLen)
+			q, push, cleanup := c.setup(t, p.url())
+			defer cleanup()
+			delKeys(t, q.client, q.queueKey)
+			defer delKeys(t, q.client, q.queueKey)
+			require.NoError(t, c.pop.Load(ctx, q.client).Err())
+			require.NoError(t, c.popOneLen.Load(ctx, q.client).Err())
+			for _, v := range []string{"a", "b", "c", "d"} {
+				require.True(t, push(v))
+			}
+			b := batcherFor(c, q)
+
+			p.drops.Store(4)
+			_, _, err := b.DequeueBatchWithAckIds(make([]any, 2), make([]string, 2))
+			require.Error(t, err) // a, b popped, every reply lost
+
+			q.popLen.Store(0) // the next call would size itself to one item
+			items, _, remaining := popBatch(t, b, 5)
+			assert.Equal(t, []string{"a", "b"}, items)
+			assert.Equal(t, 2, remaining)
+		})
 	}
 }

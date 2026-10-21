@@ -57,7 +57,7 @@ func (q *DistributedPriorityQueue) DequeueWithAckId() (any, bool, string) {
 // PriorityQueue.DequeueBatchWithAckIds); a consumer whose pop comes up short
 // joins the idle set in the same step.
 func (q *DistributedPriorityQueue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n, remaining int, err error) {
-	return q.dequeueBatch(zsetAckPop, items, ackIDs, q.consumerID(), q.getPriorityKey())
+	return q.dequeueBatch(zsetAckPop, zsetAckPopOneLen, items, ackIDs, q.consumerID(), q.getPriorityKey())
 }
 
 func (q *DistributedPriorityQueue) Close() error {

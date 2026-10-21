@@ -29,6 +29,8 @@ type Queue struct {
 	ackPrefix         string                      // ack IDs are <ackPrefix>:<reservation>:<index>, unique per Queue object
 	ackSeq            atomic.Uint64               // last reservation number handed out
 	retryPop          atomic.Pointer[reservation] // ack IDs of a pop that failed with an error, reused by the next pop
+	popLen            atomic.Int64                // items the next batch pop expects (see dequeueBatch); maxPop until the first
+	popRun            atomic.Int64                // items batch pops took since the queue was last seen empty
 	isPriority        bool                        // a zset queue, with :prio entries to clear on ack; set before any goroutine starts
 }
 
@@ -52,6 +54,7 @@ func newQueueBase(c *redis.Client, queueKey string) *Queue {
 		ackPrefix: cuid.New(),
 	}
 	q.visibilityTimeout.Store(int64(5 * time.Minute))
+	q.popLen.Store(maxPop)
 	return q
 }
 
@@ -335,14 +338,10 @@ func popScript(lenCmd, body string) *redis.Script {
 
 var (
 	// listAckPop pops from the head of a list. LRANGE+LTRIM rather than
-	// LPOP with a count, which needs Redis 6.2.
-	listAckPop = popScript("LLEN", `if want == 1 then
-	local v = redis.call('LPOP', KEYS[1])
-	if v then items[1] = v end
-else
-	items = redis.call('LRANGE', KEYS[1], 0, want - 1)
-	if #items > 0 then redis.call('LTRIM', KEYS[1], #items, -1) end
-end`)
+	// LPOP with a count, which needs Redis 6.2. dequeueBatch sends every
+	// one-item call to the lean script, so want is at least 2 here.
+	listAckPop = popScript("LLEN", `items = redis.call('LRANGE', KEYS[1], 0, want - 1)
+if #items > 0 then redis.call('LTRIM', KEYS[1], #items, -1) end`)
 	// zsetAckPop pops the lowest scores, stores the bare items (without the
 	// sequence prefix) and keeps each score in KEYS[5] so a requeue restores
 	// the item's priority.
@@ -383,14 +382,49 @@ redis.call('HSET', KEYS[2], ARGV[2], v)
 if tonumber(ARGV[1]) > 0 then redis.call('ZADD', KEYS[3], ARGV[1], ARGV[2]) end
 return v`
 
-var (
-	listAckPopOne = redis.NewScript(popOneHead + `local v = redis.call('LPOP', KEYS[1])` + popOneTail)
-	zsetAckPopOne = redis.NewScript(popOneHead + `local r = redis.call('ZPOPMIN', KEYS[1])
+// listPopOne and zsetPopOne pop one item into v (nil when empty). The zset
+// one keeps the item's score in KEYS[5] and strips the sequence prefix.
+const (
+	listPopOne = `local v = redis.call('LPOP', KEYS[1])`
+	zsetPopOne = `local r = redis.call('ZPOPMIN', KEYS[1])
 local v = r[1]
 if v then
 	redis.call('HSET', KEYS[5], ARGV[2], r[2])
 	if #v >= 17 and string.byte(v, 1) == 255 then v = string.sub(v, 18) end
-end` + popOneTail)
+end`
+)
+
+var (
+	listAckPopOne = redis.NewScript(popOneHead + listPopOne + popOneTail)
+	zsetAckPopOne = redis.NewScript(popOneHead + zsetPopOne + popOneTail)
+)
+
+// popOneLenHead and popOneLenTail wrap the lean pop a batch call runs when it
+// takes one item: popOneHead's guard and popOneTail's bookkeeping, with the
+// batch scripts' reply ({len, items}) and idle rule (see popHead). It skips
+// building and checking ack IDs for the slots it would not fill.
+//
+// ARGV: deadline, ack ID, consumer ID, the caller's free slots.
+var popOneLenHead = `local function reply(items)
+	local len = redis.call(__LEN__, KEYS[1])
+	if ARGV[3] ~= '' and len == 0 and #items < tonumber(ARGV[4]) then redis.call('SADD', KEYS[4], ARGV[3]) end
+	return {len, items}
+end
+` + strings.Replace(popOneHead, "return held", "return reply({held})", 1)
+
+const popOneLenTail = `
+if not v then return reply({}) end
+redis.call('HSET', KEYS[2], ARGV[2], v)
+if tonumber(ARGV[1]) > 0 then redis.call('ZADD', KEYS[3], ARGV[1], ARGV[2]) end
+return reply({v})`
+
+func popOneLenScript(lenCmd, body string) *redis.Script {
+	return redis.NewScript(strings.ReplaceAll(popOneLenHead+body+popOneLenTail, "__LEN__", "'"+lenCmd+"'"))
+}
+
+var (
+	listAckPopOneLen = popOneLenScript("LLEN", listPopOne)
+	zsetAckPopOneLen = popOneLenScript("ZCARD", zsetPopOne)
 )
 
 // reservation is the ack IDs <prefix>:<start>:0001..<start>:<want> of one pop
@@ -410,13 +444,20 @@ func (q *Queue) DequeueWithAckId() (any, bool, string) {
 // from the queue to pending in one atomic step, each under its own ack ID,
 // into items[:n] and ackIDs[:n]. remaining is the queue length right after
 // the move. n is 0 with a nil error when the queue is empty, or when no
-// capacity was given (remaining is then 0 and means nothing). n can be below
-// that count while remaining > 0 only right after a failed call: the next call
-// of at least that call's size reuses its ack IDs and gets its items back.
-// One failed call is kept at a time; the items of another that failed with
-// it stay pending until they are requeued.
+// capacity was given (remaining is then 0 and means nothing).
+//
+// A call takes about as many items as this object's previous batch calls
+// suggest (the full count on its first call): what the last call left in the
+// queue, or once the queue was emptied, as many as were taken since it was
+// last seen empty. A trickle thus pops one item per call, cheaply, and a
+// burst like the last one is taken in one call. So n can be below the count
+// while remaining > 0, and the caller should call again. A call can also
+// reuse a failed call's ack IDs and get that call's items back: the next
+// call with at least that call's slots does. One failed call is kept at a
+// time; the items of another that failed with it stay pending until they are
+// requeued.
 func (q *Queue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n, remaining int, err error) {
-	return q.dequeueBatch(listAckPop, items, ackIDs, "")
+	return q.dequeueBatch(listAckPop, listAckPopOneLen, items, ackIDs, "")
 }
 
 // dequeueOne pops one item with a lean single-item script (see popOneHead).
@@ -426,7 +467,7 @@ func (q *Queue) dequeueOne(pop *redis.Script, consumer string, extraKeys ...stri
 		return nil, false, ""
 	}
 
-	r := q.reserve(1)
+	r := q.reserve(1, 1)
 	ackID := q.ackIDOf(fmt.Sprintf("%020d", r.start), 1)
 	keys := append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey()}, extraKeys...)
 	v, err := pop.Run(q.ctx, q.client, keys, q.deadline(), ackID, consumer).Text()
@@ -443,16 +484,17 @@ func (q *Queue) dequeueOne(pop *redis.Script, consumer string, extraKeys ...stri
 	return []byte(v), true, ackID
 }
 
-// reserve returns the ack IDs for a pop of up to want items. The IDs are
-// reserved once per call, so a script go-redis re-sends carries them again.
-// After a failed call they are kept (retryPop) for the next one: if the
-// failed pop ran anyway, the script hands its items back now instead of
-// leaving them pending until the visibility timeout. A call smaller than the
-// kept reservation leaves it for a later call, and a failure that finds one
-// already kept drops its own: those items wait for the timeout.
-func (q *Queue) reserve(want int) *reservation {
+// reserve returns the ack IDs for a pop of up to want items, by a call with
+// room for limit. The IDs are reserved once per call, so a script go-redis
+// re-sends carries them again. After a failed call they are kept (retryPop)
+// for the next one: if the failed pop ran anyway, the script hands its items
+// back now instead of leaving them pending until the visibility timeout. A
+// call with room for fewer than the kept reservation leaves it for a later
+// call, and a failure that finds one already kept drops its own: those items
+// wait for the timeout.
+func (q *Queue) reserve(limit, want int) *reservation {
 	r := q.retryPop.Swap(nil)
-	if r != nil && r.want > want {
+	if r != nil && r.want > limit {
 		q.retryPop.CompareAndSwap(nil, r)
 		r = nil
 	}
@@ -476,11 +518,16 @@ func (q *Queue) deadline() float64 {
 }
 
 // dequeueBatch runs pop for up to len(items) items, marking them pending in
-// the same step (see popHead).
-func (q *Queue) dequeueBatch(pop *redis.Script, items []any, ackIDs []string, consumer string, extraKeys ...string) (int, int, error) {
+// the same step (see popHead), or popOne when it takes one item. It sizes the
+// pop by popLen: the length the last call left, or after the queue emptied,
+// the items taken since it was last seen empty (an empty call keeps it). A
+// trickle then pops one item with the lean script instead of building and
+// checking an ack ID for every slot, and a burst like the last one takes one
+// call. A guess that is too small costs one more call, and remaining says so.
+func (q *Queue) dequeueBatch(pop, popOne *redis.Script, items []any, ackIDs []string, consumer string, extraKeys ...string) (int, int, error) {
 	slots := min(len(items), len(ackIDs))
-	want := min(slots, maxPop)
-	if want == 0 {
+	limit := min(slots, maxPop)
+	if limit == 0 {
 		return 0, 0, nil
 	}
 
@@ -488,10 +535,16 @@ func (q *Queue) dequeueBatch(pop *redis.Script, items []any, ackIDs []string, co
 		return 0, 0, errQueueClosed
 	}
 
-	r := q.reserve(want)
+	r := q.reserve(limit, min(limit, max(1, int(q.popLen.Load()))))
 	resv := fmt.Sprintf("%020d", r.start)
 	keys := append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey()}, extraKeys...)
-	reply, err := pop.Run(q.ctx, q.client, keys, r.want, q.deadline(), q.ackPrefix, resv, consumer, slots).Slice()
+	var reply []any
+	var err error
+	if r.want == 1 {
+		reply, err = popOne.Run(q.ctx, q.client, keys, q.deadline(), q.ackIDOf(resv, 1), consumer, slots).Slice()
+	} else {
+		reply, err = pop.Run(q.ctx, q.client, keys, r.want, q.deadline(), q.ackPrefix, resv, consumer, slots).Slice()
+	}
 	if err != nil {
 		q.retryPop.CompareAndSwap(nil, r)
 		return 0, 0, err
@@ -503,7 +556,15 @@ func (q *Queue) dequeueBatch(pop *redis.Script, items []any, ackIDs []string, co
 		ackIDs[i] = q.ackIDOf(resv, i+1)
 	}
 
-	return len(popped), int(reply[0].(int64)), nil
+	remaining := int(reply[0].(int64))
+	if remaining > 0 {
+		q.popRun.Add(int64(len(popped)))
+		q.popLen.Store(int64(remaining))
+	} else if run := q.popRun.Swap(0) + int64(len(popped)); run > 0 {
+		q.popLen.Store(run)
+	}
+
+	return len(popped), remaining, nil
 }
 
 // requeueLoop and requeueEnd wrap a push of item v back onto the queue. With
