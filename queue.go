@@ -205,6 +205,13 @@ func (q *Queue) Values() []any {
 	return values
 }
 
+// prepareAck stores item ARGV[2] as pending under ack ID ARGV[1], with a
+// visibility deadline ARGV[3] seconds from now (see deadlineFn).
+var prepareAck = redis.NewScript(deadlineFn + `redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+local dl = deadline(ARGV[3])
+if dl > 0 then redis.call('ZADD', KEYS[2], dl, ARGV[1]) end
+return 1`)
+
 // PrepareForFutureAck adds an item to the pending list for acknowledgment tracking
 // Returns an error if the operation fails
 func (q *Queue) PrepareForFutureAck(ackID string, item any) error {
@@ -212,25 +219,8 @@ func (q *Queue) PrepareForFutureAck(ackID string, item any) error {
 	case <-q.ctx.Done():
 		return fmt.Errorf("queue closed, cannot prepare for acknowledgment")
 	default:
-		// Store in pending list with the ack ID. MULTI/EXEC, so a lost reply
-		// can't leave a pending entry without its deadline.
-		pendingKey := q.getNackedItemKey()
-		pipe := q.client.TxPipeline()
-
-		pipe.HSet(q.ctx, pendingKey, ackID, item)
-
-		// If visibility timeout is set, track it in ZSET
-		if vt := q.getVisibilityTimeout(); vt > 0 {
-			timeoutKey := q.getTimeoutKey()
-			score := unixSeconds(time.Now().Add(vt))
-			pipe.ZAdd(q.ctx, timeoutKey, redis.Z{
-				Score:  score,
-				Member: ackID,
-			})
-		}
-
-		_, err := pipe.Exec(q.ctx)
-		if err != nil {
+		keys := []string{q.getNackedItemKey(), q.getTimeoutKey()}
+		if err := prepareAck.Run(q.ctx, q.client, keys, ackID, item, q.vt()).Err(); err != nil {
 			return fmt.Errorf("error storing item in pending list: %v", err)
 		}
 
@@ -270,7 +260,7 @@ const maxPop = 1000
 // which leaves the popped items, as stored, in `items`.
 //
 // KEYS: queue, pending hash, deadlines, idle set [, priorities].
-// ARGV: want, deadline (Unix seconds; 0: no visibility timeout), ack ID
+// ARGV: want, visibility timeout (seconds; 0: none), ack ID
 // prefix, reservation (20-digit start), consumer ID (” if the caller is not
 // a distributed consumer), the caller's free slots.
 //
@@ -284,14 +274,15 @@ const maxPop = 1000
 // call, and a copy can even arrive after the caller acked some of the items.
 // If any of the call's IDs is still pending, an earlier run popped: popHead
 // pops nothing, so no live pending entry is overwritten, and hands back the
-// leading run of those items with their deadlines raised to this call's. A
+// leading run of those items with their deadlines raised to this run's. A
 // batch shares one deadline, so a requeue moves all of it or none.
 //
 // A call that leaves the queue empty with fewer items than the caller's free
 // slots makes a distributed consumer join the idle set, in the same step, so
 // an enqueue right after it wakes it. A hand-back counts too: a reused
 // reservation can be smaller than the call.
-const popHead = `local want, pre, resv = tonumber(ARGV[1]), ARGV[3], ARGV[4]
+const popHead = deadlineFn + `local want, pre, resv = tonumber(ARGV[1]), ARGV[3], ARGV[4]
+local dl = deadline(ARGV[2])
 local function reply(items)
 	local len = redis.call(__LEN__, KEYS[1])
 	if ARGV[5] ~= '' and len == 0 and #items < tonumber(ARGV[6]) then redis.call('SADD', KEYS[4], ARGV[5]) end
@@ -306,9 +297,9 @@ for i = 1, want do
 		for j = 1, want do
 			if not held[j] then break end
 			items[j] = held[j]
-			if tonumber(ARGV[2]) > 0 then
+			if dl > 0 then
 				local d = redis.call('ZSCORE', KEYS[3], ids[j])
-				if not d or tonumber(d) < tonumber(ARGV[2]) then redis.call('ZADD', KEYS[3], ARGV[2], ids[j]) end
+				if not d or tonumber(d) < dl then redis.call('ZADD', KEYS[3], dl, ids[j]) end
 			end
 		end
 		return reply(items)
@@ -323,10 +314,10 @@ if n > 0 then
 	local h, z = {}, {}
 	for i = 1, n do
 		h[2*i-1] = ids[i]; h[2*i] = items[i]
-		z[2*i-1] = ARGV[2]; z[2*i] = ids[i]
+		z[2*i-1] = dl; z[2*i] = ids[i]
 	end
 	redis.call('HSET', KEYS[2], unpack(h))
-	if tonumber(ARGV[2]) > 0 then redis.call('ZADD', KEYS[3], unpack(z)) end
+	if dl > 0 then redis.call('ZADD', KEYS[3], unpack(z)) end
 end
 return reply(items)`
 
@@ -365,13 +356,14 @@ if #items > 0 then redis.call('HSET', KEYS[5], unpack(p)) end`)
 // with none of the batch bookkeeping: per call it costs what a single pop did
 // before batches.
 //
-// ARGV: deadline (0: no visibility timeout), ack ID, consumer ID (” if the
-// caller is not a distributed consumer).
-const popOneHead = `local held = redis.call('HGET', KEYS[2], ARGV[2])
+// ARGV: visibility timeout (seconds; 0: none), ack ID, consumer ID (” if
+// the caller is not a distributed consumer).
+const popOneHead = deadlineFn + `local dl = deadline(ARGV[1])
+local held = redis.call('HGET', KEYS[2], ARGV[2])
 if held then
-	if tonumber(ARGV[1]) > 0 then
+	if dl > 0 then
 		local d = redis.call('ZSCORE', KEYS[3], ARGV[2])
-		if not d or tonumber(d) < tonumber(ARGV[1]) then redis.call('ZADD', KEYS[3], ARGV[1], ARGV[2]) end
+		if not d or tonumber(d) < dl then redis.call('ZADD', KEYS[3], dl, ARGV[2]) end
 	end
 	return held
 end
@@ -383,7 +375,7 @@ if not v then
 	return false
 end
 redis.call('HSET', KEYS[2], ARGV[2], v)
-if tonumber(ARGV[1]) > 0 then redis.call('ZADD', KEYS[3], ARGV[1], ARGV[2]) end
+if dl > 0 then redis.call('ZADD', KEYS[3], dl, ARGV[2]) end
 return v`
 
 // listPopOne and zsetPopOne pop one item into v (nil when empty). The zset
@@ -408,7 +400,7 @@ var (
 // batch scripts' reply ({len, items}) and idle rule (see popHead). It skips
 // building and checking ack IDs for the slots it would not fill.
 //
-// ARGV: deadline, ack ID, consumer ID, the caller's free slots.
+// ARGV: visibility timeout, ack ID, consumer ID, the caller's free slots.
 var popOneLenHead = `local function reply(items)
 	local len = redis.call(__LEN__, KEYS[1])
 	if ARGV[3] ~= '' and len == 0 and #items < tonumber(ARGV[4]) then redis.call('SADD', KEYS[4], ARGV[3]) end
@@ -419,7 +411,7 @@ end
 const popOneLenTail = `
 if not v then return reply({}) end
 redis.call('HSET', KEYS[2], ARGV[2], v)
-if tonumber(ARGV[1]) > 0 then redis.call('ZADD', KEYS[3], ARGV[1], ARGV[2]) end
+if dl > 0 then redis.call('ZADD', KEYS[3], dl, ARGV[2]) end
 return reply({v})`
 
 func popOneLenScript(lenCmd, body string) *redis.Script {
@@ -474,7 +466,7 @@ func (q *Queue) dequeueOne(pop *redis.Script, consumer string, extraKeys ...stri
 	r := q.reserve(1, 1)
 	ackID := q.ackIDOf(fmt.Sprintf("%020d", r.start), 1)
 	keys := append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey()}, extraKeys...)
-	v, err := pop.Run(q.ctx, q.client, keys, q.deadline(), ackID, consumer).Text()
+	v, err := pop.Run(q.ctx, q.client, keys, q.vt(), ackID, consumer).Text()
 	if err == redis.Nil {
 		return nil, false, ""
 	}
@@ -513,13 +505,25 @@ func (q *Queue) ackIDOf(resv string, i int) string {
 	return fmt.Sprintf("%s:%s:%04d", q.ackPrefix, resv, i)
 }
 
-// deadline is the visibility deadline of an item popped now, or 0 for none.
-func (q *Queue) deadline() float64 {
-	if vt := q.getVisibilityTimeout(); vt > 0 {
-		return unixSeconds(time.Now().Add(vt))
-	}
-	return 0
+// vt is the visibility timeout in seconds, as the scripts take it (0: none).
+func (q *Queue) vt() float64 {
+	return max(0, q.getVisibilityTimeout().Seconds())
 }
+
+// deadlineFn defines deadline(vt) for scripts: Redis's clock plus vt seconds,
+// or 0 when vt is 0. A deadline taken from Redis's clock when the script runs
+// counts from when the item is actually popped: one taken by the client when
+// it sends the pop starts early by however long the pop waited (a paused or
+// busy server, a go-redis re-send) and by any client clock skew, and the
+// sweeper could requeue an item its consumer just got. Deadlines are Unix
+// seconds, as older versions stored them.
+const deadlineFn = `local function deadline(vt)
+	vt = tonumber(vt)
+	if vt <= 0 then return 0 end
+	local t = redis.call('TIME')
+	return tonumber(t[1]) + tonumber(t[2]) / 1e6 + vt
+end
+`
 
 // dequeueBatch runs pop for up to len(items) items, marking them pending in
 // the same step (see popHead), or popOne when it takes one item. It sizes the
@@ -545,9 +549,9 @@ func (q *Queue) dequeueBatch(pop, popOne *redis.Script, items []any, ackIDs []st
 	var reply []any
 	var err error
 	if r.want == 1 {
-		reply, err = popOne.Run(q.ctx, q.client, keys, q.deadline(), q.ackIDOf(resv, 1), consumer, slots).Slice()
+		reply, err = popOne.Run(q.ctx, q.client, keys, q.vt(), q.ackIDOf(resv, 1), consumer, slots).Slice()
 	} else {
-		reply, err = pop.Run(q.ctx, q.client, keys, r.want, q.deadline(), q.ackPrefix, resv, consumer, slots).Slice()
+		reply, err = pop.Run(q.ctx, q.client, keys, r.want, q.vt(), q.ackPrefix, resv, consumer, slots).Slice()
 	}
 	if err != nil {
 		q.retryPop.CompareAndSwap(nil, r)
@@ -573,7 +577,7 @@ func (q *Queue) dequeueBatch(pop, popOne *redis.Script, items []any, ackIDs []st
 
 // requeueLoop and requeueEnd wrap a push of item v back onto the queue. With
 // ARGV[1] > 0 they requeue pending items whose visibility deadline is at or
-// before ARGV[1] (see unixSeconds), else every pending item. An item leaves
+// before Redis's clock (see deadlineFn), else every pending item. An item leaves
 // the pending hash in the same script that pushes it, so processes
 // requeueing at once can't push it twice.
 // ponytail: one script for all expired items blocks Redis for that long;
@@ -582,7 +586,8 @@ const (
 	requeueLoop = `
 local ids
 if tonumber(ARGV[1]) > 0 then
-	ids = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', ARGV[1])
+	local t = redis.call('TIME')
+	ids = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', tonumber(t[1]) + tonumber(t[2]) / 1e6)
 else
 	ids = redis.call('HKEYS', KEYS[2])
 end
@@ -655,13 +660,8 @@ func (q *Queue) requeue(script *redis.Script, extraKeys ...string) (int64, error
 		return 0, fmt.Errorf("queue closed")
 	}
 
-	var now float64
-	if q.getVisibilityTimeout() > 0 {
-		now = unixSeconds(time.Now())
-	}
-
 	keys := append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey()}, extraKeys...)
-	n, err := script.Run(q.ctx, q.client, keys, now).Int64()
+	n, err := script.Run(q.ctx, q.client, keys, q.vt()).Int64()
 	if err != nil {
 		log.Printf("Error requeueing pending items: %v", err)
 		return 0, fmt.Errorf("error requeueing pending items: %w", err)
@@ -677,14 +677,6 @@ func (q *Queue) GetNackedItemsCount() int {
 		return 0
 	}
 	return int(count)
-}
-
-// unixSeconds is t in Unix seconds with millisecond precision, the unit of
-// visibility deadlines. Whole seconds would let the sweeper requeue a job up
-// to a second early, while it is still being processed. Deadlines stored in
-// whole seconds by older versions compare correctly.
-func unixSeconds(t time.Time) float64 {
-	return float64(t.UnixMilli()) / 1000
 }
 
 // getNackedItemKey returns the Redis key for the nacked items list

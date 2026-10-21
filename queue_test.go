@@ -806,6 +806,64 @@ func TestVisibilityTimeoutNotCutShort(t *testing.T) {
 	assert.Equal(t, 1, q.Len())
 }
 
+// A pop or prepare that waits in Redis gets its visibility deadline from
+// when it runs. One stamped when the client sent it started the timeout early
+// by the wait, so the sweeper could requeue an item its consumer just got.
+func TestDeadlineCountsFromWhenItRuns(t *testing.T) {
+	const vt, pause = time.Second, 1500 * time.Millisecond
+	for _, c := range retryCases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			q, push, cleanup := c.setup(t, getTestRedisURL())
+			defer cleanup()
+			delKeys(t, q.client, q.queueKey)
+			defer delKeys(t, q.client, q.queueKey)
+			q.SetVisibilityTimeout(vt)
+			for _, v := range []string{"a", "b", "c", "d"} {
+				require.True(t, push(v))
+			}
+
+			opts, err := redis.ParseURL(getTestRedisURL())
+			require.NoError(t, err)
+			admin := redis.NewClient(opts)
+			defer admin.Close()
+
+			b := batcherFor(c, q)
+			one := b.(interface{ DequeueWithAckId() (any, bool, string) })
+			batch := func(slots int) []string {
+				n, _, err := b.DequeueBatchWithAckIds(make([]any, slots), make([]string, slots))
+				require.NoError(t, err)
+				require.Equal(t, slots, n)
+				return []string{q.ackIDOf(fmt.Sprintf("%020d", q.ackSeq.Load()), 1), q.ackIDOf(fmt.Sprintf("%020d", q.ackSeq.Load()), slots)}
+			}
+			steps := []struct {
+				name string
+				run  func() []string // the ack IDs it made pending
+			}{
+				{"single pop", func() []string { _, ok, id := one.DequeueWithAckId(); require.True(t, ok); return []string{id} }},
+				{"batch pop of one", func() []string { return batch(1) }},
+				{"batch pop", func() []string { return batch(2) }},
+				{"prepare", func() []string {
+					require.NoError(t, q.PrepareForFutureAck("prepared", "x"))
+					return []string{"prepared"}
+				}},
+			}
+			for _, s := range steps {
+				require.NoError(t, admin.Do(ctx, "CLIENT", "PAUSE", pause.Milliseconds()).Err())
+				sent := time.Now()
+				ids := s.run()
+				require.GreaterOrEqual(t, time.Since(sent), pause-200*time.Millisecond, "%s: Redis did not hold it", s.name)
+				min := unixSeconds(time.Now().Add(vt - 100*time.Millisecond))
+				for _, id := range ids {
+					d, err := q.client.ZScore(ctx, q.getTimeoutKey(), id).Result()
+					require.NoError(t, err, s.name)
+					assert.GreaterOrEqual(t, d, min, "%s: deadline counted from when it was sent", s.name)
+				}
+			}
+		})
+	}
+}
+
 // dropProxy forwards TCP to Redis. It watches for one script, by hash: each
 // call of it that reaches Redis counts in sends, and while drops > 0 the
 // call runs on Redis but its connection is cut before the reply gets back,

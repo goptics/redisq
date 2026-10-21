@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
@@ -79,4 +80,9 @@ func redisTag() string {
 		return tag
 	}
 	return "latest"
+}
+
+// unixSeconds is t in Unix seconds, the unit of visibility deadlines.
+func unixSeconds(t time.Time) float64 {
+	return float64(t.UnixMilli()) / 1000
 }
