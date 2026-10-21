@@ -46,8 +46,10 @@ return n`)
 // wakeFn defines wake(idle, prefix, count) for scripts: it publishes
 // "enqueued" to up to count idle consumers, taking each out of the idle set.
 // A consumer that is gone has no subscriber, so PUBLISH reaches nobody and the
-// next one is tried.
-const wakeFn = `local function wake(idle, prefix, count)
+// next one is tried. SPOP is non-deterministic, so the script replicates its
+// effects (see deadlineFn).
+const wakeFn = `redis.replicate_commands()
+local function wake(idle, prefix, count)
 	local woken = 0
 	while woken < count do
 		local id = redis.call('SPOP', idle)

@@ -517,7 +517,12 @@ func (q *Queue) vt() float64 {
 // busy server, a go-redis re-send) and by any client clock skew, and the
 // sweeper could requeue an item its consumer just got. Deadlines are Unix
 // seconds, as older versions stored them.
-const deadlineFn = `local function deadline(vt)
+//
+// TIME is non-deterministic, so Redis 6 configured to replicate scripts
+// verbatim (lua-replicate-commands no) rejects writes after it unless the
+// script switches to replicating its effects first. Redis 7 always does.
+const deadlineFn = `redis.replicate_commands()
+local function deadline(vt)
 	vt = tonumber(vt)
 	if vt <= 0 then return 0 end
 	local t = redis.call('TIME')
@@ -583,7 +588,7 @@ func (q *Queue) dequeueBatch(pop, popOne *redis.Script, items []any, ackIDs []st
 // ponytail: one script for all expired items blocks Redis for that long;
 // batch with ZRANGEBYSCORE LIMIT if pending runs to millions.
 const (
-	requeueLoop = `
+	requeueLoop = `redis.replicate_commands()
 local ids
 if tonumber(ARGV[1]) > 0 then
 	local t = redis.call('TIME')

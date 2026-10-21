@@ -806,6 +806,36 @@ func TestVisibilityTimeoutNotCutShort(t *testing.T) {
 	assert.Equal(t, 1, q.Len())
 }
 
+// pendingStep makes items pending one way: a single pop, a batch pop of one
+// (the lean script), a batch pop, or PrepareForFutureAck.
+type pendingStep struct {
+	name string
+	run  func() []string // the ack IDs it made pending
+}
+
+// pendingSteps returns the four steps for c's queue q, which must hold at
+// least 4 items.
+func pendingSteps(t *testing.T, c retryCase, q *Queue) []pendingStep {
+	b := batcherFor(c, q)
+	one := b.(interface{ DequeueWithAckId() (any, bool, string) })
+	batch := func(slots int) []string {
+		n, _, err := b.DequeueBatchWithAckIds(make([]any, slots), make([]string, slots))
+		require.NoError(t, err)
+		require.Equal(t, slots, n)
+		resv := fmt.Sprintf("%020d", q.ackSeq.Load())
+		return []string{q.ackIDOf(resv, 1), q.ackIDOf(resv, slots)}
+	}
+	return []pendingStep{
+		{"single pop", func() []string { _, ok, id := one.DequeueWithAckId(); require.True(t, ok); return []string{id} }},
+		{"batch pop of one", func() []string { return batch(1) }},
+		{"batch pop", func() []string { return batch(2) }},
+		{"prepare", func() []string {
+			require.NoError(t, q.PrepareForFutureAck("prepared", "x"))
+			return []string{"prepared"}
+		}},
+	}
+}
+
 // A pop or prepare that waits in Redis gets its visibility deadline from
 // when it runs. One stamped when the client sent it started the timeout early
 // by the wait, so the sweeper could requeue an item its consumer just got.
@@ -828,27 +858,7 @@ func TestDeadlineCountsFromWhenItRuns(t *testing.T) {
 			admin := redis.NewClient(opts)
 			defer admin.Close()
 
-			b := batcherFor(c, q)
-			one := b.(interface{ DequeueWithAckId() (any, bool, string) })
-			batch := func(slots int) []string {
-				n, _, err := b.DequeueBatchWithAckIds(make([]any, slots), make([]string, slots))
-				require.NoError(t, err)
-				require.Equal(t, slots, n)
-				return []string{q.ackIDOf(fmt.Sprintf("%020d", q.ackSeq.Load()), 1), q.ackIDOf(fmt.Sprintf("%020d", q.ackSeq.Load()), slots)}
-			}
-			steps := []struct {
-				name string
-				run  func() []string // the ack IDs it made pending
-			}{
-				{"single pop", func() []string { _, ok, id := one.DequeueWithAckId(); require.True(t, ok); return []string{id} }},
-				{"batch pop of one", func() []string { return batch(1) }},
-				{"batch pop", func() []string { return batch(2) }},
-				{"prepare", func() []string {
-					require.NoError(t, q.PrepareForFutureAck("prepared", "x"))
-					return []string{"prepared"}
-				}},
-			}
-			for _, s := range steps {
+			for _, s := range pendingSteps(t, c, q) {
 				require.NoError(t, admin.Do(ctx, "CLIENT", "PAUSE", pause.Milliseconds()).Err())
 				sent := time.Now()
 				ids := s.run()
@@ -862,6 +872,77 @@ func TestDeadlineCountsFromWhenItRuns(t *testing.T) {
 			}
 		})
 	}
+}
+
+// With no visibility timeout, items go pending without a deadline, so no
+// sweeper ever requeues them.
+func TestNoVisibilityTimeoutStoresNoDeadline(t *testing.T) {
+	for _, c := range retryCases {
+		t.Run(c.name, func(t *testing.T) {
+			q, push, cleanup := c.setup(t, getTestRedisURL())
+			defer cleanup()
+			delKeys(t, q.client, q.queueKey)
+			defer delKeys(t, q.client, q.queueKey)
+			q.SetVisibilityTimeout(0)
+			for _, v := range []string{"a", "b", "c", "d"} {
+				require.True(t, push(v))
+			}
+
+			for _, s := range pendingSteps(t, c, q) {
+				s.run()
+			}
+			assert.Equal(t, 5, q.GetNackedItemsCount())
+			assert.Zero(t, q.client.ZCard(context.Background(), q.getTimeoutKey()).Val(), "a deadline was stored")
+		})
+	}
+}
+
+// Redis 6 configured to replicate scripts verbatim rejects writes after a
+// non-deterministic command (TIME, SPOP) unless the script replicates its
+// effects. Redis 7 dropped the setting, so this runs only on 6 (REDIS_TAG=6.0).
+func TestScriptsUnderVerbatimReplication(t *testing.T) {
+	ctx := context.Background()
+	opts, err := redis.ParseURL(getTestRedisURL())
+	require.NoError(t, err)
+	admin := redis.NewClient(opts)
+	defer admin.Close()
+	if err := admin.ConfigSet(ctx, "lua-replicate-commands", "no").Err(); err != nil {
+		t.Skipf("no lua-replicate-commands setting: %v", err)
+	}
+	defer admin.ConfigSet(ctx, "lua-replicate-commands", "yes")
+
+	for _, c := range retryCases {
+		t.Run(c.name, func(t *testing.T) {
+			q, push, cleanup := c.setup(t, getTestRedisURL())
+			defer cleanup()
+			delKeys(t, q.client, q.queueKey)
+			defer delKeys(t, q.client, q.queueKey)
+			for _, v := range []string{"a", "b", "c", "d"} {
+				require.True(t, push(v))
+			}
+
+			q.SetVisibilityTimeout(300 * time.Millisecond)
+			for _, s := range pendingSteps(t, c, q) {
+				s.run()
+			}
+			assert.EqualValues(t, 5, q.client.ZCard(ctx, q.getTimeoutKey()).Val(), "every pending item has its deadline")
+
+			time.Sleep(400 * time.Millisecond)
+			require.NoError(t, q.RequeueNackedItems())
+			assert.Zero(t, q.GetNackedItemsCount(), "expired items are requeued")
+		})
+	}
+
+	t.Run("wake", func(t *testing.T) {
+		qs := New(getTestRedisURL())
+		defer qs.Close()
+		q := qs.NewDistributedQueue("test_verbatim_wake")
+		defer q.Close()
+		delKeys(t, q.Queue.client, "test_verbatim_wake")
+		defer delKeys(t, q.Queue.client, "test_verbatim_wake")
+		require.NoError(t, q.Queue.client.SAdd(ctx, q.idleKey, "gone-1", "gone-2").Err())
+		assert.True(t, q.Enqueue("a"), "waking past consumers that are gone")
+	})
 }
 
 // dropProxy forwards TCP to Redis. It watches for one script, by hash: each
