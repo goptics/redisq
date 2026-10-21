@@ -8,7 +8,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/lucsky/cuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -73,7 +72,7 @@ return n`)
 
 func newNotification(client *redis.Client, queueKey, lenCmd string) *Notification {
 	ctx, cancel := context.WithCancel(context.Background())
-	id := cuid.New()
+	id := newID()
 	wakePrefix := queueKey + ":wake:"
 
 	return &Notification{

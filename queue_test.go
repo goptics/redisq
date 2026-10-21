@@ -40,9 +40,7 @@ func setupTestQueue(t *testing.T) (*Queue, func()) {
 	require.NoError(t, q.client.Del(ctx, q.getTimeoutKey()).Err(), "Failed to clear timeout key")
 
 	cleanup := func() {
-		q.client.Del(ctx, testQueueKey)
-		q.client.Del(ctx, q.getNackedItemKey())
-		q.client.Del(ctx, q.getTimeoutKey())
+		delKeys(t, q.client, testQueueKey)
 		q.Close()
 		qs.Close()
 	}
@@ -1069,9 +1067,8 @@ func (c retryCase) run(t *testing.T, drops int32, check func(t *testing.T, q *Qu
 		q, push, cleanup := c.setup(t, p.url())
 		defer cleanup()
 
-		keys := []string{q.queueKey, q.queueKey + ":seq", q.getNackedItemKey(), q.getTimeoutKey(), q.getPriorityKey()}
-		q.client.Del(ctx, keys...)
-		defer q.client.Del(ctx, keys...)
+		delKeys(t, q.client, q.queueKey)
+		defer delKeys(t, q.client, q.queueKey)
 
 		require.True(t, push("a"))
 		require.True(t, push("b"))

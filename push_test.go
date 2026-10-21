@@ -2,9 +2,10 @@ package redisq
 
 import (
 	"context"
-	"fmt"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,6 +48,12 @@ func TestPushReSentAfterLostReplyStoresOnce(t *testing.T) {
 	for _, c := range pushCases {
 		t.Run(c.name, func(t *testing.T) {
 			p := newDropProxy(t, c.script)
+			var late atomic.Bool
+			p.onDrop = func() { // before any traffic: proxy goroutines read it
+				if late.Load() {
+					time.Sleep(1200 * time.Millisecond) // a re-send long after the run
+				}
+			}
 			qs := New(p.url())
 			defer qs.Close()
 			client := qs.(*queues).client
@@ -68,6 +75,11 @@ func TestPushReSentAfterLostReplyStoresOnce(t *testing.T) {
 
 			assert.True(t, push("b"), "a new call is a new push")
 			assert.Equal(t, 3, size())
+
+			late.Store(true)
+			p.drops.Store(1)
+			assert.True(t, push("c"))
+			assert.Equal(t, 4, size(), "a late re-send must still find its token")
 		})
 	}
 }
@@ -106,23 +118,45 @@ func TestPushTokensKeepEveryCall(t *testing.T) {
 			for _, b := range buckets {
 				assert.Equal(t, "intset", client.ObjectEncoding(ctx, b).Val(), "bucket %s", b)
 				ttl := client.PTTL(ctx, b).Val()
-				assert.Greater(t, ttl, time.Duration(0), "bucket %s must expire", b)
-				assert.LessOrEqual(t, ttl, time.Minute)
+				assert.Greater(t, ttl, pushTTL(client.Options())-5*time.Second, "bucket %s must outlive every re-send", b)
+				assert.LessOrEqual(t, ttl, pushTTL(client.Options()), "bucket %s must expire", b)
 			}
 		})
 	}
 }
 
-// A token must outlive every re-send of its call: a read timeout, a retry
-// backoff, a new connection and a write, per retry.
+// A long-lived producer's buckets stay sets of 2-byte integers.
+func TestPushTokensStaySmall(t *testing.T) {
+	ctx := context.Background()
+	qs := New(getTestRedisURL())
+	defer qs.Close()
+	q := qs.NewQueue("test_push_small")
+	defer q.Close()
+	delKeys(t, q.client, q.queueKey)
+	defer delKeys(t, q.client, q.queueKey)
+
+	q.pushSeq.Store(1<<31 - 1) // the next push starts bucket 1<<31 / pushBucket
+	for range pushBucket {
+		require.True(t, q.Enqueue("x"))
+	}
+	bucket := q.pushPrefix + strconv.Itoa(1<<31/pushBucket)
+	assert.Equal(t, "intset", q.client.ObjectEncoding(ctx, bucket).Val())
+	assert.EqualValues(t, pushBucket, q.client.SCard(ctx, bucket).Val())
+	assert.Less(t, q.client.MemoryUsage(ctx, bucket).Val(), int64(1500), "about 2 bytes per token")
+}
+
+// A token must outlive every copy of its call that go-redis can send: per
+// re-send a lost reply's read, a backoff, a pool wait, a dial, 3 setup round
+// trips and the write; MaxRetries re-sends as EVALSHA, then MaxRetries + 1 as
+// EVAL after a NOSCRIPT.
 func TestPushTTLCoversRetries(t *testing.T) {
+	// defaults: read 3s, write 3s, backoff 512ms, pool wait 4s, dial 5s, 3 retries
 	defaults := redis.NewClient(&redis.Options{}).Options()
-	assert.Equal(t, time.Minute, pushTTL(defaults), "the default retry window, about 35s, gets the floor")
+	assert.GreaterOrEqual(t, pushTTL(defaults), 7*(512*time.Millisecond+4*time.Second+5*time.Second+4*(3+3)*time.Second))
 
 	slow := redis.NewClient(&redis.Options{ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second}).Options()
-	window := 3 * (30*time.Second + 512*time.Millisecond + 31*time.Second + 30*time.Second) // pool wait is ReadTimeout + 1s
-	assert.GreaterOrEqual(t, pushTTL(slow), window, fmt.Sprintf("%+v", slow))
+	assert.GreaterOrEqual(t, pushTTL(slow), 7*(512*time.Millisecond+31*time.Second+5*time.Second+4*(30+30)*time.Second))
 
-	none := redis.NewClient(&redis.Options{MaxRetries: -1, ReadTimeout: -1}).Options()
-	assert.Equal(t, time.Minute, pushTTL(none))
+	none := redis.NewClient(&redis.Options{MaxRetries: -1, ReadTimeout: -1, WriteTimeout: -1, PoolTimeout: time.Second, DialTimeout: time.Second}).Options()
+	assert.Equal(t, time.Minute, pushTTL(none), "no re-sends: the floor")
 }

@@ -217,10 +217,13 @@ connection), up to 3 times by default. What that means per call:
   a time: if two fail together, the other's items stay pending until they
   are requeued. Delivery is at least once.
 - **`Enqueue`** is safe: each call carries a token, and a re-sent push
-  stores nothing. Tokens are kept in small sets (`<queue>:push:*`, about 2
-  bytes per push) for a minute, or longer when the client's timeouts allow a
-  later re-send. Returning `false` after a network error still does not prove
-  the job was not stored, and calling `Enqueue` again is a new push.
+  stores nothing. Tokens live in small sets (`<queue>:push:*`, under 3 bytes
+  per push) for as long as the client could still re-send, about 4 minutes
+  with go-redis's default timeouts and longer with larger ones. With no read
+  timeout (`read_timeout=-1`), a re-send can come after the tokens are gone
+  and store the job again. Returning `false` after a network error still
+  does not prove the job was not stored, and calling `Enqueue` again is a
+  new push.
 - **`Dequeue`** (no ack) is at most once: an item whose reply never arrives is
   gone. Use `DequeueWithAckId` for jobs you can't lose.
 - **`Remove`** can remove a second identical item if its call is re-sent.

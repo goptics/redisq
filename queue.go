@@ -2,11 +2,13 @@ package redisq
 
 import (
 	"context"
+	crand "crypto/rand"
 	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -34,6 +36,7 @@ type Queue struct {
 	isPriority        bool                        // a zset queue, with :prio entries to clear on ack; set before any goroutine starts
 	pushSeq           atomic.Uint64               // last push token handed out
 	pushTTL           int64                       // ms a push token is kept (see pushOnce); set at construction
+	pushPrefix        string                      // "<queue>:push:<ackPrefix>:", the start of push token bucket keys
 }
 
 func newQueue(c *redis.Client, queueKey string) *Queue {
@@ -53,12 +56,24 @@ func newQueueBase(c *redis.Client, queueKey string) *Queue {
 		queueKey:  queueKey,
 		ctx:       ctx,
 		cancel:    cancel,
-		ackPrefix: cuid.New(),
+		ackPrefix: newID(),
 	}
+	q.pushPrefix = queueKey + ":push:" + q.ackPrefix + ":"
 	q.visibilityTimeout.Store(int64(5 * time.Minute))
 	q.popLen.Store(maxPop)
 	q.pushTTL = pushTTL(c.Options()).Milliseconds()
 	return q
+}
+
+// newID returns an ID unique across processes. cuid.New's random part comes
+// from math/rand seeded with the start second, so processes with the same
+// pid and host (containers) started together could share IDs, and with them
+// ack IDs and push tokens; crypto/rand rules that out.
+func newID() string {
+	if id, err := cuid.NewCrypto(crand.Reader); err == nil {
+		return id
+	}
+	return cuid.New()
 }
 
 func (q *Queue) getExpiration() time.Duration {
@@ -144,21 +159,29 @@ const pushBucket = 512
 // pushOnce starts a push script so that a re-sent call pushes nothing.
 // go-redis re-sends a command whose reply was lost, so without it one Enqueue
 // could store its item twice. Each call carries a token unique to this queue
-// object: KEYS[#KEYS] is its bucket, ARGV[#ARGV-1] its number in it, and
-// ARGV[#ARGV] how long to keep the bucket, in ms. A token already in its
-// bucket means an earlier copy of the call ran.
+// object: KEYS[#KEYS] is its bucket (the call's number / pushBucket),
+// ARGV[#ARGV-1] its place in the bucket (the number % pushBucket, so a bucket
+// holds 2-byte integers) and ARGV[#ARGV] how long to keep the bucket after
+// this push, in ms. A token already in its bucket means an earlier copy of
+// the call ran.
 const pushOnce = `if redis.call('SADD', KEYS[#KEYS], ARGV[#ARGV - 1]) == 0 then return 0 end
 redis.call('PEXPIRE', KEYS[#KEYS], ARGV[#ARGV])
 `
 
 // pushTTL is how long a push token is kept: the longest go-redis can take to
-// re-send a call with o, a read timeout, a retry backoff, a new connection
-// and a write per retry, and at least a minute.
-// ponytail: a timeout <= 0 (none) counts as 0, so a call that waits longer
-// than a minute for a reply before its re-send can still push twice.
+// send the last copy of a call with o, and at least a minute. Each re-send
+// can wait out a lost reply's read, a retry backoff, a turn in the pool, a
+// dial and a new connection's setup (HELLO, then AUTH/SELECT/SETNAME and
+// CLIENT SETINFO, a round trip each) before its write. Script.Run re-sends up
+// to MaxRetries times as EVALSHA, then, on NOSCRIPT (a script cache emptied
+// by a failover), up to MaxRetries + 1 times as EVAL. With go-redis defaults
+// that is about 4 minutes.
+// ponytail: a timeout <= 0 (none) and an OnConnect hook count as 0, so with
+// either a re-send can still come after the tokens are gone and push twice.
 func pushTTL(o *redis.Options) time.Duration {
-	per := max(o.ReadTimeout, 0) + o.MaxRetryBackoff + max(o.DialTimeout, o.PoolTimeout, 0) + max(o.WriteTimeout, 0)
-	return max(time.Minute, time.Duration(max(o.MaxRetries, 0))*per)
+	r, w := max(o.ReadTimeout, 0), max(o.WriteTimeout, 0)
+	per := o.MaxRetryBackoff + max(o.PoolTimeout, 0) + max(o.DialTimeout, 0) + 4*(r+w)
+	return max(time.Minute, time.Duration(2*max(o.MaxRetries, 0)+1)*per)
 }
 
 // enqueueWith runs script, which starts with pushOnce, to push item, with
@@ -177,9 +200,11 @@ func (q *Queue) enqueueWith(script *redis.Script, keys []string, item any, extra
 	}
 
 	seq := q.pushSeq.Add(1)
-	keys = append(keys[:len(keys):len(keys)], fmt.Sprintf("%s:push:%s:%d", q.queueKey, q.ackPrefix, seq/pushBucket))
-	args := append([]any{data, q.getExpiration().Milliseconds()}, extra...)
-	args = append(args, seq, q.pushTTL)
+	keys = append(keys, q.pushPrefix+strconv.FormatUint(seq/pushBucket, 10))
+	args := make([]any, 0, 4+len(extra))
+	args = append(args, data, q.getExpiration().Milliseconds())
+	args = append(args, extra...)
+	args = append(args, seq%pushBucket, q.pushTTL)
 	if err := script.Run(q.ctx, q.client, keys, args...).Err(); err != nil {
 		log.Printf("Error enqueueing item: %v", err)
 		return false
