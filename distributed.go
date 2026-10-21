@@ -6,7 +6,7 @@ import "github.com/redis/go-redis/v9"
 // trip, up to one per waiting item, so a backlog wakes them all (see
 // Queue.enqueueWith for ARGV[1] and ARGV[2]; ARGV[3] is the wake channel
 // prefix).
-var listPushWake = redis.NewScript(wakeFn + `local n = redis.call('RPUSH', KEYS[1], ARGV[1])
+var listPushWake = redis.NewScript(wakeFn + pushOnce + `local n = redis.call('RPUSH', KEYS[1], ARGV[1])
 if tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
 return wake(KEYS[2], ARGV[3], n)`)
 

@@ -5,7 +5,7 @@ import "github.com/redis/go-redis/v9"
 // zsetPushWake is zsetPush plus waking idle consumers, up to one per waiting
 // item, in a single round trip. ARGV[3] is the priority and ARGV[4] the wake
 // channel prefix (see Queue.enqueueWith for ARGV[1] and ARGV[2]).
-var zsetPushWake = redis.NewScript(wakeFn + `local s = redis.call('INCR', KEYS[2])
+var zsetPushWake = redis.NewScript(wakeFn + pushOnce + `local s = redis.call('INCR', KEYS[2])
 redis.call('ZADD', KEYS[1], ARGV[3], '\255' .. string.format('%016x', s) .. ARGV[1])
 if tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
 return wake(KEYS[3], ARGV[4], redis.call('ZCARD', KEYS[1]))`)

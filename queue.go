@@ -32,6 +32,8 @@ type Queue struct {
 	popLen            atomic.Int64                // items the next batch pop expects (see dequeueBatch); maxPop until the first
 	popRun            atomic.Int64                // items batch pops took since the queue was last seen empty
 	isPriority        bool                        // a zset queue, with :prio entries to clear on ack; set before any goroutine starts
+	pushSeq           atomic.Uint64               // last push token handed out
+	pushTTL           int64                       // ms a push token is kept (see pushOnce); set at construction
 }
 
 func newQueue(c *redis.Client, queueKey string) *Queue {
@@ -55,6 +57,7 @@ func newQueueBase(c *redis.Client, queueKey string) *Queue {
 	}
 	q.visibilityTimeout.Store(int64(5 * time.Minute))
 	q.popLen.Store(maxPop)
+	q.pushTTL = pushTTL(c.Options()).Milliseconds()
 	return q
 }
 
@@ -124,39 +127,43 @@ func (q *Queue) toBytes(item any) ([]byte, error) {
 	return data, nil
 }
 
+// listPush pushes an item and sets the queue to expire in ARGV[2] ms when
+// that is above 0 (see pushOnce for the token).
+var listPush = redis.NewScript(pushOnce + `redis.call('RPUSH', KEYS[1], ARGV[1])
+if tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
+return 1`)
+
 func (q *Queue) Enqueue(item any) bool {
-	select {
-	case <-q.ctx.Done():
-		log.Println("queue closed, cannot enqueue")
-		return false
-	default:
-		data, err := q.toBytes(item)
-		if err != nil {
-			log.Printf("Error converting item to bytes: %v", err)
-			return false
-		}
-
-		if exp := q.getExpiration(); exp > 0 {
-			_, err = q.client.Pipelined(q.ctx, func(pipe redis.Pipeliner) error {
-				pipe.RPush(q.ctx, q.queueKey, data)
-				pipe.Expire(q.ctx, q.queueKey, exp)
-				return nil
-			})
-		} else {
-			err = q.client.RPush(q.ctx, q.queueKey, data).Err()
-		}
-
-		if err != nil {
-			log.Printf("Error enqueueing item: %v", err)
-			return false
-		}
-
-		return true
-	}
+	return q.enqueueWith(listPush, []string{q.queueKey}, item)
 }
 
-// enqueueWith runs script to push item, with ARGV[1] the item bytes, ARGV[2]
-// the queue expiration in milliseconds (0: none) and then extra.
+// pushBucket is how many push tokens share a key: a set of up to 512
+// integers is stored compactly (Redis's set-max-intset-entries).
+const pushBucket = 512
+
+// pushOnce starts a push script so that a re-sent call pushes nothing.
+// go-redis re-sends a command whose reply was lost, so without it one Enqueue
+// could store its item twice. Each call carries a token unique to this queue
+// object: KEYS[#KEYS] is its bucket, ARGV[#ARGV-1] its number in it, and
+// ARGV[#ARGV] how long to keep the bucket, in ms. A token already in its
+// bucket means an earlier copy of the call ran.
+const pushOnce = `if redis.call('SADD', KEYS[#KEYS], ARGV[#ARGV - 1]) == 0 then return 0 end
+redis.call('PEXPIRE', KEYS[#KEYS], ARGV[#ARGV])
+`
+
+// pushTTL is how long a push token is kept: the longest go-redis can take to
+// re-send a call with o, a read timeout, a retry backoff, a new connection
+// and a write per retry, and at least a minute.
+// ponytail: a timeout <= 0 (none) counts as 0, so a call that waits longer
+// than a minute for a reply before its re-send can still push twice.
+func pushTTL(o *redis.Options) time.Duration {
+	per := max(o.ReadTimeout, 0) + o.MaxRetryBackoff + max(o.DialTimeout, o.PoolTimeout, 0) + max(o.WriteTimeout, 0)
+	return max(time.Minute, time.Duration(max(o.MaxRetries, 0))*per)
+}
+
+// enqueueWith runs script, which starts with pushOnce, to push item, with
+// ARGV[1] the item bytes, ARGV[2] the queue expiration in milliseconds (0:
+// none) and then extra, followed by the call's token.
 func (q *Queue) enqueueWith(script *redis.Script, keys []string, item any, extra ...any) bool {
 	if q.ctx.Err() != nil {
 		log.Println("queue closed, cannot enqueue")
@@ -169,7 +176,10 @@ func (q *Queue) enqueueWith(script *redis.Script, keys []string, item any, extra
 		return false
 	}
 
+	seq := q.pushSeq.Add(1)
+	keys = append(keys[:len(keys):len(keys)], fmt.Sprintf("%s:push:%s:%d", q.queueKey, q.ackPrefix, seq/pushBucket))
 	args := append([]any{data, q.getExpiration().Milliseconds()}, extra...)
+	args = append(args, seq, q.pushTTL)
 	if err := script.Run(q.ctx, q.client, keys, args...).Err(); err != nil {
 		log.Printf("Error enqueueing item: %v", err)
 		return false
