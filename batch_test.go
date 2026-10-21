@@ -47,7 +47,10 @@ func popAll(t *testing.T, q interface {
 
 func delKeys(t *testing.T, c *redis.Client, key string) {
 	t.Helper()
-	require.NoError(t, c.Del(context.Background(), key, key+":nacked", key+":timeouts", key+":prio", key+":seq", key+":idle").Err())
+	ctx := context.Background()
+	dedup, err := c.Keys(ctx, key+":dedup:*").Result()
+	require.NoError(t, err)
+	require.NoError(t, c.Del(ctx, append([]string{key, key + ":nacked", key + ":timeouts", key + ":prio", key + ":seq", key + ":idle"}, dedup...)...).Err())
 }
 
 func TestDequeueBatchList(t *testing.T) {
@@ -427,10 +430,11 @@ func TestDequeueBatchShortPopRetry(t *testing.T) {
 			}
 			late := []string{"n0", "n1", "n2", "n3", "n4"}
 			all = append(all, late...)
+			directPQ := &PriorityQueue{Queue: newQueueBase(direct.client, q.queueKey)}
 			p.onDrop = func() { // between the first run and the re-send
 				for _, v := range late {
 					if c.name == "priority" {
-						assert.NoError(t, zsetPush.Run(ctx, direct.client, []string{q.queueKey, q.queueKey + ":seq"}, 1, v, 0).Err())
+						assert.True(t, directPQ.Enqueue(v, 1))
 					} else {
 						assert.NoError(t, direct.client.RPush(ctx, q.queueKey, v).Err())
 					}
@@ -651,10 +655,11 @@ func TestDequeueBatchMaxPop(t *testing.T) {
 			defer delKeys(t, q.client, q.queueKey)
 
 			const total = 2500
+			pq := &PriorityQueue{Queue: q}
 			for i := range total {
 				v := fmt.Sprintf("j%05d", i)
 				if c.name == "priority" {
-					require.NoError(t, zsetPush.Run(ctx, q.client, []string{q.queueKey, q.queueKey + ":seq"}, 1, v, 0).Err())
+					require.True(t, pq.Enqueue(v, 1))
 				} else {
 					require.NoError(t, q.client.RPush(ctx, q.queueKey, v).Err())
 				}

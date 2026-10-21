@@ -17,12 +17,17 @@ type PriorityQueue struct {
 // by older versions are still read as is, and drain first.
 const seqPrefixLen = 17
 
-// zsetPush adds item ARGV[2] at score ARGV[1] under the next sequence number,
-// and sets the queue to expire in ARGV[3] ms when that is above 0.
-var zsetPush = redis.NewScript(`local s = redis.call('INCR', KEYS[2])
-redis.call('ZADD', KEYS[1], ARGV[1], '\255' .. string.format('%016x', s) .. ARGV[2])
-if tonumber(ARGV[3]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[3]) end
-return s`)
+// zsetPushBody adds item ARGV[1] at score ARGV[3] under the next sequence
+// number, and sets the queue to expire in ARGV[2] ms when that is above 0.
+const zsetPushBody = `local s = redis.call('INCR', KEYS[2])
+redis.call('ZADD', KEYS[1], ARGV[3], '\255' .. string.format('%016x', s) .. ARGV[1])
+if tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
+return s`
+
+var (
+	zsetPush     = redis.NewScript(zsetPushBody)
+	zsetPushOnce = redis.NewScript(onceFn + zsetPushBody) // see onceFn
+)
 
 // zsetRemove removes the first member holding item ARGV[1].
 var zsetRemove = redis.NewScript(`for _, m in ipairs(redis.call('ZRANGE', KEYS[1], 0, -1)) do
@@ -58,24 +63,15 @@ func newPriorityQueue(client *redis.Client, queueKey string) *PriorityQueue {
 // Enqueue adds an item to the queue with a specified priority
 // Lower priority values (closer to 1) will be dequeued first
 func (pq *PriorityQueue) Enqueue(item any, priority int) bool {
-	select {
-	case <-pq.ctx.Done():
-		log.Println("queue closed, cannot enqueue")
-		return false
-	default:
-		data, err := pq.toBytes(item)
-		if err != nil {
-			log.Printf("Error converting item to bytes: %v", err)
-			return false
-		}
+	return pq.enqueueWith(zsetPush, pq.pushKeys(), item, priority)
+}
 
-		if err := zsetPush.Run(pq.ctx, pq.client, pq.pushKeys(), priority, data, pq.getExpiration().Milliseconds()).Err(); err != nil {
-			log.Printf("Error enqueueing item with priority: %v", err)
-			return false
-		}
-
-		return true
+// EnqueueOnce is Enqueue for a job with an id (see Queue.EnqueueOnce).
+func (pq *PriorityQueue) EnqueueOnce(item any, priority int, id string) bool {
+	if id == "" || pq.dedupWindow.Load() <= 0 {
+		return pq.Enqueue(item, priority)
 	}
+	return pq.enqueueOnceWith(zsetPushOnce, pq.pushKeys(), item, id, priority)
 }
 
 // Dequeue removes and returns the highest priority item from the queue (lowest score)

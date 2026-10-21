@@ -6,9 +6,14 @@ import "github.com/redis/go-redis/v9"
 // trip, up to one per waiting item, so a backlog wakes them all (see
 // Queue.enqueueWith for ARGV[1] and ARGV[2]; ARGV[3] is the wake channel
 // prefix).
-var listPushWake = redis.NewScript(wakeFn + `local n = redis.call('RPUSH', KEYS[1], ARGV[1])
+const listPushWakeBody = `local n = redis.call('RPUSH', KEYS[1], ARGV[1])
 if tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
-return wake(KEYS[2], ARGV[3], n)`)
+return wake(KEYS[2], ARGV[3], n)`
+
+var (
+	listPushWake     = redis.NewScript(wakeFn + listPushWakeBody)
+	listPushWakeOnce = redis.NewScript(wakeFn + onceFn + listPushWakeBody) // see onceFn
+)
 
 type DistributedQueue struct {
 	*Queue
@@ -29,6 +34,16 @@ func newDistributedQueue(client *redis.Client, queueKey string) *DistributedQueu
 func (q *DistributedQueue) Enqueue(item any) bool {
 	keys := []string{q.Notification.queueKey, q.idleKey}
 	return q.enqueueWith(listPushWake, keys, item, q.wakePrefix)
+}
+
+// EnqueueOnce is Enqueue for a job with an id (see Queue.EnqueueOnce). A
+// repeat wakes no one.
+func (q *DistributedQueue) EnqueueOnce(item any, id string) bool {
+	if id == "" || q.dedupWindow.Load() <= 0 {
+		return q.Enqueue(item)
+	}
+	keys := []string{q.Notification.queueKey, q.idleKey}
+	return q.enqueueOnceWith(listPushWakeOnce, keys, item, id, q.wakePrefix)
 }
 
 // Len returns the number of items in the queue; a consumer that finds it

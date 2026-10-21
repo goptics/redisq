@@ -217,7 +217,18 @@ connection), up to 3 times by default. What that means per call:
   a time: if two fail together, the other's items stay pending until they
   are requeued. Delivery is at least once.
 - **`Enqueue`** can store a job twice, and returning `false` after a network
-  error does not prove the job was not stored. Make handlers idempotent.
+  error does not prove the job was not stored. Use `EnqueueOnce` with a job
+  id where that matters (below), or make handlers idempotent.
+- **`EnqueueOnce(item, id)`** stores the item once per id within the dedupe
+  window (5 minutes by default, `SetDedupWindow`), so neither a re-sent push
+  nor your own retry after a `false` stores it twice. A repeat returns `true`
+  and stores nothing. Use globally unique ids (a UUID or nanoid, never a
+  per-process counter): two producers that reuse an id drop each other's
+  jobs. The id is remembered for the whole window, even after its job is
+  handled, removed or purged. Each id holds about 100 bytes of Redis memory
+  for the window. Keep the window above the client's re-send window (about 4
+  minutes with go-redis's default timeouts). varmq uses it for every job
+  added with `WithJobId` or a job id generator.
 - **`Dequeue`** (no ack) is at most once: an item whose reply never arrives is
   gone. Use `DequeueWithAckId` for jobs you can't lose.
 - **`Remove`** can remove a second identical item if its call is re-sent.
