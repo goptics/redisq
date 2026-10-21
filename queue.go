@@ -2,6 +2,7 @@ package redisq
 
 import (
 	"context"
+	crand "crypto/rand"
 	"errors"
 	"fmt"
 	"log"
@@ -51,11 +52,23 @@ func newQueueBase(c *redis.Client, queueKey string) *Queue {
 		queueKey:  queueKey,
 		ctx:       ctx,
 		cancel:    cancel,
-		ackPrefix: cuid.New(),
+		ackPrefix: newID(),
 	}
 	q.visibilityTimeout.Store(int64(5 * time.Minute))
 	q.popLen.Store(maxPop)
 	return q
+}
+
+// newID returns an ID unique across processes. cuid.New's random part comes
+// from math/rand seeded with the start second, so processes with the same
+// pid and host (containers) started together could share IDs: two consumers
+// would then build the same ack IDs, and a pop's re-send guard could hand one
+// the items the other holds. crypto/rand rules that out.
+func newID() string {
+	if id, err := cuid.NewCrypto(crand.Reader); err == nil {
+		return id
+	}
+	return cuid.New()
 }
 
 func (q *Queue) getExpiration() time.Duration {
