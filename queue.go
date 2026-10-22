@@ -167,7 +167,7 @@ func (q *Queue) Enqueue(item any) bool {
 
 // SetDedupWindow sets how long EnqueueOnce remembers an id: a push of the
 // same id within it stores nothing. Keep it above the client's re-send window,
-// or a late re-send can store the item again: with go-redis's default timeouts
+// or a late re-send can store the item again: with the client timeouts New sets
 // up to 7 sends of a script (3 re-sends as EVALSHA, then up to 4 as EVAL after
 // a NOSCRIPT), each after a read timeout, a backoff, a pool wait, a dial and
 // a connection's setup, about 4 minutes at worst. 0 or less turns EnqueueOnce into Enqueue. Each id

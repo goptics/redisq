@@ -9,7 +9,7 @@
     <a href="https://pkg.go.dev/github.com/goptics/redisq"><img src="https://img.shields.io/badge/go-pkg-00ADD8.svg?logo=go" alt="Go Reference" /></a>
     <a href="https://github.com/goptics/redisq/actions/workflows/redisq.yml"><img src="https://github.com/goptics/redisq/actions/workflows/redisq.yml/badge.svg" alt="CI" /></a>
     <a href="https://codecov.io/gh/goptics/redisq"><img src="https://codecov.io/gh/goptics/redisq/branch/main/graph/badge.svg" alt="Codecov" /></a>
-    <a href="https://golang.org/doc/devel/release.html"><img src="https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat-square&logo=go" alt="Go Version" /></a>
+    <a href="https://golang.org/doc/devel/release.html"><img src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat-square&logo=go" alt="Go Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square" alt="License" /></a>
   </p>
 
@@ -48,7 +48,7 @@
 go get github.com/goptics/redisq
 ```
 
-Requires Go 1.24.1+ and Redis 6.0+.
+Requires Go 1.26+ and Redis 6.0+.
 
 ### Basic Usage
 
@@ -291,7 +291,7 @@ connection), up to 3 times by default. What that means per call:
   jobs. The id is remembered for the whole window, even after its job is
   handled, removed or purged. Each id holds about 100 bytes of Redis memory
   for the window. Keep the window above the client's re-send window (about 4
-  minutes with go-redis's default timeouts). varmq uses it for every job
+  minutes with the client timeouts `New` sets). varmq uses it for every job
   added with `WithJobId` or a job id generator.
 - **`Dequeue`** (no ack) is at most once: an item whose reply never arrives is
   gone. Use `DequeueWithAckId` for jobs you can't lose.
@@ -299,9 +299,12 @@ connection), up to 3 times by default. What that means per call:
 
 > [!WARNING]
 > Keep the visibility timeout well above the client's re-send window: about
-> 4 minutes at worst with go-redis's defaults (up to 7 sends of a script, each
-> after a read timeout, a backoff, a pool wait, a dial and a connection's
-> setup), usually a few seconds. A pop that reaches
+> 4 minutes at worst with the client timeouts `New` sets (up to 7 sends of a
+> script, each after a read timeout, a backoff, a pool wait, a dial and a
+> connection's setup), usually a few seconds. `New` keeps go-redis 9.7's
+> timings (3s reads, one dial attempt) unless the URL sets them; longer
+> timeouts in the URL stretch the window. On Redis Cloud and Redis Software,
+> go-redis also relaxes timeouts to 10s during maintenance. A pop that reaches
 > Redis only after its item was requeued, which takes a stall longer than the
 > visibility timeout, can still lose a job.
 

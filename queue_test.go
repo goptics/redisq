@@ -62,6 +62,28 @@ func TestNewQueue(t *testing.T) {
 	assert.Equal(t, 5*time.Minute, q.getVisibilityTimeout(), "Default visibility timeout should be 5 minutes")
 }
 
+func TestNewClientTimings(t *testing.T) {
+	options := func(url string) *redis.Options {
+		qs := New(url).(*queues)
+		defer qs.Close()
+		return qs.client.Options()
+	}
+
+	opts := options(getTestRedisURL())
+	assert.Equal(t, 3*time.Second, opts.ReadTimeout)
+	assert.Equal(t, 3*time.Second, opts.WriteTimeout)
+	assert.Equal(t, 4*time.Second, opts.PoolTimeout)
+	assert.Equal(t, 512*time.Millisecond, opts.MaxRetryBackoff)
+	assert.Equal(t, 1, opts.DialerRetries)
+
+	// Timings the URL sets win, including a disabled read timeout.
+	opts = options(getTestRedisURL() + "?read_timeout=10s&max_retry_backoff=2s")
+	assert.Equal(t, 10*time.Second, opts.ReadTimeout)
+	assert.Equal(t, 10*time.Second, opts.WriteTimeout)
+	assert.Equal(t, 2*time.Second, opts.MaxRetryBackoff)
+	assert.Equal(t, time.Duration(0), options(getTestRedisURL()+"?read_timeout=0").ReadTimeout)
+}
+
 func TestEnqueueDequeue(t *testing.T) {
 	q, cleanup := setupTestQueue(t)
 	defer cleanup()

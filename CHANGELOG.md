@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Upgraded go-redis from v9.7.3 to v9.23.0, which requires Go 1.26
+- `New` keeps go-redis 9.7's client timings (3s read and write timeouts, 512ms
+  max retry backoff, one dial attempt) unless the URL sets them, so the
+  documented re-send window stays at about 4 minutes
+- Behaviour that comes with go-redis v9.23.0:
+  - A pool timeout on any call, and a dial timeout on a single command or
+    script, is now retried: such a call to a Redis host that drops packets
+    can take about 20s to fail instead of about 5s. Pipelines already
+    retried dial timeouts
+  - Pipelines (`Enqueue` with an expiration, `Acknowledge`) use a separate
+    pool of up to 10 connections; add `pipeline_pool_size=-1` to the URL to
+    turn it off
+  - Maintenance notifications are on by default. Open-source Redis rejects
+    them once; on Redis Cloud and Redis Software timeouts are relaxed to 10s
+    during maintenance
+  - A zero duration with a unit in the URL no longer means the default:
+    `read_timeout=0s`, `write_timeout=0s` and `max_retry_backoff=0s` turn
+    it off (as `read_timeout=0` already did), and `dial_timeout=0s` or
+    `pool_timeout=0s` makes that wait fail at once. Leave the parameter out
+    to get the default
+- CI takes its Go version from `go.mod`
+
 ## [1.4.0] - 2026-01-29
 
 ### Added
