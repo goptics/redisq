@@ -1,122 +1,129 @@
-# Redisq
+<div align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="./assets/text-logo-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="./assets/text-logo.svg">
+  <img alt="redisq" width="320px" src="./assets/text-logo.svg">
+</picture>
 
-[![Go Reference](https://img.shields.io/badge/go-pkg-00ADD8.svg?logo=go)](https://pkg.go.dev/github.com/goptics/redisq)
-[![Go Report Card](https://goreportcard.com/badge/github.com/goptics/redisq)](https://goreportcard.com/report/github.com/goptics/redisq)
-[![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat-square&logo=go)](https://golang.org/doc/devel/release.html)
-[![CI](https://github.com/goptics/redisq/actions/workflows/redisq.yml/badge.svg)](https://github.com/goptics/redisq/actions/workflows/go.yml)
-[![codecov](https://codecov.io/gh/goptics/redisq/branch/main/graph/badge.svg)](https://codecov.io/gh/goptics/redisq)
+  <p>
+    <a href="https://pkg.go.dev/github.com/goptics/redisq"><img src="https://img.shields.io/badge/go-pkg-00ADD8.svg?logo=go" alt="Go Reference" /></a>
+    <a href="https://github.com/goptics/redisq/actions/workflows/redisq.yml"><img src="https://github.com/goptics/redisq/actions/workflows/redisq.yml/badge.svg" alt="CI" /></a>
+    <a href="https://codecov.io/gh/goptics/redisq"><img src="https://codecov.io/gh/goptics/redisq/branch/main/graph/badge.svg" alt="Codecov" /></a>
+    <a href="https://golang.org/doc/devel/release.html"><img src="https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat-square&logo=go" alt="Go Version" /></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square" alt="License" /></a>
+  </p>
 
-A lightweight, thread-safe Redis-backed queue implementation in Go with support for distributed notifications and priority queuing.
+  <p><strong>Redis-backed FIFO and priority queues for Go, with acknowledgments, batch pops and distributed consumers.</strong></p>
 
-## Features
+  <p align="center">
+    <a href="#-features">Features</a> ·
+    <a href="#quick-start">Quick Start</a> ·
+    <a href="#queue-types">Queue Types</a> ·
+    <a href="#-reliable-processing">Reliable Processing</a> ·
+    <a href="#how-it-works">How It Works</a> ·
+    <a href="#delivery-guarantees">Delivery Guarantees</a> ·
+    <a href="#api-reference">API Reference</a> ·
+    <a href="#contributing">Contributing</a>
+  </p>
+</div>
 
-- Thread-safe queue operations
-- Priority queue support
-- Distributed queue with real-time notifications
-- Automatic message expiration support
-- Graceful shutdown handling
-- Concurrent operations support
-- Simple API for queue operations
-- Built as a persistence adapter for [varmq](https://github.com/goptics/varmq)
+---
 
-## Installation
+## ✨ Features
+
+- **FIFO and priority queues** on plain Redis lists and sorted sets; lower priority number is served first.
+- **Distributed variants** that wake only idle consumers, one per waiting item, in the same round trip as the enqueue.
+- **Acknowledgments with a visibility timeout**: unacknowledged items return to the queue, with deadlines taken from Redis's clock.
+- **Batch dequeue**: up to 1000 items per round trip, each under its own ack ID, sized to recent traffic.
+- **Deduplicated enqueue**: `EnqueueOnce` stores a job once per id, even across retries.
+- **Queue TTL**: optional key expiration, refreshed on every enqueue.
+- **Thread-safe**: share one queue object across goroutines.
+- **Persistence adapter for [varmq](https://github.com/goptics/varmq)**.
+
+## Quick Start
+
+### Installation
 
 ```bash
 go get github.com/goptics/redisq
 ```
 
-## Quick Start
+Requires Go 1.24.1+ and Redis 6.0+.
+
+### Basic Usage
 
 ```go
-import "github.com/goptics/redisq"
+package main
+
+import (
+	"fmt"
+
+	"github.com/goptics/redisq"
+)
 
 func main() {
-    // Initialize queue system
-    qs := redisq.New("redis://localhost:6379")
-    defer qs.Close()
+	qs := redisq.New("redis://localhost:6379") // panics on an invalid URL
+	defer qs.Close()
 
-    // Create a simple queue
-    queue := qs.NewQueue("my-queue")
-    defer queue.Close()
+	queue := qs.NewQueue("my-queue")
+	defer queue.Close()
 
-    // Enqueue items
-    queue.Enqueue("hello world")
+	queue.Enqueue("hello world") // accepts string or []byte
 
-    // Dequeue items
-    data, ok := queue.Dequeue()
-    if ok {
-        fmt.Println(string(data.([]byte)))
-    }
+	if data, ok := queue.Dequeue(); ok {
+		fmt.Println(string(data.([]byte))) // items come back as []byte
+	}
 }
 ```
 
-## Usage
+## Queue Types
+
+| Type                       | Constructor                           | Order        | Wakes idle consumers |
+| -------------------------- | ------------------------------------- | ------------ | :------------------: |
+| `Queue`                    | `qs.NewQueue(key)`                    | FIFO         |          –           |
+| `PriorityQueue`            | `qs.NewPriorityQueue(key)`            | Lowest first |          –           |
+| `DistributedQueue`         | `qs.NewDistributedQueue(key)`         | FIFO         |          ✅          |
+| `DistributedPriorityQueue` | `qs.NewDistributedPriorityQueue(key)` | Lowest first |          ✅          |
+
+Every type supports `DequeueWithAckId`, `DequeueBatchWithAckIds`, `Acknowledge` and the rest of the [reliable processing](#-reliable-processing) API.
 
 ### Simple Queue
 
 ```go
-// Create a queue
 queue := qs.NewQueue("my-queue")
 
-// Optional: Set expiration for queue items
-queue.SetExpiration(time.Hour)
+queue.SetExpiration(time.Hour) // optional TTL on the queue key
 
-// Enqueue items (supports []byte and string)
 queue.Enqueue("test message")
 queue.Enqueue([]byte("binary data"))
 
-// Get queue length
 length := queue.Len()
-
-// Get all values
 values := queue.Values()
-
-// Purge the queue
 queue.Purge()
 ```
 
 ### Priority Queue
 
 ```go
-// Create a priority queue
 pq := qs.NewPriorityQueue("priority-queue")
 
-// Enqueue items with priority (lower number = higher priority)
+// Lower number = higher priority
+pq.Enqueue("low priority", 3)
 pq.Enqueue("high priority", 1)
 pq.Enqueue("medium priority", 2)
-pq.Enqueue("low priority", 3)
 
-// Items will be dequeued in priority order
-data, ok := pq.Dequeue() // Returns "high priority"
+data, ok := pq.Dequeue() // "high priority"
 ```
 
-### Distributed Priority Queue
+### Distributed Queue
 
 ```go
-// Create a distributed priority queue
-dpq := qs.NewDistributedPriorityQueue("distributed-priority-queue")
-
-// Subscribing makes this instance a consumer that can be woken
-dpq.Subscribe(func(action string) {
-    fmt.Printf("Action: %s\n", action) // "enqueued"
-})
-
-// Wakes one idle consumer, if any
-dpq.Enqueue("important message", 1)
-
-data, ok := dpq.Dequeue()
-
-```
-
-### Distributed Queue with Notifications
-
-```go
-// Create a distributed queue
 dq := qs.NewDistributedQueue("distributed-queue")
+defer dq.Close()
 
 // Subscribing makes this instance a consumer that can be woken
 dq.Subscribe(func(action string) {
-    fmt.Printf("Action: %s\n", action) // "enqueued"
+	fmt.Printf("Action: %s\n", action) // "enqueued"
 })
 
 // Wakes one idle consumer, if any
@@ -125,59 +132,70 @@ dq.Enqueue("test message")
 data, ok := dq.Dequeue()
 ```
 
-#### How consumers are woken
-
-A busy consumer keeps pulling on its own, so only idle ones need a signal.
-A consumer that finds the queue empty (`Len()` returns 0, or a dequeue leaves
-it empty while the consumer could take more) joins the idle set `<key>:idle`.
-Each enqueue wakes idle consumers on their own channel `<key>:wake:<id>`, up to
-one per waiting item, so a backlog wakes them all; when every consumer is
-busy, nothing is published. A requeue of `n` expired items wakes up to `n`.
-A consumer that is idle while items wait (for example after a wake reached a
-paused instance) is nudged within a second. There is no `"dequeued"`
-notification.
-
-### Queue with Acknowledgment (Reliable Processing)
+### Distributed Priority Queue
 
 ```go
-// Create a queue with acknowledgment support
+dpq := qs.NewDistributedPriorityQueue("distributed-priority-queue")
+defer dpq.Close()
+
+dpq.Subscribe(func(action string) {
+	fmt.Printf("Action: %s\n", action) // "enqueued"
+})
+
+dpq.Enqueue("important message", 1)
+
+data, ok := dpq.Dequeue()
+```
+
+See [How consumers are woken](#how-consumers-are-woken) for the wake protocol.
+
+## 💡 Reliable Processing
+
+### Acknowledgments
+
+```go
 queue := qs.NewQueue("ack-queue")
 
 // How long a dequeued item stays pending before it can be requeued
-queue.SetVisibilityTimeout(time.Minute * 5)
+queue.SetVisibilityTimeout(5 * time.Minute)
 
-// Dequeue an item; it stays pending under ackID until acknowledged
+// The item stays pending under ackID until acknowledged
 item, ok, ackID := queue.DequeueWithAckId()
 if ok {
-    // Process the item
-    processItem(item)
-
-    // Mark the item as successfully processed
-    queue.Acknowledge(ackID)
+	processItem(item)
+	queue.Acknowledge(ackID)
 }
-
-// For manual control of the acknowledgment process:
-// 1. Prepare an item for future acknowledgment
-ackID := "job-456"
-data := "important job"
-err := queue.PrepareForFutureAck(ackID, data)
-
-// 2. Acknowledge the item after processing
-success := queue.Acknowledge(ackID)
-
-// You can trigger requeue of all unacknowledged items
-queue.RequeueNackedItems()
-
-// 4. Get count of pending unacknowledged items
-pendingCount := queue.GetNackedItemsCount()
 ```
 
-The visibility timeout counts from when Redis runs the pop, on Redis's clock,
-so a pop that waited in Redis still gets the full timeout. Once every process
-runs this version, clients whose clocks disagree share one deadline (older
-versions stamp and sweep deadlines with their own clocks).
+Manual control of the pending set:
 
-#### Taking several items at once
+```go
+// Track an item under your own ID, then acknowledge it after processing
+err := queue.PrepareForFutureAck("job-456", "important job")
+acked := queue.Acknowledge("job-456")
+
+// Requeue every item whose visibility timeout has passed
+err = queue.RequeueNackedItems()
+
+// Count items still waiting for acknowledgment
+pending := queue.GetNackedItemsCount()
+```
+
+### Enqueue once per job id
+
+```go
+queue.SetDedupWindow(10 * time.Minute) // default 5 minutes
+
+// Stored once per id within the window; a repeat returns true and stores nothing
+queue.EnqueueOnce("send welcome email", "job-0b7e9c2a")
+
+// Priority variants take the priority before the id
+pq.EnqueueOnce("rebuild index", 1, "job-5f1d3e77")
+```
+
+See [Delivery Guarantees](#delivery-guarantees) for how ids should be chosen.
+
+### Taking several items at once
 
 `DequeueBatchWithAckIds` takes up to `len(items)` items (at most 1000) in one
 round trip, each pending under its own ack ID, and reports how many are left.
@@ -194,21 +212,67 @@ items := make([]any, 8)
 ackIDs := make([]string, 8)
 
 for {
-    n, remaining, err := queue.DequeueBatchWithAckIds(items, ackIDs)
-    for i := range n {
-        processItem(items[i])
-        queue.Acknowledge(ackIDs[i])
-    }
-    if err != nil || remaining == 0 {
-        break
-    }
+	n, remaining, err := queue.DequeueBatchWithAckIds(items, ackIDs)
+	for i := range n {
+		processItem(items[i])
+		queue.Acknowledge(ackIDs[i])
+	}
+	if err != nil || remaining == 0 {
+		break
+	}
 }
 ```
 
-#### Network errors and retries
+### Using with varmq
+
+redisq implements varmq's persistent and distributed queue interfaces:
+
+```go
+qs := redisq.New("redis://localhost:6379")
+defer qs.Close()
+
+rq := qs.NewDistributedPriorityQueue("jobs")
+dq := varmq.NewDistributedPriorityQueue[[]string](rq)
+defer dq.Close()
+
+dq.Add([]string{"https://example.com"}, 1)
+```
+
+A provider/consumer integration example lives in [`examples/varmq`](examples/varmq).
+
+## How It Works
+
+### How consumers are woken
+
+A busy consumer keeps pulling on its own, so only idle ones need a signal.
+A consumer that finds the queue empty (`Len()` returns 0, or a dequeue leaves
+it empty while the consumer could take more) joins the idle set `<key>:idle`.
+Each enqueue wakes idle consumers on their own channel `<key>:wake:<id>`, up to
+one per waiting item, so a backlog wakes them all; when every consumer is
+busy, nothing is published. A requeue of `n` expired items wakes up to `n`.
+A consumer that is idle while items wait (for example after a wake reached a
+paused instance) is nudged within a second. There is no `"dequeued"`
+notification.
+
+### Visibility deadlines
+
+The visibility timeout counts from when Redis runs the pop, on Redis's clock,
+so a pop that waited in Redis still gets the full timeout. Once every process
+runs this version, clients whose clocks disagree share one deadline (older
+versions stamp and sweep deadlines with their own clocks).
+
+## Delivery Guarantees
 
 go-redis re-sends a command whose reply was lost (a read timeout or a dropped
 connection), up to 3 times by default. What that means per call:
+
+| Call                                            | Guarantee     | On a lost reply                                    |
+| ----------------------------------------------- | ------------- | -------------------------------------------------- |
+| `DequeueWithAckId`, `DequeueBatchWithAckIds`    | At least once | Items come back on retry or on the next call       |
+| `Enqueue`                                       | At least once | May store the job twice; `false` is not proof      |
+| `EnqueueOnce`                                   | Once per id   | Stored once within the dedupe window               |
+| `Dequeue`                                       | At most once  | Item is gone                                       |
+| `Remove`                                        | –             | May remove a second identical item                 |
 
 - **`DequeueWithAckId`** and **`DequeueBatchWithAckIds`** are safe: a re-sent
   pop hands back the items the first attempt took, and after a call that
@@ -232,38 +296,42 @@ connection), up to 3 times by default. What that means per call:
 - **`Dequeue`** (no ack) is at most once: an item whose reply never arrives is
   gone. Use `DequeueWithAckId` for jobs you can't lose.
 - **`Remove`** can remove a second identical item if its call is re-sent.
-- Keep the visibility timeout well above the client's re-send window: about
-  4 minutes at worst with go-redis's defaults (up to 7 sends of a script, each
-  after a read timeout, a backoff, a pool wait, a dial and a connection's
-  setup), usually a few seconds. A pop that reaches
-  Redis only after its item was requeued, which takes a stall longer than the
-  visibility timeout, can still lose a job.
 
-## Testing
+> [!WARNING]
+> Keep the visibility timeout well above the client's re-send window: about
+> 4 minutes at worst with go-redis's defaults (up to 7 sends of a script, each
+> after a read timeout, a backoff, a pool wait, a dial and a connection's
+> setup), usually a few seconds. A pop that reaches
+> Redis only after its item was requeued, which takes a stall longer than the
+> visibility timeout, can still lose a job.
 
-```bash
-make test
-```
+## Development
 
-## Requirements
+Tests start Redis in a container through [dockertest](https://github.com/ory/dockertest), so Docker must be running; no Redis server is needed.
 
-- Go 1.24.1 or higher
-- Redis 6.0 or higher
+| Command                         | Description                                   |
+| ------------------------------- | --------------------------------------------- |
+| `make test`                     | Run all tests with race detection and coverage |
+| `REDIS_TAG=6.0 make test`       | Run the tests on the oldest supported Redis   |
+| `make format`                   | Format code                                   |
+| `make release VERSION=v1.0.0`   | Tag and push a signed release                 |
+
+## API Reference
+
+For the complete package documentation, types, and method signatures, browse the **[GoDoc](https://pkg.go.dev/github.com/goptics/redisq)**.
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=goptics/redisq&type=Date)](https://www.star-history.com/#goptics/redisq&Date)
 
 ## Contributing
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+Contributions are welcome! Open an issue to discuss a change, or send a pull request:
 
-## 👤 Author
-
-- GitHub: [@fahimfaisaal](https://github.com/fahimfaisaal)
-- LinkedIn: [in/fahimfaisaal](https://www.linkedin.com/in/fahimfaisaal/)
-- Twitter: [@FahimFaisaal](https://twitter.com/FahimFaisaal)
+1. Fork the repository and create a branch (`git checkout -b feature/amazing-feature`)
+2. Make your change with tests, and run `make test`
+3. Open a pull request against `main`
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+Released under the [MIT License](LICENSE).
