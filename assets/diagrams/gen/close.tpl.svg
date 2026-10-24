@@ -1,0 +1,137 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 444" width="960" height="444" role="img" aria-labelledby="title desc">
+  <title id="title">redisq Close: a closing consumer hands its unacknowledged jobs back to the front of the list at once and wakes another consumer</title>
+  <desc id="desc">Two DistributedQueue consumers with three worker slots each share a queue. At the start the queue and the pending set are empty, consumer C2 is idle and its chip is in the idle set, and consumer C1 has not started yet. Jobs J1, J2 and J3 are enqueued back to back; each enqueue pushes the job to the tail of the list and wakes up to one idle consumer per waiting job in the same script. J1's push takes C2 out of the idle set and publishes to it; J2 and J3 find the idle set empty, so they wake no one. C2 wakes with three free slots and pops J1, J2 and J3, one DequeueWithAckId call per free slot: each pop moves the job from the head of the list into the pending set, tagged with its owner C2 and with a visibility deadline, and C2 runs all three. At its next nudge, once a second, C2 finds the queue empty but stays out of the idle set: it popped work, and all its slots are busy. C1 starts and subscribes, which adds it to the idle set too. Then C2 calls Close while its three jobs are still running and unacknowledged. Close first calls leave, which takes C2 out of the idle set; it is not in it. Then one release script pushes C2's pending jobs back to the front of the list in pop order, J1, then J2, then J3, so the list reads J3, J2, J1 from the head, and drops C2's heartbeat and presence. Then it wakes up to three idle consumers: C1 is the only member of the idle set, so C1 alone is woken. C1 pops J3, J2 and J1 right away, one call per free slot, with no timer involved, while C2's process exits: its runs are cut off, an acknowledgment after Close would fail, and the jobs run again on C1. C1 finishes and acknowledges all three jobs, which deletes their pending entries; at its first job end its Len() call finds the queue empty and puts it back in the idle set. At the end the list and the pending set are empty, C1 is idle in the idle set and C2 is gone; the picture then fades back to the start state to replay. Times are not to scale.</desc>
+  <style>
+    :root {
+      --dur: {D}s;
+      --bg: #f6f8fa; --border: #d0d7de; --box: #ffffff; --fg: #1f2328; --muted: #59636e; --line: #8c959f;
+      --yellow: #f5c451; --yellow-tint: #fff1d6;
+      --purple: #8250df; --green: #1a7f37; --blue: #0969da; --pink: #bf3989; --red: #cf222e;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #161b22; --border: #30363d; --box: #0d1117; --fg: #e6edf3; --muted: #9198a1; --line: #6e7681;
+        --yellow: #d29922; --yellow-tint: #2b2111;
+        --purple: #a371f7; --green: #3fb950; --blue: #58a6ff; --pink: #db61a2; --red: #f85149;
+      }
+    }
+    .bg { fill: var(--bg); stroke: var(--border); }
+    .box { fill: var(--box); stroke: var(--line); stroke-width: 1.5; }
+    .edge { fill: none; stroke: var(--line); stroke-width: 1.5; }
+    .sig { fill: none; stroke: var(--pink); stroke-width: 1.5; stroke-dasharray: 5 4; }
+    .slot { fill: none; stroke: var(--yellow); stroke-width: 1; stroke-dasharray: 3 3; opacity: .5; }
+    .arrow { fill: var(--line); }
+    .arrow-sig { fill: var(--pink); }
+    text { font-family: system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: var(--fg); text-anchor: middle; dominant-baseline: central; }
+    .t { font-size: 14px; font-weight: 600; }
+    .h { font-size: 13px; font-weight: 600; text-anchor: start; }
+    .m { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; fill: var(--muted); }
+    .why { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; font-weight: 600; fill: var(--red); }
+    .lg { font-size: 12px; fill: var(--muted); text-anchor: start; }
+
+    /* motion: one shared --dur loop; keyframes generated from a seconds timeline, keyframe name == element id */
+    .a { animation: var(--dur) cubic-bezier(.65, 0, .35, 1) infinite; transform-box: fill-box; opacity: 0; }
+    .lin { animation-timing-function: linear; }
+    .dot { fill: var(--green); }
+    .glow { fill: var(--blue); }
+    .bar { fill: var(--blue); transform-origin: left center; }
+    /* redisq diagram classes, after the base rules */
+    .panel { fill: none; stroke: var(--border); stroke-width: 1.5; stroke-dasharray: 6 4; }
+    .lane { fill: var(--yellow-tint); stroke: var(--yellow); stroke-width: 1.5; }
+    .item { fill: var(--yellow); }
+    .itxt { fill: #1f2328; font-size: 13px; font-weight: 700; }
+    .track { fill: var(--border); }
+    .wk { stroke: var(--blue); }
+    .prod { stroke: var(--yellow); stroke-width: 2; }
+    .note { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; font-weight: 600; fill: var(--purple); }
+    .ok { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; font-weight: 600; fill: var(--green); }
+    .step { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; font-weight: 600; fill: var(--fg); }
+    .st { text-anchor: end; }
+    .st-on { fill: var(--fg); font-weight: 600; }
+    .chip { fill: var(--box); stroke: var(--blue); stroke-width: 1.5; }
+    .ctxt { font-size: 12px; font-weight: 700; }
+    .ttxt { font-size: 11px; font-weight: 700; }
+    .wdot { fill: var(--pink); }
+    .pip { fill: var(--purple); }
+    .pring { fill: none; stroke: var(--purple); stroke-width: 2; transform-origin: center; }
+    .replay { font-size: 13px; font-weight: 600; fill: var(--muted); text-anchor: end; }
+    /*KEYFRAMES*/
+    @media (prefers-reduced-motion: reduce) { .a { animation-play-state: paused; animation-delay: -{STILL}s; } }
+  </style>
+  <defs>
+    <marker id="arr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto">
+      <path class="arrow" d="M0 0L8 4L0 8z"/>
+    </marker>
+    <marker id="arr-sig" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto">
+      <path class="arrow-sig" d="M0 0L8 4L0 8z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0.5" y="0.5" width="959" height="443" rx="12"/>
+
+  <!-- legend -->
+  <g transform="translate(24 30)">
+    <rect class="item" x="0" y="-6" width="12" height="12" rx="3"/><text class="lg" x="20" y="0">job in Redis: waiting in the list, or pending</text>
+    <circle class="dot" cx="6" cy="20" r="6"/><text class="lg" x="20" y="20">job handed to a consumer</text>
+    <rect class="chip" x="0" y="32" width="26" height="16" rx="8"/><text class="ttxt" x="13" y="40">C1</text><text class="lg" x="34" y="40">consumer in :idle, or owner of a pending job</text>
+    <circle class="wdot" cx="336" cy="0" r="5"/><text class="lg" x="350" y="0">wake: PUBLISH to one idle consumer</text>
+    <circle class="pring" cx="336" cy="20" r="6"/><text class="lg" x="350" y="20">nudge, once a second per consumer</text>
+    <rect class="bar" x="330" y="37" width="12" height="6" rx="2"/><text class="lg" x="350" y="40">visibility deadline</text>
+  </g>
+  <text class="m" x="936" y="30" style="text-anchor:end">times not to scale</text>
+  <text class="m" x="936" y="48" style="text-anchor:end">visibility timeout (default 5 min) drawn as {VT} s</text>
+  <text id="replay" class="a replay" x="936" y="66">↻ replay</text>
+
+  <!-- producer: RPUSH + wake, one script -->
+  <rect class="box prod" x="24" y="142" width="110" height="46" rx="8"/>
+  <rect id="enq-glow" class="a item" x="24" y="142" width="110" height="46" rx="8"/>
+  <text class="t" x="79" y="165">Enqueue</text>
+  <text class="m" x="79" y="202">one script:</text>
+  <text class="m" x="79" y="216">RPUSH + wake(n)</text>
+  <path class="edge" d="M134 165H194" marker-end="url(#arr)"/>
+
+  <!-- Redis -->
+  <rect class="panel" x="160" y="84" width="548" height="340" rx="12"/>
+  <text class="h" x="176" y="102">Redis</text>
+
+  <text class="h" x="196" y="128">queue</text>
+  <text class="m" x="244" y="128" style="text-anchor:start">&lt;key&gt; · list</text>
+  <rect class="lane" x="196" y="142" width="274" height="46" rx="8"/>
+  <rect class="slot" x="348" y="150" width="30" height="30" rx="5"/>
+  <rect class="slot" x="384" y="150" width="30" height="30" rx="5"/>
+  <rect class="slot" x="420" y="150" width="30" height="30" rx="5"/>
+  <text class="m" x="363" y="200">tail</text>
+  <text class="m" x="435" y="200">head</text>
+
+  <text class="h" x="196" y="240">pending</text>
+  <text class="m" x="256" y="240" style="text-anchor:start">&lt;key&gt;:nacked + :timeouts</text>
+  <rect class="box" x="196" y="252" width="274" height="152" rx="8"/>
+  <!--ROWS-->
+
+  <text class="h" x="548" y="222">idle</text>
+  <text class="m" x="580" y="222" style="text-anchor:start">&lt;key&gt;:idle · set</text>
+  <rect class="box" x="548" y="236" width="142" height="46" rx="8"/>
+  <g id="chip-C1" class="a"><rect class="chip" x="560" y="247" width="52" height="24" rx="12"/><text class="ctxt" x="586" y="259">C1</text></g>
+  <g id="chip-C2" class="a"><rect class="chip" x="624" y="247" width="52" height="24" rx="12"/><text class="ctxt" x="650" y="259">C2</text></g>
+  <text id="why-nowake" class="a why" x="612" y="300">J2, J3: :idle empty, no wake</text>
+  <text id="note-nudge" class="a note" x="612" y="300">nudge: C2 busy, stays out</text>
+  <!-- Close, step by step: one list under :idle, between the pop edges (x 500, y 370) -->
+  <text id="note-leave" class="a step" x="510" y="298" style="text-anchor:start">1. leave(): SREM C2 (not in)</text>
+  <g id="note-release" class="a"><text class="step" x="510" y="312" style="text-anchor:start">2. release, one script:</text><text class="step" x="530" y="326" style="text-anchor:start">LPUSH J1, J2, J3,</text><text class="step" x="530" y="340" style="text-anchor:start">drop C2 heartbeat</text></g>
+  <text id="note-wake" class="a step" x="510" y="354" style="text-anchor:start">3. wake(3): SPOP C1, PUBLISH</text>
+
+  <!-- pop: list head → consumers -->
+  <path class="edge" d="M470 165H738" marker-end="url(#arr)"/>
+  <path class="edge" d="M500 165V370H738" marker-end="url(#arr)"/>
+  <text class="m" x="606" y="150">DequeueWithAckId per free slot</text>
+
+  <!-- wake: SPOP a member of :idle, PUBLISH to its channel -->
+  <path class="sig" d="M690 248H716V180H738" marker-end="url(#arr-sig)"/>
+  <path class="sig" d="M690 270H716V296H738" marker-end="url(#arr-sig)"/>
+
+  <!--CONSUMERS-->
+  <g id="why-c2" class="a"><text class="why" x="838" y="396">acks after Close fail</text><text class="why" x="838" y="410">runs again on C1</text></g>
+
+  <!-- moving parts -->
+  <!--ELEMENTS-->
+</svg>

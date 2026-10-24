@@ -40,8 +40,9 @@ func TestMain(m *testing.M) {
 		log.Fatalf("Could not start resource: %s", err)
 	}
 
-	// Tell docker to hard kill the container in 120 seconds
-	resource.Expire(120)
+	// Tell docker to hard kill the container in 600 seconds; the suite takes
+	// about 2 minutes locally and longer in CI
+	resource.Expire(600)
 
 	// Get the mapped port
 	port := resource.GetPort("6379/tcp")

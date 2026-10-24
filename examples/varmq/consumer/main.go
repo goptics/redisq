@@ -16,7 +16,6 @@ func main() {
 
 	redisQueue := redisq.New("redis://localhost:6375")
 	rq := redisQueue.NewDistributedPriorityQueue("scraping_priority_queue")
-	defer rq.Listen()
 
 	w := varmq.NewWorker(func(j varmq.Job[[]string]) {
 		data := j.Data()
@@ -31,4 +30,8 @@ func main() {
 
 	fmt.Println("pending jobs:", q.NumPending())
 	fmt.Println("listening...")
+
+	rq.Listen() // until SIGINT or SIGTERM
+	w.Stop()    // finish the jobs in progress
+	rq.Close()  // and hand any unacknowledged one to another consumer at once
 }

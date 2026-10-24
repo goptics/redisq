@@ -1,0 +1,172 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 {H}" width="960" height="{H}" role="img" aria-labelledby="title desc">
+  <title id="title">redisq: how another consumer finds out that a consumer died holding jobs without calling Close</title>
+  <desc id="desc">{DESC}</desc>
+  <style>
+    :root {
+      --dur: {D}s;
+      --bg: #f6f8fa; --border: #d0d7de; --box: #ffffff; --fg: #1f2328; --muted: #59636e; --line: #8c959f;
+      --yellow: #f5c451; --yellow-tint: #fff1d6;
+      --purple: #8250df; --green: #1a7f37; --blue: #0969da; --pink: #bf3989; --red: #cf222e;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #161b22; --border: #30363d; --box: #0d1117; --fg: #e6edf3; --muted: #9198a1; --line: #6e7681;
+        --yellow: #d29922; --yellow-tint: #2b2111;
+        --purple: #a371f7; --green: #3fb950; --blue: #58a6ff; --pink: #db61a2; --red: #f85149;
+      }
+    }
+    .bg { fill: var(--bg); stroke: var(--border); }
+    .box { fill: var(--box); stroke: var(--line); stroke-width: 1.5; }
+    .edge { fill: none; stroke: var(--line); stroke-width: 1.5; }
+    .sig { fill: none; stroke: var(--pink); stroke-width: 1.5; stroke-dasharray: 5 4; }
+    .slot { fill: none; stroke: var(--yellow); stroke-width: 1; stroke-dasharray: 3 3; opacity: .5; }
+    .arrow { fill: var(--line); }
+    .arrow-sig { fill: var(--pink); }
+    text { font-family: system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: var(--fg); text-anchor: middle; dominant-baseline: central; }
+    .t { font-size: 14px; font-weight: 600; }
+    .h { font-size: 13px; font-weight: 600; text-anchor: start; }
+    .m { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; fill: var(--muted); }
+    .why { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; font-weight: 600; fill: var(--red); }
+    .lg { font-size: 12px; fill: var(--muted); text-anchor: start; }
+
+    /* motion: one shared --dur loop; keyframes generated from a seconds timeline, keyframe name == element id */
+    .a { animation: var(--dur) cubic-bezier(.65, 0, .35, 1) infinite; transform-box: fill-box; opacity: 0; }
+    .lin { animation-timing-function: linear; }
+    .dot { fill: var(--green); }
+    .glow { fill: var(--blue); }
+    .bar { fill: var(--blue); transform-origin: left center; }
+    /* redisq diagram classes, after the base rules */
+    .panel { fill: none; stroke: var(--border); stroke-width: 1.5; stroke-dasharray: 6 4; }
+    .lane { fill: var(--yellow-tint); stroke: var(--yellow); stroke-width: 1.5; }
+    .item { fill: var(--yellow); }
+    .itxt { fill: #1f2328; font-size: 13px; font-weight: 700; }
+    .track { fill: var(--border); }
+    .wk { stroke: var(--blue); }
+    .swp { stroke: var(--purple); stroke-width: 2; }
+    .sw-edge { fill: none; stroke: var(--purple); stroke-width: 1.5; stroke-dasharray: 5 4; }
+    .arrow-sw { fill: var(--purple); }
+    .ring { fill: none; stroke: var(--purple); stroke-width: 2; transform-origin: center; }
+    .note { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; font-weight: 600; fill: var(--purple); }
+    .ok { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; font-weight: 600; fill: var(--green); }
+    /* dead-consumer diagram */
+    .sub { fill: var(--pink); }
+    .pk { fill: var(--pink); }
+    .sep { stroke: var(--border); stroke-width: 1; }
+    .clk { font-size: 16px; font-weight: 700; text-anchor: end; font-variant-numeric: tabular-nums; }
+    .st { font-size: 13px; font-weight: 600; text-anchor: start; }
+    .end { text-anchor: end; }
+    .start { text-anchor: start; }
+    /*KEYFRAMES*/
+    @media (prefers-reduced-motion: reduce) { .a { animation-play-state: paused; animation-delay: -{STILL}s; } }
+  </style>
+  <defs>
+    <marker id="arr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto">
+      <path class="arrow" d="M0 0L8 4L0 8z"/>
+    </marker>
+    <marker id="arr-sig" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto">
+      <path class="arrow-sig" d="M0 0L8 4L0 8z"/>
+    </marker>
+    <marker id="arr-sw" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto">
+      <path class="arrow-sw" d="M0 0L8 4L0 8z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0.5" y="0.5" width="959" height="{H1}" rx="12"/>
+
+  <!-- legend -->
+  <g transform="translate(24 22)">
+    <rect class="item" x="0" y="-6" width="12" height="12" rx="3"/><text class="lg" x="20" y="0">job in Redis</text>
+    <circle class="dot" cx="6" cy="20" r="6"/><text class="lg" x="20" y="20">job handed to C1</text>
+    <circle class="sub" cx="146" cy="0" r="6"/><text class="lg" x="160" y="0">subscribed to its wake channel</text>
+    <path class="sig" d="M140 20H152"/><circle class="pk" cx="152" cy="20" r="4"/><text class="lg" x="160" y="20">wake signal</text>
+    <rect class="bar" x="380" y="-3" width="12" height="6" rx="2"/><text class="lg" x="400" y="0">time left before C2 counts as dead</text>
+    <circle class="ring" cx="386" cy="20" r="6"/><text class="lg" x="400" y="20">sweep, once a second</text>
+  </g>
+  <!--CLOCK-->
+  <text class="m end" x="936" y="42">times not to scale</text>
+  <text id="ff" class="a note end" x="852" y="22">fast-forward</text>
+  <text id="replay" class="a m end" x="852" y="22">↻ replay</text>
+  <line class="sep" x1="24" y1="{SEP}" x2="936" y2="{SEP}"/>
+
+<!--ROW-->
+  <g transform="translate(0 {Y})">
+    <text class="h" x="24" y="10">{TITLE}</text>
+
+    <!-- C2: dies at t = 0 (outline and sweep chip fade; its name stays readable) -->
+    <g id="c2-{r}" class="a">
+      <rect class="box wk" x="24" y="30" width="120" height="68" rx="8"/>
+      <rect class="track" x="44" y="82" width="80" height="4" rx="2"/>
+      <rect class="box swp" x="24" y="110" width="120" height="28" rx="8"/>
+      <text class="m" x="84" y="124">sweep · every 1 s</text>
+    </g>
+    <rect id="c2glow-{r}" class="a glow" x="24" y="30" width="120" height="68" rx="8"/>
+    <text class="t" x="84" y="50">C2</text>
+    <text id="c2cap-{r}-0" class="a m" x="84" y="68">running J1, J2</text>
+    <text id="c2cap-{r}-1" class="a why" x="84" y="68">{KILL}</text>
+    <rect id="c2bar-{r}" class="a lin bar" x="44" y="82" width="80" height="4" rx="2"/>
+    <rect id="c2ring-{r}" class="a ring" x="24" y="110" width="120" height="28" rx="8"/>
+    <text id="kill-{r}" class="a why" x="84" y="154">no more sweeps</text>
+
+    <!-- C2's subscription to its wake channel -->
+    <path id="chan-{r}" class="a sig" d="M220 58H147" marker-end="url(#arr-sig)"/>
+    <text class="m" x="172" y="47" style="fill: var(--pink)">wake:C2</text>
+
+    <!-- Redis -->
+    <rect class="panel" x="200" y="22" width="520" height="160" rx="12"/>
+    <text class="h" x="214" y="36">Redis</text>
+    <circle id="sub-{r}" class="a sub" cx="226" cy="58" r="6"/>
+
+    <text class="h" x="214" y="84">heartbeat</text>
+    <text class="m end" x="390" y="84">:heartbeats</text>
+    <rect class="track" x="214" y="93" width="176" height="7" rx="3"/>
+    <rect id="hb-{r}" class="a lin bar" x="214" y="93" width="176" height="7" rx="3"/>
+    <text class="h" x="214" y="135">presence mark</text>
+    <text class="m end" x="390" y="135">:presence</text>
+    <rect class="track" x="214" y="145" width="176" height="7" rx="3"/>
+    <rect id="gr-{r}" class="a lin bar" x="214" y="145" width="176" height="7" rx="3"/>
+
+    <text class="h" x="410" y="36">queue</text>
+    <text class="m start" x="460" y="36">&lt;key&gt; · list</text>
+    <text class="m" x="635" y="36">tail</text>
+    <text class="m" x="671" y="36">head</text>
+    <rect class="lane" x="410" y="46" width="290" height="44" rx="8"/>
+    <rect class="slot" x="620" y="53" width="30" height="30" rx="5"/>
+    <rect class="slot" x="656" y="53" width="30" height="30" rx="5"/>
+
+    <text class="h" x="410" y="106">pending</text>
+    <text class="m start" x="470" y="106">:nacked</text>
+    <rect class="box" x="410" y="116" width="290" height="56" rx="8"/>
+    <text id="own2a-{r}" class="a m start" x="460" y="144">owner C2</text>
+    <text id="own2b-{r}" class="a m start" x="576" y="144">owner C2</text>
+    <text id="own1a-{r}" class="a m start" x="460" y="144">owner C1</text>
+    <text id="own1b-{r}" class="a m start" x="576" y="144">owner C1</text>
+    <text id="acked-{r}" class="a ok" x="555" y="144">✓ acked by C1</text>
+
+    <!-- C1: alive, idle, sweeping -->
+    <circle class="sub" cx="712" cy="40" r="6"/>
+    <path class="sig" d="M718 40H774" marker-end="url(#arr-sig)"/>
+    <text class="m" x="745" y="29" style="fill: var(--pink)">wake</text>
+    <path class="edge" d="M700 68H774" marker-end="url(#arr)"/>
+    <text class="m" x="738" y="80">pop</text>
+    <rect class="box wk" x="776" y="30" width="160" height="68" rx="8"/>
+    <rect id="c1glow-{r}" class="a glow" x="776" y="30" width="160" height="68" rx="8"/>
+    <text class="t" x="856" y="50">C1</text>
+    <text class="m" x="856" y="68">concurrency 2</text>
+    <rect class="track" x="808" y="82" width="96" height="4" rx="2"/>
+    <rect id="c1bar-{r}" class="a lin bar" x="808" y="82" width="96" height="4" rx="2"/>
+    <rect class="box swp" x="776" y="110" width="160" height="28" rx="8"/>
+    <text class="m" x="856" y="124">sweep · every 1 s</text>
+    <rect id="c1ring-{r}" class="a ring" x="776" y="110" width="160" height="28" rx="8"/>
+    <path class="sw-edge" d="M776 124H723" marker-end="url(#arr-sw)"/>
+
+    <!--ROW-ELEMENTS-->
+
+    <!-- moving parts -->
+    <g id="j1-{r}" class="a"><rect class="item" x="0" y="0" width="30" height="30" rx="5"/><text class="itxt" x="15" y="15">J1</text></g>
+    <g id="j2-{r}" class="a"><rect class="item" x="0" y="0" width="30" height="30" rx="5"/><text class="itxt" x="15" y="15">J2</text></g>
+    <circle id="wk-{r}" class="a lin pk" cx="0" cy="0" r="5"/>
+    <circle id="g1-{r}" class="a lin dot" cx="0" cy="0" r="7"/>
+    <circle id="g2-{r}" class="a lin dot" cx="0" cy="0" r="7"/>
+  </g>
+<!--/ROW-->
+</svg>

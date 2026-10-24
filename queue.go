@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -33,14 +34,21 @@ type Queue struct {
 	popRun            atomic.Int64                // items batch pops took since the queue was last seen empty
 	isPriority        bool                        // a zset queue, with :prio entries to clear on ack; set before any goroutine starts
 	dedupWindow       atomic.Int64                // time.Duration EnqueueOnce remembers an id for
+	heartbeatTimeout  atomic.Int64                // time.Duration (see SetHeartbeatTimeout)
+	beating           atomic.Bool                 // a pop set this queue's heartbeat since a lapse was last logged
+	tickScript        *redis.Script               // the sweep for this storage (see tickBody)
+	releaseScript     *redis.Script               // what Close runs to requeue this queue's items (see releaseBody)
+	storageKeys       []string                    // keys both take after the deadlines: :seq and :prio for a zset
+	closeOnce         sync.Once
 }
 
 func newQueue(c *redis.Client, queueKey string) *Queue {
 	q := newQueueBase(c, queueKey)
+	q.tickScript, q.releaseScript = listTick, listRelease
 
 	// requeue nacked items
 	q.RequeueNackedItems()
-	go q.sweep(func() (int64, error) { return q.requeue(listRequeue) })
+	go q.sweep()
 
 	return q
 }
@@ -56,6 +64,7 @@ func newQueueBase(c *redis.Client, queueKey string) *Queue {
 	}
 	q.visibilityTimeout.Store(int64(5 * time.Minute))
 	q.dedupWindow.Store(int64(5 * time.Minute))
+	q.heartbeatTimeout.Store(int64(30 * time.Second))
 	q.popLen.Store(maxPop)
 	return q
 }
@@ -97,6 +106,37 @@ func (q *Queue) SetAckTimeout(ackTimeout time.Duration) {
 // This controls how long a job remains invisible in the nacked queue before being candidates for requeuing
 func (q *Queue) SetVisibilityTimeout(d time.Duration) {
 	q.visibilityTimeout.Store(int64(d))
+}
+
+// minHeartbeat is the shortest heartbeat timeout SetHeartbeatTimeout takes:
+// a few sweeps, so one slow call doesn't make a live queue look dead.
+const minHeartbeat = 5 * time.Second
+
+// SetHeartbeatTimeout sets how long this queue may go without reaching Redis
+// before other processes on the key take it for dead and requeue the items it
+// dequeued and has not acknowledged (default 30s, at least 5s). Each pop that
+// hands out items and each sweep, once a second, renew the heartbeat, so it
+// runs out only when the process dies, freezes or loses Redis. Unlike the
+// visibility timeout it doesn't limit how long a job may run: a job that takes
+// longer than the visibility timeout still comes back, heartbeat or not.
+//
+// Set it above the longest freeze or network cut you want to ride out: a job
+// still running when its queue's heartbeat runs out runs again elsewhere, and
+// its later Acknowledge still reports success. A stall of Redis itself, such
+// as a failover, doesn't count. A distributed queue whose process exits is
+// taken for dead sooner, about 5s after Redis drops its pub/sub connection.
+// 0 or less turns both off, so this queue's items wait for the visibility
+// timeout.
+func (q *Queue) SetHeartbeatTimeout(d time.Duration) {
+	if d > 0 {
+		d = max(d, minHeartbeat)
+	}
+	q.heartbeatTimeout.Store(int64(d))
+}
+
+// hbt is the heartbeat timeout in seconds, as the scripts take it (0: none).
+func (q *Queue) hbt() float64 {
+	return max(0, time.Duration(q.heartbeatTimeout.Load()).Seconds())
 }
 
 // Dequeue removes and returns an item from the queue without acknowledgment
@@ -322,10 +362,11 @@ const maxPop = 1000
 // popHead and popTail wrap the storage-specific part of the ack pop scripts,
 // which leaves the popped items, as stored, in `items`.
 //
-// KEYS: queue, pending hash, deadlines, idle set [, priorities].
+// KEYS: queue, pending hash, deadlines, idle set [, priorities], heartbeats.
 // ARGV: want, visibility timeout (seconds; 0: none), ack ID
 // prefix, reservation (20-digit start), consumer ID (” if the caller is not
-// a distributed consumer), the caller's free slots.
+// a distributed consumer), the caller's free slots, heartbeat timeout
+// (seconds; 0: none), the ack ID prefix again (see beatFn).
 //
 // Item i is pending under "<prefix>:<reservation>:<i as 4 digits>". IDs are
 // built from strings, so no number goes through Lua arithmetic, and they sort
@@ -344,7 +385,7 @@ const maxPop = 1000
 // slots makes a distributed consumer join the idle set, in the same step, so
 // an enqueue right after it wakes it. A hand-back counts too: a reused
 // reservation can be smaller than the call.
-const popHead = deadlineFn + `local want, pre, resv = tonumber(ARGV[1]), ARGV[3], ARGV[4]
+const popHead = deadlineFn + beatFn + `local want, pre, resv = tonumber(ARGV[1]), ARGV[3], ARGV[4]
 local dl = deadline(ARGV[2])
 local function reply(items)
 	local len = redis.call(__LEN__, KEYS[1])
@@ -365,6 +406,7 @@ for i = 1, want do
 				if not d or tonumber(d) < dl then redis.call('ZADD', KEYS[3], dl, ids[j]) end
 			end
 		end
+		if #items > 0 then beat() end
 		return reply(items)
 	end
 end
@@ -381,6 +423,7 @@ if n > 0 then
 	end
 	redis.call('HSET', KEYS[2], unpack(h))
 	if dl > 0 then redis.call('ZADD', KEYS[3], unpack(z)) end
+	beat()
 end
 return reply(items)`
 
@@ -416,14 +459,15 @@ if #items > 0 then redis.call('HSET', KEYS[5], unpack(p)) end`)
 // before batches.
 //
 // ARGV: visibility timeout (seconds; 0: none), ack ID, consumer ID (” if
-// the caller is not a distributed consumer).
-const popOneHead = deadlineFn + `local dl = deadline(ARGV[1])
+// the caller is not a distributed consumer), heartbeat timeout, ack ID prefix.
+const popOneHead = deadlineFn + beatFn + `local dl = deadline(ARGV[1])
 local held = redis.call('HGET', KEYS[2], ARGV[2])
 if held then
 	if dl > 0 then
 		local d = redis.call('ZSCORE', KEYS[3], ARGV[2])
 		if not d or tonumber(d) < dl then redis.call('ZADD', KEYS[3], dl, ARGV[2]) end
 	end
+	beat()
 	return held
 end
 `
@@ -435,6 +479,7 @@ if not v then
 end
 redis.call('HSET', KEYS[2], ARGV[2], v)
 if dl > 0 then redis.call('ZADD', KEYS[3], dl, ARGV[2]) end
+beat()
 return v`
 
 // listPopOne and zsetPopOne pop one item into v (nil when empty). The zset
@@ -459,7 +504,8 @@ var (
 // batch scripts' reply ({len, items}) and idle rule (see popHead). It skips
 // building and checking ack IDs for the slots it would not fill.
 //
-// ARGV: visibility timeout, ack ID, consumer ID, the caller's free slots.
+// ARGV: visibility timeout, ack ID, consumer ID, the caller's free slots,
+// heartbeat timeout, ack ID prefix.
 var popOneLenHead = `local function reply(items)
 	local len = redis.call(__LEN__, KEYS[1])
 	if ARGV[3] ~= '' and len == 0 and #items < tonumber(ARGV[4]) then redis.call('SADD', KEYS[4], ARGV[3]) end
@@ -471,6 +517,7 @@ const popOneLenTail = `
 if not v then return reply({}) end
 redis.call('HSET', KEYS[2], ARGV[2], v)
 if dl > 0 then redis.call('ZADD', KEYS[3], dl, ARGV[2]) end
+beat()
 return reply({v})`
 
 func popOneLenScript(lenCmd, body string) *redis.Script {
@@ -524,8 +571,8 @@ func (q *Queue) dequeueOne(pop *redis.Script, consumer string, extraKeys ...stri
 
 	r := q.reserve(1, 1)
 	ackID := q.ackIDOf(fmt.Sprintf("%020d", r.start), 1)
-	keys := append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey()}, extraKeys...)
-	v, err := pop.Run(q.ctx, q.client, keys, q.vt(), ackID, consumer).Text()
+	keys := append(append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey()}, extraKeys...), q.getHeartbeatKey())
+	v, err := pop.Run(q.ctx, q.client, keys, q.vt(), ackID, consumer, q.hbt(), q.ackPrefix).Text()
 	if err == redis.Nil {
 		return nil, false, ""
 	}
@@ -536,6 +583,7 @@ func (q *Queue) dequeueOne(pop *redis.Script, consumer string, extraKeys ...stri
 		return nil, false, ""
 	}
 
+	q.beating.Store(q.hbt() > 0)
 	return []byte(v), true, ackID
 }
 
@@ -589,6 +637,19 @@ local function deadline(vt)
 end
 `
 
+// beatFn defines beat() for the pop scripts, after deadlineFn: it sets the
+// heartbeat of owner ARGV[#ARGV] (an ack ID prefix) in ZSET KEYS[#KEYS] to
+// ARGV[#ARGV-1] seconds past Redis's clock, unless that is 0. A pop that
+// hands out items beats in the same step, so a pop that runs late, such as a
+// re-send that lands after Close or after another process took the owner for
+// dead, beats again, and its items come back one heartbeat timeout later
+// instead of after the visibility timeout.
+const beatFn = `local function beat()
+	local h = deadline(ARGV[#ARGV - 1])
+	if h > 0 then redis.call('ZADD', KEYS[#KEYS], h, ARGV[#ARGV]) end
+end
+`
+
 // dequeueBatch runs pop for up to len(items) items, marking them pending in
 // the same step (see popHead), or popOne when it takes one item. It sizes the
 // pop by popLen: the length the last call left, or after the queue emptied,
@@ -609,13 +670,13 @@ func (q *Queue) dequeueBatch(pop, popOne *redis.Script, items []any, ackIDs []st
 
 	r := q.reserve(limit, min(limit, max(1, int(q.popLen.Load()))))
 	resv := fmt.Sprintf("%020d", r.start)
-	keys := append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey()}, extraKeys...)
+	keys := append(append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey()}, extraKeys...), q.getHeartbeatKey())
 	var reply []any
 	var err error
 	if r.want == 1 {
-		reply, err = popOne.Run(q.ctx, q.client, keys, q.vt(), q.ackIDOf(resv, 1), consumer, slots).Slice()
+		reply, err = popOne.Run(q.ctx, q.client, keys, q.vt(), q.ackIDOf(resv, 1), consumer, slots, q.hbt(), q.ackPrefix).Slice()
 	} else {
-		reply, err = pop.Run(q.ctx, q.client, keys, r.want, q.vt(), q.ackPrefix, resv, consumer, slots).Slice()
+		reply, err = pop.Run(q.ctx, q.client, keys, r.want, q.vt(), q.ackPrefix, resv, consumer, slots, q.hbt(), q.ackPrefix).Slice()
 	}
 	if err != nil {
 		q.retryPop.CompareAndSwap(nil, r)
@@ -623,6 +684,9 @@ func (q *Queue) dequeueBatch(pop, popOne *redis.Script, items []any, ackIDs []st
 	}
 
 	popped := reply[1].([]any)
+	if len(popped) > 0 {
+		q.beating.Store(q.hbt() > 0)
+	}
 	for i, v := range popped {
 		items[i] = []byte(v.(string))
 		ackIDs[i] = q.ackIDOf(resv, i+1)
@@ -672,6 +736,136 @@ return n`
 // listRequeue pushes requeued items to the front, ahead of newer work.
 var listRequeue = redis.NewScript(requeueLoop + `redis.call('LPUSH', KEYS[1], v)` + requeueEnd)
 
+// The sweep and release scripts take the queue, pending hash, deadlines and
+// storageKeys, then the heartbeats ZSET (member: ack ID prefix, score: Unix
+// seconds it runs out at), for the sweep its clock, and the presence ZSET
+// (see tickBody). repush(v, id) puts item v, pending as id, back at the front
+// of the queue, and moveFn's move(id) pushes before it drops the item from
+// pending, so a push that fails loses nothing. move returns 1, or 0 when id is no longer pending (its deadline,
+// if left behind, still goes).
+const (
+	listRepush = `local function repush(v, id) redis.call('LPUSH', KEYS[1], v) end
+`
+	moveFn = `local function move(id)
+	local v = redis.call('HGET', KEYS[2], id)
+	if v then
+		repush(v, id)
+		redis.call('HDEL', KEYS[2], id)
+	end
+	redis.call('ZREM', KEYS[3], id)
+	return v and 1 or 0
+end
+`
+)
+
+// tickBody is the sweep. It requeues pending items whose visibility deadline
+// is past Redis's clock, renews heartbeat ARGV[1] by ARGV[2] seconds (drops
+// it when that is 0; only a pop adds one), and requeues the items of owners
+// whose heartbeat ran out or who are gone (below). ARGV[3] is the longest
+// gap, in seconds, between sweeps that counts as normal. It returns {items
+// moved, 1 if ARGV[1]'s heartbeat was missing or had run out, else 0}.
+//
+// The clock is when any process last swept. A longer gap means Redis, or
+// every process, stalled: a failover, a restart, a pause. No one could beat
+// then, so the heartbeats move on by the gap first, and a stall doesn't make
+// every consumer look dead. With no clock yet, no owner is taken for dead.
+//
+// Presence: a distributed queue's wake channel is ARGV[4] .. its ack ID
+// prefix (see Notification), and Redis drops its subscription within
+// milliseconds of the process exiting. The sweep that moves the clock on
+// counts the subscribers of every owner with a live heartbeat and keeps the
+// result in the presence ZSET: 0 once it has seen one, else when it first
+// saw none. An owner seen subscribed and then without one for ARGV[5]
+// seconds is gone. Its own sweep sets it back to 0, so a process that still
+// sweeps is never taken for gone, whatever its connection does. Owners never
+// seen subscribed (plain queues) are left to their heartbeat, and so is a
+// lost host, whose subscription Redis keeps until TCP keepalive drops it.
+// ponytail: a dead owner, like a Close (releaseBody), costs a read of every
+// pending ID (HKEYS); index pending items by owner if pending runs to millions.
+// The presence count covers 1000 owners per sweep; the rest keep heartbeats.
+const tickBody = `local hb, clock, pres = KEYS[#KEYS - 2], KEYS[#KEYS - 1], KEYS[#KEYS]
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1e6
+local last = tonumber(redis.call('GET', clock))
+if last and now - last > tonumber(ARGV[3]) then
+	for _, m in ipairs(redis.call('ZRANGE', hb, 0, -1)) do redis.call('ZINCRBY', hb, now - last, m) end
+	for _, m in ipairs(redis.call('ZRANGEBYSCORE', pres, '(0', '+inf')) do redis.call('ZINCRBY', pres, now - last, m) end
+end
+local ticked = not last or now - last >= 0.5 or now < last
+if ticked then redis.call('SET', clock, now) end
+local own = tonumber(redis.call('ZSCORE', hb, ARGV[1]))
+if own then
+	if tonumber(ARGV[2]) > 0 then
+		redis.call('ZADD', hb, now + tonumber(ARGV[2]), ARGV[1])
+		redis.call('ZADD', pres, 'XX', 0, ARGV[1])
+	else
+		redis.call('ZREM', hb, ARGV[1])
+		redis.call('ZREM', pres, ARGV[1])
+	end
+end
+local n = 0
+for _, id in ipairs(redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', now)) do n = n + move(id) end
+if last then
+	local dead, ids = {}, {}
+	for _, m in ipairs(redis.call('ZRANGEBYSCORE', hb, '-inf', now, 'LIMIT', 0, 100)) do dead[m] = true end
+	if ticked then
+		local live, chans = redis.call('ZRANGEBYSCORE', hb, now, '+inf', 'LIMIT', 0, 1000), {}
+		for i, m in ipairs(live) do chans[i] = ARGV[4] .. m end
+		local subs = #live > 0 and redis.call('PUBSUB', 'NUMSUB', unpack(chans)) or {}
+		for i, m in ipairs(live) do
+			local s = tonumber(redis.call('ZSCORE', pres, m))
+			if subs[2 * i] > 0 then
+				if s ~= 0 then redis.call('ZADD', pres, 0, m) end
+			elseif s == 0 then redis.call('ZADD', pres, now, m)
+			elseif s and now - s >= tonumber(ARGV[5]) then dead[m] = true end
+		end
+	end
+	if next(dead) then
+		for _, id in ipairs(redis.call('HKEYS', KEYS[2])) do
+			if dead[string.match(id, '^(.-):') or ''] then ids[#ids + 1] = id end
+		end
+		table.sort(ids)
+		for _, id in ipairs(ids) do n = n + move(id) end
+		for m in pairs(dead) do
+			redis.call('ZREM', hb, m)
+			redis.call('ZREM', pres, m)
+		end
+	end
+end
+if own and own >= now then return {n, 0} end
+return {n, 1}`
+
+// releaseBody requeues every pending item of owner ARGV[1], taking them in
+// pop order, and then drops its heartbeat and presence.
+const releaseBody = `local p, ids = ARGV[1] .. ':', {}
+for _, id in ipairs(redis.call('HKEYS', KEYS[2])) do
+	if string.sub(id, 1, #p) == p then ids[#ids + 1] = id end
+end
+table.sort(ids)
+local n = 0
+for _, id in ipairs(ids) do n = n + move(id) end
+redis.call('ZREM', KEYS[#KEYS - 1], ARGV[1])
+redis.call('ZREM', KEYS[#KEYS], ARGV[1])
+return n`
+
+// heartbeatScripts builds the sweep and release scripts for a storage's repush.
+func heartbeatScripts(repush string) (tick, release *redis.Script) {
+	head := "redis.replicate_commands()\n" + repush + moveFn
+	return redis.NewScript(head + tickBody), redis.NewScript(head + releaseBody)
+}
+
+var listTick, listRelease = heartbeatScripts(listRepush)
+
+// sweepGap is the longest gap between two sweeps of a key that the sweep
+// script takes as normal (see tickBody): above a sweep's one second plus a
+// slow call, below minHeartbeat.
+const sweepGap = 2 * time.Second
+
+// presenceGrace is how long a distributed queue may go without a subscriber
+// on its wake channel and without a sweep of its own before other processes
+// take it for gone (see tickBody): well above a go-redis pub/sub reconnect.
+const presenceGrace = 5 * time.Second
+
 // RequeueNackedItems returns un-acknowledged items whose visibility timeout
 // has passed (every pending item when it is 0) to the queue.
 func (q *Queue) RequeueNackedItems() error {
@@ -679,13 +873,15 @@ func (q *Queue) RequeueNackedItems() error {
 	return err
 }
 
-// sweep runs requeue every second until Close, and calls onRequeue after it
-// moves any item. Without it an item whose consumer died stayed pending until
-// the next process start. It skips a zero visibility timeout, where requeue
-// takes every pending item, including ones still being processed.
+// sweep runs the sweep script (see tickBody) every second until Close, and
+// calls onRequeue after it moves any item. Without it an item whose consumer
+// died stayed pending until the next process start. It requeues only items
+// past their deadline or held by a dead owner, never every pending item as
+// RequeueNackedItems does with no visibility timeout, so it runs whatever
+// this queue's timeouts.
 // ponytail: one script call per queue per second; tie the tick to the
-// visibility timeout if that load ever shows up.
-func (q *Queue) sweep(requeue func() (int64, error)) {
+// timeouts if that load ever shows up.
+func (q *Queue) sweep() {
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 
@@ -696,21 +892,39 @@ func (q *Queue) sweep(requeue func() (int64, error)) {
 		case <-tick.C:
 		}
 
-		if q.getVisibilityTimeout() <= 0 {
-			continue
-		}
-
-		n, err := requeue()
+		keys := append(q.requeueKeys(), q.getHeartbeatKey(), q.getHeartbeatKey()+":clock", q.getPresenceKey())
+		wakePrefix := q.queueKey + ":wake:" // as Notification names the channels
+		r, err := q.tickScript.Run(q.ctx, q.client, keys, q.ackPrefix, q.hbt(), sweepGap.Seconds(), wakePrefix, presenceGrace.Seconds()).Int64Slice()
 		if errors.Is(err, redis.ErrClosed) {
 			return // the client was closed without closing this queue
 		}
-
-		if n > 0 {
-			if onRequeue := q.onRequeue.Load(); onRequeue != nil {
-				(*onRequeue)(n)
+		if err != nil {
+			if q.ctx.Err() == nil {
+				log.Printf("Error requeueing pending items: %v", err)
 			}
+			continue
+		}
+
+		if r[1] == 1 && q.hbt() > 0 && q.beating.CompareAndSwap(true, false) {
+			log.Printf("queue %s: taken for dead (heartbeat ran out, or pub/sub connection and sweep gone); its unacknowledged items may have been requeued to other consumers", q.queueKey)
+		}
+
+		q.requeued(r[0])
+	}
+}
+
+// requeued calls onRequeue after n items went back to the queue.
+func (q *Queue) requeued(n int64) {
+	if n > 0 {
+		if onRequeue := q.onRequeue.Load(); onRequeue != nil {
+			(*onRequeue)(n)
 		}
 	}
+}
+
+// requeueKeys are the keys the sweep and release scripts start with.
+func (q *Queue) requeueKeys() []string {
+	return append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey()}, q.storageKeys...)
 }
 
 // setOnRequeue sets the callback the sweeper runs after requeueing items.
@@ -763,8 +977,50 @@ func (q *Queue) getTimeoutKey() string {
 	return q.queueKey + ":timeouts"
 }
 
+// getHeartbeatKey returns the Redis key for the heartbeats of the queues
+// holding pending items
+func (q *Queue) getHeartbeatKey() string {
+	return q.queueKey + ":heartbeats"
+}
+
+// getPresenceKey returns the Redis key for whether the owners of pending
+// items are still subscribed to their wake channel (see tickBody)
+func (q *Queue) getPresenceKey() string {
+	return q.queueKey + ":presence"
+}
+
+// Close stops the queue and requeues the items it dequeued and has not
+// acknowledged, at once, as a broker requeues a closed channel's deliveries:
+// an Acknowledge after Close fails anyway. Stop or drain the workers first,
+// or jobs still running here run again elsewhere.
 func (q *Queue) Close() error {
-	q.cancel() // Cancel context to stop notification listener
+	var err error
+	q.closeOnce.Do(func() {
+		q.cancel() // Cancel context to stop notification listener
+		err = q.release()
+	})
+	return err
+}
+
+// release requeues this queue's pending items and drops its heartbeat. A pop
+// that Redis runs after it beats again (see beatFn), and its items come back
+// one heartbeat timeout later.
+func (q *Queue) release() error {
+	if q.releaseScript == nil || q.ackSeq.Load() == 0 {
+		return nil // nothing was ever popped
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	n, err := q.releaseScript.Run(ctx, q.client, append(q.requeueKeys(), q.getHeartbeatKey(), q.getPresenceKey()), q.ackPrefix).Int64()
+	if errors.Is(err, redis.ErrClosed) {
+		return nil // the client is gone: the heartbeat runs out instead
+	}
+	if err != nil {
+		return fmt.Errorf("error requeueing unacknowledged items: %w", err)
+	}
+
+	q.requeued(n)
 	return nil
 }
 

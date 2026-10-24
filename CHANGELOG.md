@@ -7,7 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Heartbeats: a consumer that dies or loses Redis has its unacknowledged
+  items requeued, and idle consumers woken, once its heartbeat timeout runs
+  out (30s by default) instead of after the visibility timeout
+  - `SetHeartbeatTimeout` - how long a queue object may go without reaching
+    Redis before other processes requeue its items (at least 5s; 0 or less
+    turns it off)
+  - A pop renews the heartbeat in the same step, and the sweep every second.
+    Producers never get one, and items of older versions or tracked with
+    `PrepareForFutureAck` still wait for the visibility timeout
+  - A stall of Redis itself (failover, restart, pause) doesn't make live
+    consumers look dead: heartbeats move on by the gap between sweeps
+  - New keys `<key>:heartbeats` and `<key>:heartbeats:clock`
+- Presence: a distributed consumer whose process exits has its items
+  requeued about 5s after Redis drops its pub/sub subscription, without
+  waiting for the heartbeat
+  - A distributed queue's wake channel is now named after its ack ID prefix
+  - Counts as gone only with no subscriber and no sweep of its own for 5s, so
+    a go-redis reconnect or a lone dropped pub/sub connection doesn't count.
+    A lost host, whose socket Redis keeps, still waits for the heartbeat
+  - New key `<key>:presence`
+
 ### Changed
+
+- `Close` requeues the items the queue object dequeued and has not
+  acknowledged at once, and a distributed queue wakes another consumer for
+  them. Stop or drain workers before `Close`, or jobs still running run again
+  elsewhere. `Close` can now return an error from that requeue
+- The sweep requeues items whose visibility deadline passed even on a queue
+  object whose own visibility timeout is 0, and pushes an item back before
+  removing it from pending
+- The varmq consumer example stops its worker and closes the queue on
+  SIGINT/SIGTERM
+- A distributed consumer busy with work it popped no longer rejoins the idle
+  set within a second of the queue emptying, so an enqueue wakes a free
+  consumer at once instead of the busy one, which ignored the wake while the
+  free one waited up to a second for its nudge. A consumer is idle again once
+  its own `Len()` or dequeue finds the queue empty, so one that takes a
+  single item per wake and never looks again is now only nudged
 
 - Upgraded go-redis from v9.7.3 to v9.23.0, which requires Go 1.26
 - `New` keeps go-redis 9.7's client timings (3s read and write timeouts, 512ms

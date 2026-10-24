@@ -21,7 +21,7 @@ func newTestNotification(t *testing.T, consumer bool) (*Notification, chan strin
 	require.NoError(t, err)
 
 	client := redis.NewClient(opts)
-	n := newNotification(client, testWakeKey, "LLEN")
+	n := newNotification(client, testWakeKey, "LLEN", newID())
 	got := make(chan string, 10)
 	if consumer {
 		n.Subscribe(func(action string) { got <- action })

@@ -50,7 +50,7 @@ func delKeys(t *testing.T, c *redis.Client, key string) {
 	ctx := context.Background()
 	dedup, err := c.Keys(ctx, key+":dedup:*").Result()
 	require.NoError(t, err)
-	require.NoError(t, c.Del(ctx, append([]string{key, key + ":nacked", key + ":timeouts", key + ":prio", key + ":seq", key + ":idle"}, dedup...)...).Err())
+	require.NoError(t, c.Del(ctx, append([]string{key, key + ":nacked", key + ":timeouts", key + ":prio", key + ":seq", key + ":idle", key + ":heartbeats", key + ":heartbeats:clock", key + ":presence"}, dedup...)...).Err())
 }
 
 func TestDequeueBatchList(t *testing.T) {
@@ -393,8 +393,8 @@ func TestDequeueBatchLateDuplicateAfterPartialAck(t *testing.T) {
 			require.Equal(t, []string{"x1", "x2", "x3"}, items)
 			require.True(t, q.Acknowledge(ids[0]))
 
-			keys := []string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey(), q.getPriorityKey()}
-			require.NoError(t, c.pop.Run(ctx, q.client, keys, 3, 60, q.ackPrefix, resv, "", 3).Err())
+			keys := []string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey(), q.getPriorityKey(), q.getHeartbeatKey()}
+			require.NoError(t, c.pop.Run(ctx, q.client, keys, 3, 60, q.ackPrefix, resv, "", 3, 0, q.ackPrefix).Err())
 
 			pending, err := q.client.HMGet(ctx, q.getNackedItemKey(), ids[1], ids[2]).Result()
 			require.NoError(t, err)
@@ -840,7 +840,7 @@ func TestDequeueBatchLeanScriptRules(t *testing.T) {
 			defer cleanup()
 			delKeys(t, q.client, q.queueKey)
 			defer delKeys(t, q.client, q.queueKey)
-			keys := []string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey(), q.getPriorityKey()}
+			keys := []string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey(), q.getPriorityKey(), q.getHeartbeatKey()}
 			const cons = "synthetic-consumer"
 			member := func() bool {
 				ok, err := q.client.SIsMember(ctx, q.getIdleKey(), cons).Result()
@@ -854,7 +854,7 @@ func TestDequeueBatchLeanScriptRules(t *testing.T) {
 					resv++
 					id = q.ackIDOf(fmt.Sprintf("%020d", resv), 1)
 				}
-				r, err := c.popOneLen.Run(ctx, q.client, keys, 60, id, consumer, slots).Slice()
+				r, err := c.popOneLen.Run(ctx, q.client, keys, 60, id, consumer, slots, 0, q.ackPrefix).Slice()
 				require.NoError(t, err)
 				return r[0].(int64), r[1].([]any)
 			}

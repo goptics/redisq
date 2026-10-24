@@ -13,44 +13,40 @@
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square" alt="License" /></a>
   </p>
 
-  <p><strong>Redis-backed FIFO and priority queues for Go, with acknowledgments, batch pops and distributed consumers.</strong></p>
-
   <p align="center">
-    <a href="#-features">Features</a> ·
+    <a href="#features">Features</a> ·
     <a href="#quick-start">Quick Start</a> ·
-    <a href="#queue-types">Queue Types</a> ·
-    <a href="#-reliable-processing">Reliable Processing</a> ·
+    <a href="#usage">Usage</a> ·
     <a href="#how-it-works">How It Works</a> ·
+    <a href="#trade-offs">Trade-offs</a> ·
     <a href="#delivery-guarantees">Delivery Guarantees</a> ·
-    <a href="#api-reference">API Reference</a> ·
-    <a href="#contributing">Contributing</a>
+    <a href="#development">Development</a>
+  </p>
+
+  <p>
+    Redis-backed FIFO and priority queues for Go, with acknowledgments, batch pops, consumers that hand unacknowledged jobs back when they close or die, and distributed variants that wake idle consumers.
   </p>
 </div>
 
----
+## Features
 
-## ✨ Features
-
-- **FIFO and priority queues** on plain Redis lists and sorted sets; lower priority number is served first.
-- **Distributed variants** that wake only idle consumers, one per waiting item, in the same round trip as the enqueue.
-- **Acknowledgments with a visibility timeout**: unacknowledged items return to the queue, with deadlines taken from Redis's clock.
-- **Batch dequeue**: up to 1000 items per round trip, each under its own ack ID, sized to recent traffic.
-- **Deduplicated enqueue**: `EnqueueOnce` stores a job once per id, even across retries.
-- **Queue TTL**: optional key expiration, refreshed on every enqueue.
+- **FIFO and priority queues** on Redis lists and sorted sets; lower priority number is served first.
+- **Distributed variants** that wake idle consumers, up to one per waiting job.
+- **Acknowledgments** with a [visibility timeout](#acknowledgments-and-the-visibility-timeout) on Redis's clock.
+- **Fast handover**: a consumer that [closes](#when-a-consumer-closes) hands its unacknowledged jobs back at once; a distributed one that [dies](#when-a-consumer-dies), in about 6 s; any other silent one, after a 30 s heartbeat.
+- **Batch dequeue** of up to 1000 items per round trip, each under its own ack ID.
+- **Deduplicated enqueue**: `EnqueueOnce` stores a job once per id within a dedup window.
+- **Queue TTL**, refreshed on every enqueue.
 - **Thread-safe**: share one queue object across goroutines.
-- **Persistence adapter for [varmq](https://github.com/goptics/varmq)**.
+- **Storage for [varmq](https://github.com/goptics/varmq)** persistent and distributed queues.
 
 ## Quick Start
-
-### Installation
 
 ```bash
 go get github.com/goptics/redisq
 ```
 
 Requires Go 1.26+ and Redis 6.0+.
-
-### Basic Usage
 
 ```go
 package main
@@ -76,7 +72,9 @@ func main() {
 }
 ```
 
-## Queue Types
+## Usage
+
+### Queue types
 
 | Type                       | Constructor                           | Order        | Wakes idle consumers |
 | -------------------------- | ------------------------------------- | ------------ | :------------------: |
@@ -85,37 +83,23 @@ func main() {
 | `DistributedQueue`         | `qs.NewDistributedQueue(key)`         | FIFO         |          ✅          |
 | `DistributedPriorityQueue` | `qs.NewDistributedPriorityQueue(key)` | Lowest first |          ✅          |
 
-Every type supports `DequeueWithAckId`, `DequeueBatchWithAckIds`, `Acknowledge` and the rest of the [reliable processing](#-reliable-processing) API.
-
-### Simple Queue
+All types support the acknowledgment, dedup and batch APIs below.
 
 ```go
 queue := qs.NewQueue("my-queue")
-
 queue.SetExpiration(time.Hour) // optional TTL on the queue key
-
-queue.Enqueue("test message")
-queue.Enqueue([]byte("binary data"))
-
-length := queue.Len()
-values := queue.Values()
+queue.Enqueue("message")
+queue.Len()
+queue.Values()
 queue.Purge()
-```
 
-### Priority Queue
-
-```go
 pq := qs.NewPriorityQueue("priority-queue")
-
-// Lower number = higher priority
-pq.Enqueue("low priority", 3)
-pq.Enqueue("high priority", 1)
-pq.Enqueue("medium priority", 2)
-
-data, ok := pq.Dequeue() // "high priority"
+pq.Enqueue("low", 3)
+pq.Enqueue("high", 1)
+data, ok := pq.Dequeue() // "high"
 ```
 
-### Distributed Queue
+### Distributed queue
 
 ```go
 dq := qs.NewDistributedQueue("distributed-queue")
@@ -123,68 +107,38 @@ defer dq.Close()
 
 // Subscribing makes this instance a consumer that can be woken
 dq.Subscribe(func(action string) {
-	fmt.Printf("Action: %s\n", action) // "enqueued"
+	fmt.Println(action) // "enqueued"
 })
 
-// Wakes one idle consumer, if any
-dq.Enqueue("test message")
-
-data, ok := dq.Dequeue()
+dq.Enqueue("message") // wakes an idle consumer, if any
 ```
-
-### Distributed Priority Queue
-
-```go
-dpq := qs.NewDistributedPriorityQueue("distributed-priority-queue")
-defer dpq.Close()
-
-dpq.Subscribe(func(action string) {
-	fmt.Printf("Action: %s\n", action) // "enqueued"
-})
-
-dpq.Enqueue("important message", 1)
-
-data, ok := dpq.Dequeue()
-```
-
-See [How consumers are woken](#how-consumers-are-woken) for the wake protocol.
-
-## 💡 Reliable Processing
 
 ### Acknowledgments
 
 ```go
-queue := qs.NewQueue("ack-queue")
+queue.SetVisibilityTimeout(5 * time.Minute) // default; keep it above your slowest job
+queue.SetHeartbeatTimeout(30 * time.Second) // default; how long a frozen or cut-off process keeps its jobs
 
-// How long a dequeued item stays pending before it can be requeued
-queue.SetVisibilityTimeout(5 * time.Minute)
-
-// The item stays pending under ackID until acknowledged
 item, ok, ackID := queue.DequeueWithAckId()
 if ok {
 	processItem(item)
 	queue.Acknowledge(ackID)
 }
+
+queue.GetNackedItemsCount()   // jobs any consumer of this key took and has not acknowledged
+queue.RequeueNackedItems()    // requeue expired jobs now; with a 0 visibility timeout, every pending job
+queue.PrepareForFutureAck("job-456", item) // track an item under your own ack ID
 ```
 
-Manual control of the pending set:
-
-```go
-// Track an item under your own ID, then acknowledge it after processing
-err := queue.PrepareForFutureAck("job-456", "important job")
-acked := queue.Acknowledge("job-456")
-
-// Requeue every item whose visibility timeout has passed
-err = queue.RequeueNackedItems()
-
-// Count items still waiting for acknowledgment
-pending := queue.GetNackedItemsCount()
-```
+`Close` hands every job the queue object took and did not acknowledge back to the queue at once, so stop or
+drain your workers first (varmq 1.7+: `w.StopAndWait()`; before 1.7, `w.Stop()` waits). Jobs tracked with
+`PrepareForFutureAck` get no heartbeat and `Close` doesn't hand them back: they wait for the visibility timeout.
+See [How It Works](#how-it-works).
 
 ### Enqueue once per job id
 
 ```go
-queue.SetDedupWindow(10 * time.Minute) // default 5 minutes
+queue.SetDedupWindow(10 * time.Minute) // default 5 minutes; ~100 bytes of Redis memory per id
 
 // Stored once per id within the window; a repeat returns true and stores nothing
 queue.EnqueueOnce("send welcome email", "job-0b7e9c2a")
@@ -193,19 +147,15 @@ queue.EnqueueOnce("send welcome email", "job-0b7e9c2a")
 pq.EnqueueOnce("rebuild index", 1, "job-5f1d3e77")
 ```
 
-See [Delivery Guarantees](#delivery-guarantees) for how ids should be chosen.
+An id stays taken for the whole window, even after its job is handled, removed or purged, so producers that reuse
+an id drop each other's jobs.
 
-### Taking several items at once
+### Batch dequeue
 
-`DequeueBatchWithAckIds` takes up to `len(items)` items (at most 1000) in one
-round trip, each pending under its own ack ID, and reports how many are left.
-Size the buffers to the work you can start right away: items taken but not
-started are invisible to other consumers while their visibility timeout runs.
-
-A call sizes itself by the previous batch calls on the same queue object (a
-full batch on its first call): a trickle takes one item per call, cheaply, and
-a burst like the last one is taken in one call. A call can take fewer items
-than the queue holds, so keep calling while `remaining > 0` and you have room.
+Takes up to `len(items)` items (max 1000) in one round trip, sized by recent calls. Keep calling while
+`remaining > 0`, and size the buffers to work you can start now: taken items stay invisible to other consumers
+until they are acknowledged or come back. After a call fails, the next call with at least as many slots gets its
+items back; a smaller call, or a second call failing at the same time, leaves them pending until they come back.
 
 ```go
 items := make([]any, 8)
@@ -223,14 +173,11 @@ for {
 }
 ```
 
-### Using with varmq
+### With varmq
 
 redisq implements varmq's persistent and distributed queue interfaces:
 
 ```go
-qs := redisq.New("redis://localhost:6379")
-defer qs.Close()
-
 rq := qs.NewDistributedPriorityQueue("jobs")
 dq := varmq.NewDistributedPriorityQueue[[]string](rq)
 defer dq.Close()
@@ -238,90 +185,123 @@ defer dq.Close()
 dq.Add([]string{"https://example.com"}, 1)
 ```
 
-A provider/consumer integration example lives in [`examples/varmq`](examples/varmq).
+See [`examples/varmq`](examples/varmq) for a provider/consumer setup.
 
 ## How It Works
 
-### How consumers are woken
+### Acknowledgments and the visibility timeout
 
-A busy consumer keeps pulling on its own, so only idle ones need a signal.
-A consumer that finds the queue empty (`Len()` returns 0, or a dequeue leaves
-it empty while the consumer could take more) joins the idle set `<key>:idle`.
-Each enqueue wakes idle consumers on their own channel `<key>:wake:<id>`, up to
-one per waiting item, so a backlog wakes them all; when every consumer is
-busy, nothing is published. A requeue of `n` expired items wakes up to `n`.
-A consumer that is idle while items wait (for example after a wake reached a
-paused instance) is nudged within a second. There is no `"dequeued"`
-notification.
+`DequeueWithAckId` runs one Redis script: it takes the job from the head of the list, stores it in the pending
+hash `<key>:nacked` and its deadline (Redis time plus the visibility timeout) in `<key>:timeouts`, and returns it.
+`Acknowledge` deletes both. Each queue object sweeps once a second, and a job whose deadline passed goes back to
+the front of the list (a priority queue re-adds it at its priority, behind the jobs already waiting there). A job
+is always in the queue or pending, never only in a client.
 
-### Visibility deadlines
+![redisq acknowledgments and the visibility timeout](./assets/diagrams/redisq-ack.svg)
 
-The visibility timeout counts from when Redis runs the pop, on Redis's clock,
-so a pop that waited in Redis still gets the full timeout. Once every process
-runs this version, clients whose clocks disagree share one deadline (older
-versions stamp and sweep deadlines with their own clocks).
+varmq acknowledges a job even when its handler fails, so with varmq a job comes back this way only when it runs
+past the visibility timeout or its `Acknowledge` fails (Redis unreachable). Keep the timeout above your slowest
+job.
+
+### Waking idle consumers
+
+A distributed consumer that finds the queue empty joins the idle set `<key>:idle`. An enqueue pushes the job and,
+in the same script, wakes up to one idle consumer per waiting job, each on its own pub/sub channel. A consumer
+that took a job stays out of the idle set until its own `Len()` or dequeue finds the queue empty again, so wakes
+go to free consumers; a busy one pulls the next job itself when one finishes (varmq does). Every consumer also
+runs a nudge once a second: with jobs waiting it pulls, and with the queue empty it puts an idle consumer back in
+the idle set, in case a wake was lost.
+
+![redisq waking idle consumers](./assets/diagrams/redisq-wake.svg)
+
+### When a consumer closes
+
+`Close` moves every job the consumer took and did not acknowledge back to the front of the queue in one script;
+a distributed queue first leaves the idle set, then wakes idle consumers for the jobs. The handover takes no
+timer, as when RabbitMQ requeues a closed channel's deliveries. An `Acknowledge` after `Close` fails, so a job still running on the closing
+consumer runs again on the next one: stop or drain workers before `Close`.
+
+![redisq Close hands unacknowledged jobs back](./assets/diagrams/redisq-close.svg)
+
+### When a consumer dies
+
+A consumer killed without `Close` (kill -9, OOM, a crash) can't hand anything back, so the other processes find
+out. Every ack pop that hands out a job sets the queue object's heartbeat in `<key>:heartbeats`, and its sweep
+renews it every second. A distributed consumer is also subscribed to its wake channel, and Redis drops that
+subscription as soon as the process exits. Any process's sweep then requeues the dead consumer's jobs and, on a
+distributed queue, wakes up to one idle consumer per job:
+
+| Consumer 2 holds unacknowledged jobs and…                                       | They are back in the queue after    |
+| ------------------------------------------------------------------------------- | ----------------------------------- |
+| calls `Close` on shutdown (trap SIGINT/SIGTERM, e.g. with `Listen()`)            | at once                             |
+| dies; distributed queue                                                         | about 6 s (no subscriber for 5 s)   |
+| dies; `Queue` or `PriorityQueue`, or a distributed one within ~1 s of its first pop | the heartbeat timeout (30 s) + ~1 s |
+| loses Redis, or its host goes down (Redis keeps the socket)                     | the heartbeat timeout (30 s) + ~1 s |
+| stays alive but a job hangs                                                     | the visibility timeout (5 min)      |
+
+Only a distributed queue wakes a consumer for requeued jobs. On a `Queue` or `PriorityQueue` they wait for a
+consumer's next pop; varmq's persistent queues pull only after a local `Add`, a start or a finished job.
+
+![redisq detecting a dead consumer](./assets/diagrams/redisq-dead.svg)
+
+## Trade-offs
+
+- **At least once, not exactly once.** A job runs again when its consumer dies mid-job, when it outlives its
+  visibility timeout, when its process goes without Redis for longer than the heartbeat timeout, when its
+  `Acknowledge` fails, or when its consumer closes before it finishes. A late `Acknowledge` after a timeout still
+  returns `true`. Make handlers idempotent.
+- **Timeouts trade speed for false alarms.** A shorter heartbeat timeout (at least 5 s) recovers a lost host
+  sooner, but a process frozen or cut off from Redis for longer loses its running jobs to other consumers. A
+  stall of Redis itself (failover, restart, pause) does not count: when no process could sweep, every heartbeat
+  moves on by the gap. Visibility deadlines don't: keep the visibility timeout above your slowest job and the
+  client's re-send window (about 4 minutes).
+- **Wakes are best-effort.** A wake can be lost in a pub/sub reconnect, or reach a consumer that can't take the
+  job (paused, or marked idle by a `Len()` call from elsewhere while busy); the once-a-second nudge bounds the
+  delay to about a second, at the cost of one Redis script per consumer per second. A consumer that stops pulling
+  before the queue is empty isn't woken again, only nudged.
+- **No retry limit or dead-letter queue.** A job that crashes every consumer that takes it keeps coming back
+  after each crash: about 6 s later on a distributed queue, 31 s otherwise.
+- **Cost.** Every queue object, producers included, runs one sweep script a second; about once a second per key
+  it also counts subscribers (`PUBSUB NUMSUB`) for the consumers holding jobs. Each pop that hands out jobs also
+  writes the heartbeat. A dead consumer or a `Close` reads every pending ack ID once.
+- **One Redis server.** `New` uses a single-node client; Redis Cluster isn't supported.
 
 ## Delivery Guarantees
 
-go-redis re-sends a command whose reply was lost (a read timeout or a dropped
-connection), up to 3 times by default. What that means per call:
+go-redis re-sends a command whose reply was lost, so:
 
-| Call                                            | Guarantee     | On a lost reply                                    |
-| ----------------------------------------------- | ------------- | -------------------------------------------------- |
-| `DequeueWithAckId`, `DequeueBatchWithAckIds`    | At least once | Items come back on retry or on the next call       |
-| `Enqueue`                                       | At least once | May store the job twice; `false` is not proof      |
-| `EnqueueOnce`                                   | Once per id   | Stored once within the dedupe window               |
-| `Dequeue`                                       | At most once  | Item is gone                                       |
-| `Remove`                                        | –             | May remove a second identical item                 |
+| Call                                         | Guarantee     | On a lost reply                                                    |
+| -------------------------------------------- | ------------- | ------------------------------------------------------------------ |
+| `DequeueWithAckId`, `DequeueBatchWithAckIds` | At least once | Items come back on retry, the next call, or after a timeout        |
+| `Enqueue`                                    | At least once | May store the job twice; `false` is not proof                      |
+| `EnqueueOnce`                                | Once per id   | Stored once within the dedup window                                |
+| `Dequeue`                                    | At most once  | Item is gone                                                       |
+| `Remove`                                     | –             | May remove a second identical item                                 |
 
-- **`DequeueWithAckId`** and **`DequeueBatchWithAckIds`** are safe: a re-sent
-  pop hands back the items the first attempt took, and after a call that
-  failed outright, the next call of at least its size returns those items (a
-  smaller call leaves them for a later one). Only one failed call is kept at
-  a time: if two fail together, the other's items stay pending until they
-  are requeued. Delivery is at least once.
-- **`Enqueue`** can store a job twice, and returning `false` after a network
-  error does not prove the job was not stored. Use `EnqueueOnce` with a job
-  id where that matters (below), or make handlers idempotent.
-- **`EnqueueOnce(item, id)`** stores the item once per id within the dedupe
-  window (5 minutes by default, `SetDedupWindow`), so neither a re-sent push
-  nor your own retry after a `false` stores it twice. A repeat returns `true`
-  and stores nothing. Use globally unique ids (a UUID or nanoid, never a
-  per-process counter): two producers that reuse an id drop each other's
-  jobs. The id is remembered for the whole window, even after its job is
-  handled, removed or purged. Each id holds about 100 bytes of Redis memory
-  for the window. Keep the window above the client's re-send window (about 4
-  minutes with the client timeouts `New` sets). varmq uses it for every job
-  added with `WithJobId` or a job id generator.
-- **`Dequeue`** (no ack) is at most once: an item whose reply never arrives is
-  gone. Use `DequeueWithAckId` for jobs you can't lose.
-- **`Remove`** can remove a second identical item if its call is re-sent.
-
-> [!WARNING]
-> Keep the visibility timeout well above the client's re-send window: about
-> 4 minutes at worst with the client timeouts `New` sets (up to 7 sends of a
-> script, each after a read timeout, a backoff, a pool wait, a dial and a
-> connection's setup), usually a few seconds. `New` keeps go-redis 9.7's
-> timings (3s reads, one dial attempt) unless the URL sets them; longer
-> timeouts in the URL stretch the window. On Redis Cloud and Redis Software,
-> go-redis also relaxes timeouts to 10s during maintenance. A pop that reaches
-> Redis only after its item was requeued, which takes a stall longer than the
-> visibility timeout, can still lose a job.
+- Use globally unique ids with `EnqueueOnce` (UUID or nanoid, never a per-process counter).
+- Use `DequeueWithAckId` for jobs you can't lose.
+- Keep the visibility timeout and dedup window above the client's re-send window: about 4 minutes with the
+  timeouts `New` sets, longer if the URL sets longer ones or Redis Cloud/Software maintenance relaxes them to 10s.
+- A pop that reaches Redis only after its items were requeued (a stall longer than the visibility or heartbeat
+  timeout) can still lose a job.
 
 ## Development
 
-Tests start Redis in a container through [dockertest](https://github.com/ory/dockertest), so Docker must be running; no Redis server is needed.
+Tests start Redis in Docker via [dockertest](https://github.com/ory/dockertest); Docker must be running.
 
-| Command                         | Description                                   |
-| ------------------------------- | --------------------------------------------- |
-| `make test`                     | Run all tests with race detection and coverage |
-| `REDIS_TAG=6.0 make test`       | Run the tests on the oldest supported Redis   |
-| `make format`                   | Format code                                   |
-| `make release VERSION=v1.0.0`   | Tag and push a signed release                 |
+```bash
+make test                     # race detection and coverage
+REDIS_TAG=6.0 make test       # oldest supported Redis
+make format                   # gofmt
+make diagrams                 # regenerate the README diagrams (Python 3; each asserts what it draws)
+make release VERSION=v1.0.0   # tag and push a signed release
+```
+
+The diagrams' facts, with code citations, are in [`assets/diagrams/gen/STORYBOARD.md`](assets/diagrams/gen/STORYBOARD.md).
 
 ## API Reference
 
-For the complete package documentation, types, and method signatures, browse the **[GoDoc](https://pkg.go.dev/github.com/goptics/redisq)**.
+See [GoDoc](https://pkg.go.dev/github.com/goptics/redisq).
 
 ## Star History
 
@@ -329,12 +309,8 @@ For the complete package documentation, types, and method signatures, browse the
 
 ## Contributing
 
-Contributions are welcome! Open an issue to discuss a change, or send a pull request:
-
-1. Fork the repository and create a branch (`git checkout -b feature/amazing-feature`)
-2. Make your change with tests, and run `make test`
-3. Open a pull request against `main`
+Open an issue to discuss a change, or send a pull request against `main` with tests (`make test`).
 
 ## License
 
-Released under the [MIT License](LICENSE).
+[MIT](LICENSE)

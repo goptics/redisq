@@ -40,10 +40,11 @@ func setupTestQueue(t *testing.T) (*Queue, func()) {
 	require.NoError(t, q.client.Del(ctx, q.getTimeoutKey()).Err(), "Failed to clear timeout key")
 
 	cleanup := func() {
+		q.Close() // first: it requeues what the test left pending
 		q.client.Del(ctx, testQueueKey)
 		q.client.Del(ctx, q.getNackedItemKey())
 		q.client.Del(ctx, q.getTimeoutKey())
-		q.Close()
+		q.client.Del(ctx, q.getHeartbeatKey())
 		qs.Close()
 	}
 
@@ -958,6 +959,23 @@ func TestScriptsUnderVerbatimReplication(t *testing.T) {
 				require.NoError(t, q.RequeueNackedItems())
 			}
 			assert.Zero(t, q.GetNackedItemsCount(), "expired items are requeued")
+
+			// The sweep, past a dead and a gone owner (counting subscribers,
+			// which Redis 6 flags as non-deterministic), and the release Close
+			// runs. The clock is a second old, so this sweep counts.
+			hb, pres := q.getHeartbeatKey(), q.getPresenceKey()
+			now := float64(q.client.Time(ctx).Val().UnixMicro()) / 1e6
+			require.NoError(t, q.client.Set(ctx, hb+":clock", now-1, 0).Err())
+			require.NoError(t, q.client.ZAdd(ctx, hb, redis.Z{Score: 1, Member: "dead"}, redis.Z{Score: now + 60, Member: "gone"}).Err())
+			require.NoError(t, q.client.ZAdd(ctx, pres, redis.Z{Score: now - 60, Member: "gone"}).Err())
+			require.NoError(t, q.client.HSet(ctx, q.getNackedItemKey(), "dead:1:0001", "x", "gone:1:0001", "z", q.ackPrefix+":1:0001", "y").Err())
+			keys := append(q.requeueKeys(), hb, hb+":clock", pres)
+			require.NoError(t, q.tickScript.Run(ctx, q.client, keys, q.ackPrefix, q.hbt(), sweepGap.Seconds(), q.queueKey+":wake:", presenceGrace.Seconds()).Err())
+			require.NoError(t, q.release())
+			// The queue's own sweep may have moved the clock on in between;
+			// its next one counts then.
+			assert.Eventually(t, func() bool { return q.GetNackedItemsCount() == 0 }, 3*time.Second, 50*time.Millisecond,
+				"the dead and gone owners' and the released items are requeued")
 		})
 	}
 
@@ -1232,4 +1250,39 @@ func TestAcknowledgeRunsInParallel(t *testing.T) {
 
 	assert.Less(t, time.Since(start), 500*time.Millisecond, "acks ran one at a time")
 	assert.Equal(t, 0, q.GetNackedItemsCount())
+}
+
+// SetHeartbeatTimeout keeps a floor of a few sweeps, and 0 or less turns the
+// heartbeat off. A queue whose heartbeat goes missing (another process took
+// it for dead) notices on its next sweep, and a sweep that fails keeps
+// running.
+func TestHeartbeatSetterAndLapse(t *testing.T) {
+	ctx := context.Background()
+	qs := New(getTestRedisURL())
+	defer qs.Close()
+	q := qs.NewQueue("test_heartbeat_lapse")
+	defer q.Close()
+	delKeys(t, q.client, q.queueKey)
+	defer delKeys(t, q.client, q.queueKey)
+
+	q.SetHeartbeatTimeout(time.Second)
+	assert.Equal(t, minHeartbeat.Seconds(), q.hbt(), "raised to the floor")
+	q.SetHeartbeatTimeout(-time.Second)
+	assert.Zero(t, q.hbt(), "off")
+	q.SetHeartbeatTimeout(time.Minute)
+	assert.Equal(t, 60.0, q.hbt())
+
+	require.True(t, q.Enqueue("job"))
+	_, ok, ackID := q.DequeueWithAckId()
+	require.True(t, ok)
+	require.True(t, q.beating.Load())
+	require.NoError(t, q.client.Del(ctx, q.getHeartbeatKey()).Err())
+	assert.Eventually(t, func() bool { return !q.beating.Load() }, 3*time.Second, 20*time.Millisecond, "the lapse went unnoticed")
+
+	// A key of the wrong type fails every sweep until it is fixed.
+	require.NoError(t, q.client.Set(ctx, q.getHeartbeatKey(), "not a zset", 0).Err())
+	time.Sleep(1200 * time.Millisecond)
+	require.NoError(t, q.client.Del(ctx, q.getHeartbeatKey()).Err())
+	require.NoError(t, q.client.ZAdd(ctx, q.getTimeoutKey(), redis.Z{Score: 1, Member: ackID}).Err())
+	assert.Eventually(t, func() bool { return q.Len() == 1 }, 3*time.Second, 20*time.Millisecond, "the sweep stopped after a failure")
 }

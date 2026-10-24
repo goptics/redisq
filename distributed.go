@@ -21,9 +21,10 @@ type DistributedQueue struct {
 }
 
 func newDistributedQueue(client *redis.Client, queueKey string) *DistributedQueue {
+	base := newQueue(client, queueKey)
 	q := &DistributedQueue{
-		Queue:        newQueue(client, queueKey),
-		Notification: newNotification(client, queueKey, "LLEN"),
+		Queue:        base,
+		Notification: newNotification(client, queueKey, "LLEN", base.ackPrefix),
 	}
 	q.setOnRequeue(q.wake)
 	defer q.Start()
@@ -55,7 +56,9 @@ func (q *DistributedQueue) Len() int {
 func (q *DistributedQueue) Dequeue() (any, bool) {
 	item, ok := q.Queue.Dequeue()
 
-	if !ok {
+	if ok {
+		q.idle.Store(false)
+	} else {
 		q.markIdle()
 	}
 
@@ -65,17 +68,27 @@ func (q *DistributedQueue) Dequeue() (any, bool) {
 // DequeueWithAckId pops one item; a consumer that finds the queue empty joins
 // the idle set in the same step.
 func (q *DistributedQueue) DequeueWithAckId() (any, bool, string) {
-	return q.Queue.dequeueOne(listAckPopOne, q.consumerID())
+	item, ok, ackID := q.Queue.dequeueOne(listAckPopOne, q.consumerID())
+	q.idle.Store(!ok)
+	return item, ok, ackID
 }
 
 // DequeueBatchWithAckIds pops up to len(items) items (see
 // Queue.DequeueBatchWithAckIds); a consumer whose pop comes up short joins
 // the idle set in the same step.
 func (q *DistributedQueue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n, remaining int, err error) {
-	return q.Queue.dequeueBatch(listAckPop, listAckPopOneLen, items, ackIDs, q.consumerID())
+	n, remaining, err = q.Queue.dequeueBatch(listAckPop, listAckPopOneLen, items, ackIDs, q.consumerID())
+	if err == nil {
+		q.idle.Store(remaining == 0 && n < min(len(items), len(ackIDs))) // as the pop's idle rule
+	}
+	return n, remaining, err
 }
 
+// Close requeues the items this consumer has not acknowledged (see
+// Queue.Close) and wakes another consumer for them.
 func (q *DistributedQueue) Close() error {
+	q.leave()
+	err := q.Queue.Close()
 	q.Notification.Stop()
-	return q.Queue.Close()
+	return err
 }
