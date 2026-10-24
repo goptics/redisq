@@ -960,16 +960,22 @@ func TestScriptsUnderVerbatimReplication(t *testing.T) {
 			}
 			assert.Zero(t, q.GetNackedItemsCount(), "expired items are requeued")
 
-			// The sweep, past a dead owner, and the release Close runs.
-			hb := q.getHeartbeatKey()
-			require.NoError(t, q.client.ZAdd(ctx, hb, redis.Z{Score: 1, Member: "dead"}).Err())
-			require.NoError(t, q.client.HSet(ctx, q.getNackedItemKey(), "dead:1:0001", "x", q.ackPrefix+":1:0001", "y").Err())
-			keys := append(q.requeueKeys(), hb, hb+":clock")
-			for range 2 { // the first only sets the clock
-				require.NoError(t, q.tickScript.Run(ctx, q.client, keys, q.ackPrefix, q.hbt(), sweepGap.Seconds()).Err())
-			}
+			// The sweep, past a dead and a gone owner (counting subscribers,
+			// which Redis 6 flags as non-deterministic), and the release Close
+			// runs. The clock is a second old, so this sweep counts.
+			hb, pres := q.getHeartbeatKey(), q.getPresenceKey()
+			now := float64(q.client.Time(ctx).Val().UnixMicro()) / 1e6
+			require.NoError(t, q.client.Set(ctx, hb+":clock", now-1, 0).Err())
+			require.NoError(t, q.client.ZAdd(ctx, hb, redis.Z{Score: 1, Member: "dead"}, redis.Z{Score: now + 60, Member: "gone"}).Err())
+			require.NoError(t, q.client.ZAdd(ctx, pres, redis.Z{Score: now - 60, Member: "gone"}).Err())
+			require.NoError(t, q.client.HSet(ctx, q.getNackedItemKey(), "dead:1:0001", "x", "gone:1:0001", "z", q.ackPrefix+":1:0001", "y").Err())
+			keys := append(q.requeueKeys(), hb, hb+":clock", pres)
+			require.NoError(t, q.tickScript.Run(ctx, q.client, keys, q.ackPrefix, q.hbt(), sweepGap.Seconds(), q.queueKey+":wake:", presenceGrace.Seconds()).Err())
 			require.NoError(t, q.release())
-			assert.Zero(t, q.GetNackedItemsCount(), "the dead owner's and the released items are requeued")
+			// The queue's own sweep may have moved the clock on in between;
+			// its next one counts then.
+			assert.Eventually(t, func() bool { return q.GetNackedItemsCount() == 0 }, 3*time.Second, 50*time.Millisecond,
+				"the dead and gone owners' and the released items are requeued")
 		})
 	}
 

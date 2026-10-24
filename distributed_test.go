@@ -504,6 +504,100 @@ func TestHeartbeatSurvivesRedisStall(t *testing.T) {
 	assert.EqualValues(t, 2, admin.ZCard(ctx, a.getHeartbeatKey()).Val())
 }
 
+// seen waits until a sweep has seen owner subscribed to its wake channel:
+// with the clock just deleted, the second sweep from now.
+func seen(t *testing.T, q *Queue, owner string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		return q.client.ZScore(context.Background(), q.getPresenceKey(), owner).Err() == nil
+	}, 3*time.Second, 20*time.Millisecond, "no sweep saw the consumer subscribed")
+}
+
+// A distributed consumer whose process dies (here its client closes, with its
+// pub/sub connection, which also stops its sweep) has its items requeued a
+// few seconds after Redis drops its subscription, long before its heartbeat
+// runs out, as RabbitMQ requeues when a consumer's connection closes.
+func TestGoneConsumerRequeues(t *testing.T) {
+	for _, c := range heartbeatCases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			key := "test_gone_consumer_" + c.name
+			qs1, qs2 := New(getTestRedisURL()), New(getTestRedisURL())
+			defer qs2.Close()
+			c1, q1, push := c.open(qs1, key)
+			defer c1.Close()
+			delKeys(t, q1.client, key)
+			c2, q2, _ := c.open(qs2, key)
+			defer c2.Close()
+			defer delKeys(t, q2.client, key)
+
+			require.True(t, push("job"))
+			_, ok, _ := c1.DequeueWithAckId()
+			require.True(t, ok)
+			seen(t, q2, q1.ackPrefix)
+			require.NoError(t, qs1.Close())
+			gone := time.Now()
+
+			time.Sleep(presenceGrace - time.Second)
+			assert.Equal(t, 1, q2.GetNackedItemsCount(), "requeued within the grace")
+			for c2.Len() == 0 {
+				require.Less(t, time.Since(gone), presenceGrace+3*time.Second, "gone consumer's item was not requeued")
+				time.Sleep(50 * time.Millisecond)
+			}
+			item, ok, _ := c2.DequeueWithAckId()
+			require.True(t, ok)
+			assert.Equal(t, "job", string(item.([]byte)))
+			assert.ErrorIs(t, q2.client.ZScore(ctx, q2.getPresenceKey(), q1.ackPrefix).Err(), redis.Nil, "presence dropped")
+		})
+	}
+}
+
+// A consumer whose subscription drops for less than the grace keeps its
+// items, even with its sweep stalled (stopped here), so only the
+// subscription speaks for it: first a go-redis reconnect after Redis kills
+// the connection, then a gap of a few seconds. One that stays gone is taken
+// for dead, the grace counting from when it went.
+func TestPresenceGrace(t *testing.T) {
+	ctx := context.Background()
+	key := "test_presence_grace"
+	qs := New(getTestRedisURL())
+	defer qs.Close()
+	c1, c2 := qs.NewDistributedQueue(key), qs.NewDistributedQueue(key)
+	defer c2.Close()
+	delKeys(t, c2.Queue.client, key)
+	defer delKeys(t, c2.Queue.client, key)
+	ch := c1.wakePrefix + c1.id
+	subs := func() int64 { return c2.Queue.client.PubSubNumSub(ctx, ch).Val()[ch] }
+
+	require.True(t, c1.Enqueue("job"))
+	_, ok, _ := c1.DequeueWithAckId()
+	require.True(t, ok)
+	seen(t, c2.Queue, c1.ackPrefix)
+	c1.Queue.cancel() // its sweep stops
+	defer c1.Close()
+
+	require.NoError(t, c2.Queue.client.Do(ctx, "CLIENT", "KILL", "TYPE", "pubsub").Err())
+	require.Eventually(t, func() bool { return subs() == 1 }, 2*time.Second, 10*time.Millisecond, "go-redis resubscribed")
+
+	require.NoError(t, c1.pubsub.Close())
+	went := time.Now()
+	time.Sleep(presenceGrace - 3*time.Second)
+	back := c1.Queue.client.Subscribe(ctx, ch)
+	_, err := back.Receive(ctx)
+	require.NoError(t, err)
+	time.Sleep(presenceGrace + 1500*time.Millisecond - time.Since(went))
+	assert.Equal(t, 1, c2.GetNackedItemsCount(), "requeued after a short drop")
+
+	require.NoError(t, back.Close())
+	went = time.Now()
+	for c2.GetNackedItemsCount() > 0 {
+		require.Less(t, time.Since(went), presenceGrace+3*time.Second, "gone consumer's item was not requeued")
+		time.Sleep(50 * time.Millisecond)
+	}
+	assert.Less(t, presenceGrace-time.Second, time.Since(went), "the grace counted again from the last drop")
+	assert.EqualValues(t, 1, c2.Queue.client.LLen(ctx, key).Val())
+}
+
 // Close pushes an item back before it drops it from pending, so a push that
 // fails (here the queue key holds a string) leaves the item pending.
 func TestCloseKeepsItemWhenPushFails(t *testing.T) {

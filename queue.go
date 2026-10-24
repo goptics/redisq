@@ -123,8 +123,10 @@ const minHeartbeat = 5 * time.Second
 // Set it above the longest freeze or network cut you want to ride out: a job
 // still running when its queue's heartbeat runs out runs again elsewhere, and
 // its later Acknowledge still reports success. A stall of Redis itself, such
-// as a failover, doesn't count. 0 or less turns it off, so this queue's items
-// wait for the visibility timeout.
+// as a failover, doesn't count. A distributed queue whose process exits is
+// taken for dead sooner, about 5s after Redis drops its pub/sub connection.
+// 0 or less turns both off, so this queue's items wait for the visibility
+// timeout.
 func (q *Queue) SetHeartbeatTimeout(d time.Duration) {
 	if d > 0 {
 		d = max(d, minHeartbeat)
@@ -736,10 +738,10 @@ var listRequeue = redis.NewScript(requeueLoop + `redis.call('LPUSH', KEYS[1], v)
 
 // The sweep and release scripts take the queue, pending hash, deadlines and
 // storageKeys, then the heartbeats ZSET (member: ack ID prefix, score: Unix
-// seconds it runs out at) and, for the sweep, its clock. repush(v, id) puts
-// item v, pending as id, back at the front of the queue, and moveFn's move(id)
-// pushes before it drops the item from pending, so a push that fails loses
-// nothing. move returns 1, or 0 when id is no longer pending (its deadline,
+// seconds it runs out at), for the sweep its clock, and the presence ZSET
+// (see tickBody). repush(v, id) puts item v, pending as id, back at the front
+// of the queue, and moveFn's move(id) pushes before it drops the item from
+// pending, so a push that fails loses nothing. move returns 1, or 0 when id is no longer pending (its deadline,
 // if left behind, still goes).
 const (
 	listRepush = `local function repush(v, id) redis.call('LPUSH', KEYS[1], v) end
@@ -759,47 +761,82 @@ end
 // tickBody is the sweep. It requeues pending items whose visibility deadline
 // is past Redis's clock, renews heartbeat ARGV[1] by ARGV[2] seconds (drops
 // it when that is 0; only a pop adds one), and requeues the items of owners
-// whose heartbeat ran out. ARGV[3] is the longest gap, in seconds, between
-// sweeps that counts as normal. It returns {items moved, 1 if ARGV[1]'s
-// heartbeat was missing or had run out, else 0}.
+// whose heartbeat ran out or who are gone (below). ARGV[3] is the longest
+// gap, in seconds, between sweeps that counts as normal. It returns {items
+// moved, 1 if ARGV[1]'s heartbeat was missing or had run out, else 0}.
 //
 // The clock is when any process last swept. A longer gap means Redis, or
 // every process, stalled: a failover, a restart, a pause. No one could beat
 // then, so the heartbeats move on by the gap first, and a stall doesn't make
 // every consumer look dead. With no clock yet, no owner is taken for dead.
+//
+// Presence: a distributed queue's wake channel is ARGV[4] .. its ack ID
+// prefix (see Notification), and Redis drops its subscription within
+// milliseconds of the process exiting. The sweep that moves the clock on
+// counts the subscribers of every owner with a live heartbeat and keeps the
+// result in the presence ZSET: 0 once it has seen one, else when it first
+// saw none. An owner seen subscribed and then without one for ARGV[5]
+// seconds is gone. Its own sweep sets it back to 0, so a process that still
+// sweeps is never taken for gone, whatever its connection does. Owners never
+// seen subscribed (plain queues) are left to their heartbeat, and so is a
+// lost host, whose subscription Redis keeps until TCP keepalive drops it.
 // ponytail: a dead owner, like a Close (releaseBody), costs a read of every
 // pending ID (HKEYS); index pending items by owner if pending runs to millions.
-const tickBody = `local hb, clock = KEYS[#KEYS - 1], KEYS[#KEYS]
+// The presence count covers 1000 owners per sweep; the rest keep heartbeats.
+const tickBody = `local hb, clock, pres = KEYS[#KEYS - 2], KEYS[#KEYS - 1], KEYS[#KEYS]
 local t = redis.call('TIME')
 local now = tonumber(t[1]) + tonumber(t[2]) / 1e6
 local last = tonumber(redis.call('GET', clock))
 if last and now - last > tonumber(ARGV[3]) then
 	for _, m in ipairs(redis.call('ZRANGE', hb, 0, -1)) do redis.call('ZINCRBY', hb, now - last, m) end
+	for _, m in ipairs(redis.call('ZRANGEBYSCORE', pres, '(0', '+inf')) do redis.call('ZINCRBY', pres, now - last, m) end
 end
-if not last or now - last >= 0.5 or now < last then redis.call('SET', clock, now) end
+local ticked = not last or now - last >= 0.5 or now < last
+if ticked then redis.call('SET', clock, now) end
 local own = tonumber(redis.call('ZSCORE', hb, ARGV[1]))
 if own then
-	if tonumber(ARGV[2]) > 0 then redis.call('ZADD', hb, now + tonumber(ARGV[2]), ARGV[1]) else redis.call('ZREM', hb, ARGV[1]) end
+	if tonumber(ARGV[2]) > 0 then
+		redis.call('ZADD', hb, now + tonumber(ARGV[2]), ARGV[1])
+		redis.call('ZADD', pres, 'XX', 0, ARGV[1])
+	else
+		redis.call('ZREM', hb, ARGV[1])
+		redis.call('ZREM', pres, ARGV[1])
+	end
 end
 local n = 0
 for _, id in ipairs(redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', now)) do n = n + move(id) end
 if last then
 	local dead, ids = {}, {}
 	for _, m in ipairs(redis.call('ZRANGEBYSCORE', hb, '-inf', now, 'LIMIT', 0, 100)) do dead[m] = true end
+	if ticked then
+		local live, chans = redis.call('ZRANGEBYSCORE', hb, now, '+inf', 'LIMIT', 0, 1000), {}
+		for i, m in ipairs(live) do chans[i] = ARGV[4] .. m end
+		local subs = #live > 0 and redis.call('PUBSUB', 'NUMSUB', unpack(chans)) or {}
+		for i, m in ipairs(live) do
+			local s = tonumber(redis.call('ZSCORE', pres, m))
+			if subs[2 * i] > 0 then
+				if s ~= 0 then redis.call('ZADD', pres, 0, m) end
+			elseif s == 0 then redis.call('ZADD', pres, now, m)
+			elseif s and now - s >= tonumber(ARGV[5]) then dead[m] = true end
+		end
+	end
 	if next(dead) then
 		for _, id in ipairs(redis.call('HKEYS', KEYS[2])) do
 			if dead[string.match(id, '^(.-):') or ''] then ids[#ids + 1] = id end
 		end
 		table.sort(ids)
 		for _, id in ipairs(ids) do n = n + move(id) end
-		for m in pairs(dead) do redis.call('ZREM', hb, m) end
+		for m in pairs(dead) do
+			redis.call('ZREM', hb, m)
+			redis.call('ZREM', pres, m)
+		end
 	end
 end
 if own and own >= now then return {n, 0} end
 return {n, 1}`
 
 // releaseBody requeues every pending item of owner ARGV[1], taking them in
-// pop order, and then drops its heartbeat.
+// pop order, and then drops its heartbeat and presence.
 const releaseBody = `local p, ids = ARGV[1] .. ':', {}
 for _, id in ipairs(redis.call('HKEYS', KEYS[2])) do
 	if string.sub(id, 1, #p) == p then ids[#ids + 1] = id end
@@ -807,6 +844,7 @@ end
 table.sort(ids)
 local n = 0
 for _, id in ipairs(ids) do n = n + move(id) end
+redis.call('ZREM', KEYS[#KEYS - 1], ARGV[1])
 redis.call('ZREM', KEYS[#KEYS], ARGV[1])
 return n`
 
@@ -822,6 +860,11 @@ var listTick, listRelease = heartbeatScripts(listRepush)
 // script takes as normal (see tickBody): above a sweep's one second plus a
 // slow call, below minHeartbeat.
 const sweepGap = 2 * time.Second
+
+// presenceGrace is how long a distributed queue may go without a subscriber
+// on its wake channel and without a sweep of its own before other processes
+// take it for gone (see tickBody): well above a go-redis pub/sub reconnect.
+const presenceGrace = 5 * time.Second
 
 // RequeueNackedItems returns un-acknowledged items whose visibility timeout
 // has passed (every pending item when it is 0) to the queue.
@@ -849,8 +892,9 @@ func (q *Queue) sweep() {
 		case <-tick.C:
 		}
 
-		keys := append(q.requeueKeys(), q.getHeartbeatKey(), q.getHeartbeatKey()+":clock")
-		r, err := q.tickScript.Run(q.ctx, q.client, keys, q.ackPrefix, q.hbt(), sweepGap.Seconds()).Int64Slice()
+		keys := append(q.requeueKeys(), q.getHeartbeatKey(), q.getHeartbeatKey()+":clock", q.getPresenceKey())
+		wakePrefix := q.queueKey + ":wake:" // as Notification names the channels
+		r, err := q.tickScript.Run(q.ctx, q.client, keys, q.ackPrefix, q.hbt(), sweepGap.Seconds(), wakePrefix, presenceGrace.Seconds()).Int64Slice()
 		if errors.Is(err, redis.ErrClosed) {
 			return // the client was closed without closing this queue
 		}
@@ -862,7 +906,7 @@ func (q *Queue) sweep() {
 		}
 
 		if r[1] == 1 && q.hbt() > 0 && q.beating.CompareAndSwap(true, false) {
-			log.Printf("queue %s: heartbeat ran out; its unacknowledged items may have been requeued to other consumers", q.queueKey)
+			log.Printf("queue %s: taken for dead (heartbeat ran out, or pub/sub connection and sweep gone); its unacknowledged items may have been requeued to other consumers", q.queueKey)
 		}
 
 		q.requeued(r[0])
@@ -939,6 +983,12 @@ func (q *Queue) getHeartbeatKey() string {
 	return q.queueKey + ":heartbeats"
 }
 
+// getPresenceKey returns the Redis key for whether the owners of pending
+// items are still subscribed to their wake channel (see tickBody)
+func (q *Queue) getPresenceKey() string {
+	return q.queueKey + ":presence"
+}
+
 // Close stops the queue and requeues the items it dequeued and has not
 // acknowledged, at once, as a broker requeues a closed channel's deliveries:
 // an Acknowledge after Close fails anyway. Stop or drain the workers first,
@@ -962,7 +1012,7 @@ func (q *Queue) release() error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	n, err := q.releaseScript.Run(ctx, q.client, append(q.requeueKeys(), q.getHeartbeatKey()), q.ackPrefix).Int64()
+	n, err := q.releaseScript.Run(ctx, q.client, append(q.requeueKeys(), q.getHeartbeatKey(), q.getPresenceKey()), q.ackPrefix).Int64()
 	if errors.Is(err, redis.ErrClosed) {
 		return nil // the client is gone: the heartbeat runs out instead
 	}

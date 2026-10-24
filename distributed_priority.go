@@ -21,9 +21,10 @@ type DistributedPriorityQueue struct {
 }
 
 func newDistributedPriorityQueue(client *redis.Client, queueKey string) *DistributedPriorityQueue {
+	base := newPriorityQueue(client, queueKey)
 	q := &DistributedPriorityQueue{
-		PriorityQueue: newPriorityQueue(client, queueKey),
-		Notification:  newNotification(client, queueKey, "ZCARD"),
+		PriorityQueue: base,
+		Notification:  newNotification(client, queueKey, "ZCARD", base.ackPrefix),
 	}
 	q.setOnRequeue(q.wake)
 	defer q.Start()

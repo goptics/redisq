@@ -21,9 +21,10 @@ type DistributedQueue struct {
 }
 
 func newDistributedQueue(client *redis.Client, queueKey string) *DistributedQueue {
+	base := newQueue(client, queueKey)
 	q := &DistributedQueue{
-		Queue:        newQueue(client, queueKey),
-		Notification: newNotification(client, queueKey, "LLEN"),
+		Queue:        base,
+		Notification: newNotification(client, queueKey, "LLEN", base.ackPrefix),
 	}
 	q.setOnRequeue(q.wake)
 	defer q.Start()

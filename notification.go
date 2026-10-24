@@ -15,7 +15,9 @@ import (
 // pulling on its own, so only idle ones need a signal: a consumer that finds
 // the queue empty joins the idle set (<key>:idle), and each enqueue or
 // requeue wakes at most one member, on that member's own channel
-// (<key>:wake:<id>). With every consumer busy, nothing is published.
+// (<key>:wake:<id>). With every consumer busy, nothing is published. The id is
+// the queue's ack ID prefix, so the sweep can tell from the channel whether
+// the owner of pending items is still connected (see tickBody).
 //
 // An instance counts as a consumer once Subscribe is called; a producer-only
 // instance never joins the idle set.
@@ -70,9 +72,8 @@ var nudge = redis.NewScript(`local n = redis.call(ARGV[1], KEYS[1])
 if n == 0 then redis.call('SADD', KEYS[2], ARGV[2]) else redis.call('SREM', KEYS[2], ARGV[2]) end
 return n`)
 
-func newNotification(client *redis.Client, queueKey, lenCmd string) *Notification {
+func newNotification(client *redis.Client, queueKey, lenCmd, id string) *Notification {
 	ctx, cancel := context.WithCancel(context.Background())
-	id := newID()
 	wakePrefix := queueKey + ":wake:"
 
 	return &Notification{

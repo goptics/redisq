@@ -50,7 +50,7 @@ func delKeys(t *testing.T, c *redis.Client, key string) {
 	ctx := context.Background()
 	dedup, err := c.Keys(ctx, key+":dedup:*").Result()
 	require.NoError(t, err)
-	require.NoError(t, c.Del(ctx, append([]string{key, key + ":nacked", key + ":timeouts", key + ":prio", key + ":seq", key + ":idle", key + ":heartbeats", key + ":heartbeats:clock"}, dedup...)...).Err())
+	require.NoError(t, c.Del(ctx, append([]string{key, key + ":nacked", key + ":timeouts", key + ":prio", key + ":seq", key + ":idle", key + ":heartbeats", key + ":heartbeats:clock", key + ":presence"}, dedup...)...).Err())
 }
 
 func TestDequeueBatchList(t *testing.T) {

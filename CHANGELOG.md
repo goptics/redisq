@@ -21,6 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A stall of Redis itself (failover, restart, pause) doesn't make live
     consumers look dead: heartbeats move on by the gap between sweeps
   - New keys `<key>:heartbeats` and `<key>:heartbeats:clock`
+- Presence: a distributed consumer whose process exits has its items
+  requeued about 5s after Redis drops its pub/sub subscription, without
+  waiting for the heartbeat
+  - A distributed queue's wake channel is now named after its ack ID prefix
+  - Counts as gone only with no subscriber and no sweep of its own for 5s, so
+    a go-redis reconnect or a lone dropped pub/sub connection doesn't count.
+    A lost host, whose socket Redis keeps, still waits for the heartbeat
+  - New key `<key>:presence`
 
 ### Changed
 

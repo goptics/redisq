@@ -34,7 +34,7 @@
 - **FIFO and priority queues** on plain Redis lists and sorted sets; lower priority number is served first.
 - **Distributed variants** that wake only idle consumers, one per waiting item, in the same round trip as the enqueue.
 - **Acknowledgments with a visibility timeout**: unacknowledged items return to the queue, with deadlines taken from Redis's clock.
-- **Fast handover**: a consumer that closes hands its unacknowledged items back at once; one that dies, a heartbeat timeout (30s) after it went silent.
+- **Fast handover**: a consumer that closes hands its unacknowledged items back at once; a distributed one that dies, about 6s later; anything else silent, after a heartbeat timeout (30s).
 - **Batch dequeue**: up to 1000 items per round trip, each under its own ack ID, sized to recent traffic.
 - **Deduplicated enqueue**: `EnqueueOnce` stores a job once per id, even across retries.
 - **Queue TTL**: optional key expiration, refreshed on every enqueue.
@@ -279,13 +279,22 @@ deliveries to a channel, so redisq keeps a heartbeat per queue object in
 `<key>:heartbeats`, on Redis's clock. A pop that hands out items sets it, and
 the queue's sweep renews it every second. Every process's sweep requeues the
 items of any queue object whose heartbeat ran out, and on a distributed queue
-wakes idle consumers for them:
+wakes idle consumers for them.
 
-| Consumer 2 holds 5 unacknowledged jobs and…  | They reach consumer 1 after |
-| -------------------------------------------- | --------------------------- |
-| calls `Close` (deploy, scale-down, Ctrl+C)   | under a second              |
-| dies (kill -9, OOM, panic) or loses Redis    | the heartbeat timeout + ~1s |
-| stays alive but a job hangs                  | the visibility timeout      |
+A distributed queue is also subscribed to its own wake channel, and Redis
+drops a subscription within milliseconds of the process exiting, as RabbitMQ
+sees a consumer's connection close. Once the sweep has seen a queue object
+subscribed, 5s with no subscriber and no sweep of its own (a go-redis
+reconnect takes milliseconds) count as dead, without waiting for the
+heartbeat (`<key>:presence`):
+
+| Consumer 2 holds 5 unacknowledged jobs and…                 | They reach consumer 1 after |
+| ----------------------------------------------------------- | --------------------------- |
+| calls `Close` (deploy, scale-down, Ctrl+C)                  | under a second              |
+| dies (kill -9, OOM, panic), distributed queue               | ~5-7s                       |
+| dies, plain queue or within a second of its first pop       | the heartbeat timeout + ~1s |
+| loses Redis, or its host goes down (Redis keeps the socket) | the heartbeat timeout + ~1s |
+| stays alive but a job hangs                                 | the visibility timeout      |
 
 Producers never get a heartbeat, and items of older versions, or tracked
 with `PrepareForFutureAck`, wait for the visibility timeout. A stall of Redis
