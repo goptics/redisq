@@ -262,7 +262,11 @@ Each enqueue wakes idle consumers on their own channel `<key>:wake:<id>`, up to
 one per waiting item, so a backlog wakes them all; when every consumer is
 busy, nothing is published. A requeue of `n` expired items wakes up to `n`.
 A consumer that is idle while items wait (for example after a wake reached a
-paused instance) is nudged within a second. There is no `"dequeued"`
+paused instance) is nudged within a second. A consumer that popped work is
+not idle again until its own `Len()` or dequeue finds the queue empty, so
+wakes go to consumers that can take the job rather than to a busy one that
+would ignore it: keep pulling until the queue is empty (varmq does). There
+is no `"dequeued"`
 notification.
 
 ### Visibility deadlines

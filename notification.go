@@ -15,7 +15,10 @@ import (
 // pulling on its own, so only idle ones need a signal: a consumer that finds
 // the queue empty joins the idle set (<key>:idle), and each enqueue or
 // requeue wakes at most one member, on that member's own channel
-// (<key>:wake:<id>). With every consumer busy, nothing is published. The id is
+// (<key>:wake:<id>). With every consumer busy, nothing is published. A
+// consumer that popped work stays out of the idle set until its own Len or
+// dequeue finds the queue empty again, so wakes go to consumers that can take
+// the job (the nudge only puts back an idle one). The id is
 // the queue's ack ID prefix, so the sweep can tell from the channel whether
 // the owner of pending items is still connected (see tickBody).
 //
@@ -30,6 +33,7 @@ type Notification struct {
 	idleKey     string
 	wakePrefix  string
 	consumer    atomic.Bool
+	idle        atomic.Bool // this consumer's own last look found no work for it
 	subscribers []func(action string)
 	mx          sync.RWMutex
 	started     sync.Once
@@ -65,11 +69,13 @@ end
 var wakeIdle = redis.NewScript(wakeFn + `return wake(KEYS[1], ARGV[1], tonumber(ARGV[2]))`)
 
 // nudge brings consumer ARGV[2]'s idle-set membership in line with the
-// queue and returns its length: with the queue empty the consumer is (back)
-// in the idle set, with items waiting it leaves it, since it is about to be
-// poked to pull them.
+// queue and returns its length: with the queue empty an idle consumer
+// (ARGV[3] == '1') is (back) in the idle set, with items waiting it leaves
+// it, since it is about to be poked to pull them. A busy consumer is not put
+// back: a wake would reach it and be ignored while a free one waits.
 var nudge = redis.NewScript(`local n = redis.call(ARGV[1], KEYS[1])
-if n == 0 then redis.call('SADD', KEYS[2], ARGV[2]) else redis.call('SREM', KEYS[2], ARGV[2]) end
+if n > 0 then redis.call('SREM', KEYS[2], ARGV[2])
+elseif ARGV[3] == '1' then redis.call('SADD', KEYS[2], ARGV[2]) end
 return n`)
 
 func newNotification(client *redis.Client, queueKey, lenCmd, id string) *Notification {
@@ -110,12 +116,13 @@ func (n *Notification) Start() {
 }
 
 // nudgeLoop pokes this consumer once a second while items wait, and puts it
-// back in the idle set while the queue is empty. Wakes can be lost: one can
-// reach a consumer that can't take work (paused, or full but marked idle by
-// a Len call from elsewhere), a consumer whose pub/sub connection was
-// reconnecting is dropped from the idle set as gone, and items pushed by
-// older versions or other clients send none. A busy consumer just ignores
-// the poke.
+// back in the idle set while the queue is empty and its own last Len or
+// dequeue found no work for it (a consumer that popped work stays out until
+// it looks again). Wakes can be lost: one can reach a consumer that can't
+// take work (paused, or full but marked idle by a Len call from elsewhere),
+// a consumer whose pub/sub connection was reconnecting is dropped from the
+// idle set as gone, and items pushed by older versions or other clients send
+// none. A busy consumer just ignores the poke.
 // ponytail: one script call per consumer per second.
 func (n *Notification) nudgeLoop() {
 	tick := time.NewTicker(time.Second)
@@ -132,7 +139,7 @@ func (n *Notification) nudgeLoop() {
 			continue
 		}
 
-		waiting, err := nudge.Run(n.ctx, n.client, []string{n.queueKey, n.idleKey}, n.lenCmd, n.id).Int()
+		waiting, err := nudge.Run(n.ctx, n.client, []string{n.queueKey, n.idleKey}, n.lenCmd, n.id, n.idle.Load()).Int()
 		if errors.Is(err, redis.ErrClosed) {
 			return // the client was closed without closing this queue
 		}
@@ -176,6 +183,9 @@ func (n *Notification) len() int {
 	if err != nil {
 		return 0
 	}
+	if length == 0 && id != "" {
+		n.idle.Store(true)
+	}
 	return length
 }
 
@@ -192,6 +202,7 @@ func (n *Notification) consumerID() string {
 // it.
 func (n *Notification) markIdle() {
 	if n.consumer.Load() {
+		n.idle.Store(true)
 		n.client.SAdd(n.ctx, n.idleKey, n.id)
 	}
 }

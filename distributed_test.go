@@ -347,6 +347,76 @@ func wakes(q distQueue) chan struct{} {
 	return ch
 }
 
+// A consumer busy with a job stays out of the idle set while the queue sits
+// empty, so the next enqueue wakes a free consumer at once instead of the
+// busy one, which would ignore the wake and leave the free one to its nudge.
+func TestBusyConsumerStaysOutOfIdleSet(t *testing.T) {
+	for _, c := range heartbeatCases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			key := "test_busy_not_idle_" + c.name
+			qs := New(getTestRedisURL())
+			defer qs.Close()
+			c1, q1, push := c.open(qs, key)
+			delKeys(t, q1.client, key)
+			defer delKeys(t, q1.client, key)
+			defer c1.Close()
+			wakes(c1)
+
+			require.True(t, push("x"))
+			_, ok, _ := c1.DequeueWithAckId() // busy with x from here on
+			require.True(t, ok)
+
+			c2, q2, _ := c.open(qs, key)
+			defer c2.Close()
+			free := wakes(c2)
+
+			time.Sleep(1500 * time.Millisecond) // c1's nudge runs on the empty queue
+			idle, err := q1.client.SMembers(ctx, key+":idle").Result()
+			require.NoError(t, err)
+			assert.Equal(t, []string{q2.ackPrefix}, idle, "only the free consumer is idle")
+
+			require.True(t, push("y"))
+			select {
+			case <-free:
+			case <-time.After(300 * time.Millisecond):
+				t.Fatal("the free consumer was not woken at once")
+			}
+		})
+	}
+}
+
+// A batch pop that fills every slot leaves the consumer busy, so its nudge
+// won't put it back in the idle set; one with a slot to spare leaves it idle.
+func TestBatchDequeueSetsIdle(t *testing.T) {
+	qs := New(getTestRedisURL())
+	defer qs.Close()
+	dq := qs.NewDistributedQueue("test_batch_idle_list")
+	dpq := qs.NewDistributedPriorityQueue("test_batch_idle_prio")
+
+	for _, c := range []struct {
+		q    distQueue
+		n    *Notification
+		push func() bool
+		pop  func([]any, []string) (int, int, error)
+	}{
+		{dq, dq.Notification, func() bool { return dq.Enqueue("x") }, dq.DequeueBatchWithAckIds},
+		{dpq, dpq.Notification, func() bool { return dpq.Enqueue("x", 1) }, dpq.DequeueBatchWithAckIds},
+	} {
+		delKeys(t, c.n.client, c.n.queueKey)
+		c.q.Subscribe(func(string) {})
+		for _, slots := range []int{1, 2} {
+			require.True(t, c.push())
+			n, _, err := c.pop(make([]any, slots), make([]string, slots))
+			require.NoError(t, err)
+			require.Equal(t, 1, n)
+			assert.Equal(t, slots > 1, c.n.idle.Load(), "%s, %d slots", c.n.queueKey, slots)
+		}
+		require.NoError(t, c.q.Close())
+		delKeys(t, c.n.client, c.n.queueKey)
+	}
+}
+
 // A consumer that closes with work it has not acknowledged hands it back at
 // once, like a closed RabbitMQ channel, and wakes another idle consumer for it.
 func TestCloseRequeuesUnacked(t *testing.T) {

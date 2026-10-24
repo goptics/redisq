@@ -56,7 +56,9 @@ func (q *DistributedPriorityQueue) Len() int {
 func (q *DistributedPriorityQueue) Dequeue() (any, bool) {
 	item, ok := q.PriorityQueue.Dequeue()
 
-	if !ok {
+	if ok {
+		q.idle.Store(false)
+	} else {
 		q.markIdle()
 	}
 
@@ -66,14 +68,20 @@ func (q *DistributedPriorityQueue) Dequeue() (any, bool) {
 // DequeueWithAckId pops one item; a consumer that finds the queue empty joins
 // the idle set in the same step.
 func (q *DistributedPriorityQueue) DequeueWithAckId() (any, bool, string) {
-	return q.dequeueOne(zsetAckPopOne, q.consumerID(), q.getPriorityKey())
+	item, ok, ackID := q.dequeueOne(zsetAckPopOne, q.consumerID(), q.getPriorityKey())
+	q.idle.Store(!ok)
+	return item, ok, ackID
 }
 
 // DequeueBatchWithAckIds pops up to len(items) items (see
 // PriorityQueue.DequeueBatchWithAckIds); a consumer whose pop comes up short
 // joins the idle set in the same step.
 func (q *DistributedPriorityQueue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n, remaining int, err error) {
-	return q.dequeueBatch(zsetAckPop, zsetAckPopOneLen, items, ackIDs, q.consumerID(), q.getPriorityKey())
+	n, remaining, err = q.dequeueBatch(zsetAckPop, zsetAckPopOneLen, items, ackIDs, q.consumerID(), q.getPriorityKey())
+	if err == nil {
+		q.idle.Store(remaining == 0 && n < min(len(items), len(ackIDs))) // as the pop's idle rule
+	}
+	return n, remaining, err
 }
 
 // Close requeues the items this consumer has not acknowledged (see

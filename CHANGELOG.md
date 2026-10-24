@@ -41,6 +41,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removing it from pending
 - The varmq consumer example stops its worker and closes the queue on
   SIGINT/SIGTERM
+- A distributed consumer busy with work it popped no longer rejoins the idle
+  set within a second of the queue emptying, so an enqueue wakes a free
+  consumer at once instead of the busy one, which ignored the wake while the
+  free one waited up to a second for its nudge. A consumer is idle again once
+  its own `Len()` or dequeue finds the queue empty, so one that takes a
+  single item per wake and never looks again is now only nudged
 
 - Upgraded go-redis from v9.7.3 to v9.23.0, which requires Go 1.26
 - `New` keeps go-redis 9.7's client timings (3s read and write timeouts, 512ms
