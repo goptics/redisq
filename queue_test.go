@@ -1251,3 +1251,38 @@ func TestAcknowledgeRunsInParallel(t *testing.T) {
 	assert.Less(t, time.Since(start), 500*time.Millisecond, "acks ran one at a time")
 	assert.Equal(t, 0, q.GetNackedItemsCount())
 }
+
+// SetHeartbeatTimeout keeps a floor of a few sweeps, and 0 or less turns the
+// heartbeat off. A queue whose heartbeat goes missing (another process took
+// it for dead) notices on its next sweep, and a sweep that fails keeps
+// running.
+func TestHeartbeatSetterAndLapse(t *testing.T) {
+	ctx := context.Background()
+	qs := New(getTestRedisURL())
+	defer qs.Close()
+	q := qs.NewQueue("test_heartbeat_lapse")
+	defer q.Close()
+	delKeys(t, q.client, q.queueKey)
+	defer delKeys(t, q.client, q.queueKey)
+
+	q.SetHeartbeatTimeout(time.Second)
+	assert.Equal(t, minHeartbeat.Seconds(), q.hbt(), "raised to the floor")
+	q.SetHeartbeatTimeout(-time.Second)
+	assert.Zero(t, q.hbt(), "off")
+	q.SetHeartbeatTimeout(time.Minute)
+	assert.Equal(t, 60.0, q.hbt())
+
+	require.True(t, q.Enqueue("job"))
+	_, ok, ackID := q.DequeueWithAckId()
+	require.True(t, ok)
+	require.True(t, q.beating.Load())
+	require.NoError(t, q.client.Del(ctx, q.getHeartbeatKey()).Err())
+	assert.Eventually(t, func() bool { return !q.beating.Load() }, 3*time.Second, 20*time.Millisecond, "the lapse went unnoticed")
+
+	// A key of the wrong type fails every sweep until it is fixed.
+	require.NoError(t, q.client.Set(ctx, q.getHeartbeatKey(), "not a zset", 0).Err())
+	time.Sleep(1200 * time.Millisecond)
+	require.NoError(t, q.client.Del(ctx, q.getHeartbeatKey()).Err())
+	require.NoError(t, q.client.ZAdd(ctx, q.getTimeoutKey(), redis.Z{Score: 1, Member: ackID}).Err())
+	assert.Eventually(t, func() bool { return q.Len() == 1 }, 3*time.Second, 20*time.Millisecond, "the sweep stopped after a failure")
+}
