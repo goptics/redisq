@@ -202,8 +202,16 @@ func (n *Notification) wake(count int64) {
 	}
 }
 
-func (n *Notification) Stop() {
+// leave stops this instance counting as a consumer and takes it out of the
+// idle set, so the wake for the items its Close requeues goes to another
+// consumer.
+func (n *Notification) leave() {
+	n.consumer.Store(false)
 	n.client.SRem(context.Background(), n.idleKey, n.id)
+}
+
+func (n *Notification) Stop() {
+	n.leave()
 	n.cancel()
 	n.pubsub.Close()
 

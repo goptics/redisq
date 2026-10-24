@@ -34,6 +34,7 @@
 - **FIFO and priority queues** on plain Redis lists and sorted sets; lower priority number is served first.
 - **Distributed variants** that wake only idle consumers, one per waiting item, in the same round trip as the enqueue.
 - **Acknowledgments with a visibility timeout**: unacknowledged items return to the queue, with deadlines taken from Redis's clock.
+- **Fast handover**: a consumer that closes hands its unacknowledged items back at once; one that dies, a heartbeat timeout (30s) after it went silent.
 - **Batch dequeue**: up to 1000 items per round trip, each under its own ack ID, sized to recent traffic.
 - **Deduplicated enqueue**: `EnqueueOnce` stores a job once per id, even across retries.
 - **Queue TTL**: optional key expiration, refreshed on every enqueue.
@@ -159,6 +160,9 @@ queue := qs.NewQueue("ack-queue")
 // How long a dequeued item stays pending before it can be requeued
 queue.SetVisibilityTimeout(5 * time.Minute)
 
+// How long this process may go silent before others requeue its items
+queue.SetHeartbeatTimeout(30 * time.Second) // default 30 seconds
+
 // The item stays pending under ackID until acknowledged
 item, ok, ackID := queue.DequeueWithAckId()
 if ok {
@@ -166,6 +170,13 @@ if ok {
 	queue.Acknowledge(ackID)
 }
 ```
+
+`Close` requeues the items the queue object dequeued and has not acknowledged,
+at once, as RabbitMQ does when a channel closes; a distributed queue also wakes
+another consumer for them. An `Acknowledge` after `Close` fails anyway, so stop your workers
+first (with varmq, `w.Stop()` waits for the jobs in progress), or the jobs
+still running run again elsewhere. See
+[When a consumer goes away](#when-a-consumer-goes-away).
 
 Manual control of the pending set:
 
@@ -261,6 +272,29 @@ so a pop that waited in Redis still gets the full timeout. Once every process
 runs this version, clients whose clocks disagree share one deadline (older
 versions stamp and sweep deadlines with their own clocks).
 
+### When a consumer goes away
+
+Redis doesn't tie pending items to a connection the way RabbitMQ ties
+deliveries to a channel, so redisq keeps a heartbeat per queue object in
+`<key>:heartbeats`, on Redis's clock. A pop that hands out items sets it, and
+the queue's sweep renews it every second. Every process's sweep requeues the
+items of any queue object whose heartbeat ran out, and on a distributed queue
+wakes idle consumers for them:
+
+| Consumer 2 holds 5 unacknowledged jobs and…  | They reach consumer 1 after |
+| -------------------------------------------- | --------------------------- |
+| calls `Close` (deploy, scale-down, Ctrl+C)   | under a second              |
+| dies (kill -9, OOM, panic) or loses Redis    | the heartbeat timeout + ~1s |
+| stays alive but a job hangs                  | the visibility timeout      |
+
+Producers never get a heartbeat, and items of older versions, or tracked
+with `PrepareForFutureAck`, wait for the visibility timeout. A stall of Redis
+itself (a failover, a restart, a pause) doesn't count against a heartbeat:
+when every process misses its sweeps, the heartbeats are moved on by the gap.
+Visibility deadlines are not, as before. Like
+any faster redelivery, it also hands a job that crashes its consumer to the
+next one sooner; there is no redelivery limit.
+
 ## Delivery Guarantees
 
 go-redis re-sends a command whose reply was lost (a read timeout or a dropped
@@ -279,7 +313,9 @@ connection), up to 3 times by default. What that means per call:
   failed outright, the next call of at least its size returns those items (a
   smaller call leaves them for a later one). Only one failed call is kept at
   a time: if two fail together, the other's items stay pending until they
-  are requeued. Delivery is at least once.
+  are requeued. Delivery is at least once. A job still running when its
+  process goes without Redis for longer than the heartbeat timeout runs again
+  elsewhere, and its later `Acknowledge` still returns `true`.
 - **`Enqueue`** can store a job twice, and returning `false` after a network
   error does not prove the job was not stored. Use `EnqueueOnce` with a job
   id where that matters (below), or make handlers idempotent.
@@ -306,7 +342,7 @@ connection), up to 3 times by default. What that means per call:
 > timeouts in the URL stretch the window. On Redis Cloud and Redis Software,
 > go-redis also relaxes timeouts to 10s during maintenance. A pop that reaches
 > Redis only after its item was requeued, which takes a stall longer than the
-> visibility timeout, can still lose a job.
+> visibility timeout or the heartbeat timeout, can still lose a job.
 
 ## Development
 

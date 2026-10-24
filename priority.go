@@ -54,9 +54,11 @@ func newPriorityQueue(client *redis.Client, queueKey string) *PriorityQueue {
 		Queue: newQueueBase(client, queueKey),
 	}
 	q.isPriority = true
+	q.tickScript, q.releaseScript = zsetTick, zsetRelease
+	q.storageKeys = []string{q.queueKey + ":seq", q.getPriorityKey()}
 
 	q.RequeueNackedItems()
-	go q.sweep(func() (int64, error) { return q.requeue(zsetRequeue, q.queueKey+":seq", q.getPriorityKey()) })
+	go q.sweep()
 	return q
 }
 
@@ -141,6 +143,17 @@ var zsetRequeue = redis.NewScript(requeueLoop + `local s = redis.call('INCR', KE
 		local p = redis.call('HGET', KEYS[5], id) or 1
 		redis.call('HDEL', KEYS[5], id)
 		redis.call('ZADD', KEYS[1], p, '\255' .. string.format('%016x', s) .. v)` + requeueEnd)
+
+// zsetRepush is zsetRequeue's push for the sweep and release scripts (see
+// moveFn): KEYS[4] is :seq and KEYS[5] :prio.
+const zsetRepush = `local function repush(v, id)
+	local s = redis.call('INCR', KEYS[4])
+	redis.call('ZADD', KEYS[1], redis.call('HGET', KEYS[5], id) or 1, '\255' .. string.format('%016x', s) .. v)
+	redis.call('HDEL', KEYS[5], id)
+end
+`
+
+var zsetTick, zsetRelease = heartbeatScripts(zsetRepush)
 
 // RequeueNackedItems returns un-acknowledged items whose visibility timeout
 // has passed (every pending item when it is 0) to the priority queue.

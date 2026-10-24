@@ -75,7 +75,11 @@ func (q *DistributedPriorityQueue) DequeueBatchWithAckIds(items []any, ackIDs []
 	return q.dequeueBatch(zsetAckPop, zsetAckPopOneLen, items, ackIDs, q.consumerID(), q.getPriorityKey())
 }
 
+// Close requeues the items this consumer has not acknowledged (see
+// Queue.Close) and wakes another consumer for them.
 func (q *DistributedPriorityQueue) Close() error {
+	q.leave()
+	err := q.PriorityQueue.Close()
 	q.Notification.Stop()
-	return q.PriorityQueue.Close()
+	return err
 }

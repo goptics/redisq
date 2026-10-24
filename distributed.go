@@ -75,7 +75,11 @@ func (q *DistributedQueue) DequeueBatchWithAckIds(items []any, ackIDs []string) 
 	return q.Queue.dequeueBatch(listAckPop, listAckPopOneLen, items, ackIDs, q.consumerID())
 }
 
+// Close requeues the items this consumer has not acknowledged (see
+// Queue.Close) and wakes another consumer for them.
 func (q *DistributedQueue) Close() error {
+	q.leave()
+	err := q.Queue.Close()
 	q.Notification.Stop()
-	return q.Queue.Close()
+	return err
 }

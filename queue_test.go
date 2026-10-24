@@ -40,10 +40,11 @@ func setupTestQueue(t *testing.T) (*Queue, func()) {
 	require.NoError(t, q.client.Del(ctx, q.getTimeoutKey()).Err(), "Failed to clear timeout key")
 
 	cleanup := func() {
+		q.Close() // first: it requeues what the test left pending
 		q.client.Del(ctx, testQueueKey)
 		q.client.Del(ctx, q.getNackedItemKey())
 		q.client.Del(ctx, q.getTimeoutKey())
-		q.Close()
+		q.client.Del(ctx, q.getHeartbeatKey())
 		qs.Close()
 	}
 
@@ -958,6 +959,17 @@ func TestScriptsUnderVerbatimReplication(t *testing.T) {
 				require.NoError(t, q.RequeueNackedItems())
 			}
 			assert.Zero(t, q.GetNackedItemsCount(), "expired items are requeued")
+
+			// The sweep, past a dead owner, and the release Close runs.
+			hb := q.getHeartbeatKey()
+			require.NoError(t, q.client.ZAdd(ctx, hb, redis.Z{Score: 1, Member: "dead"}).Err())
+			require.NoError(t, q.client.HSet(ctx, q.getNackedItemKey(), "dead:1:0001", "x", q.ackPrefix+":1:0001", "y").Err())
+			keys := append(q.requeueKeys(), hb, hb+":clock")
+			for range 2 { // the first only sets the clock
+				require.NoError(t, q.tickScript.Run(ctx, q.client, keys, q.ackPrefix, q.hbt(), sweepGap.Seconds()).Err())
+			}
+			require.NoError(t, q.release())
+			assert.Zero(t, q.GetNackedItemsCount(), "the dead owner's and the released items are requeued")
 		})
 	}
 

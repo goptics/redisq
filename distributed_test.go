@@ -23,8 +23,8 @@ func setupTestDistributedQueue(t *testing.T) (*DistributedQueue, func()) {
 	require.NoError(t, q.Queue.client.Del(ctx, testQueueKey).Err(), "Failed to clear test queue")
 
 	cleanup := func() {
+		q.Close() // first: it requeues what the test left pending
 		q.Queue.client.Del(ctx, testQueueKey)
-		q.Close()
 		qs.Close()
 	}
 
@@ -152,6 +152,7 @@ type cmdCounter struct {
 func newCmdCounter() *cmdCounter {
 	return &cmdCounter{skip: map[string]bool{
 		nudge.Hash(): true, listRequeue.Hash(): true, zsetRequeue.Hash(): true,
+		listTick.Hash(): true, zsetTick.Hash(): true,
 	}}
 }
 
@@ -313,4 +314,218 @@ func TestDistributedQueueClosed(t *testing.T) {
 	// The nudge loop must stop on the closed client rather than spin.
 	time.Sleep(1200 * time.Millisecond)
 	_ = dpq.Close()
+}
+
+// distQueue is what the heartbeat tests use of both distributed queue types.
+type distQueue interface {
+	Subscribe(handler func(action string))
+	DequeueWithAckId() (any, bool, string)
+	Len() int
+	Close() error
+}
+
+// heartbeatCases open a distributed queue of each storage on key, with its
+// push (priority 3).
+var heartbeatCases = []struct {
+	name string
+	open func(qs Queues, key string) (distQueue, *Queue, func(string) bool)
+}{
+	{"list", func(qs Queues, key string) (distQueue, *Queue, func(string) bool) {
+		q := qs.NewDistributedQueue(key)
+		return q, q.Queue, func(v string) bool { return q.Enqueue(v) }
+	}},
+	{"priority", func(qs Queues, key string) (distQueue, *Queue, func(string) bool) {
+		q := qs.NewDistributedPriorityQueue(key)
+		return q, q.Queue, func(v string) bool { return q.Enqueue(v, 3) }
+	}},
+}
+
+// wakes collects a consumer's wake signals.
+func wakes(q distQueue) chan struct{} {
+	ch := make(chan struct{}, 100)
+	q.Subscribe(func(string) { ch <- struct{}{} })
+	return ch
+}
+
+// A consumer that closes with work it has not acknowledged hands it back at
+// once, like a closed RabbitMQ channel, and wakes another idle consumer for it.
+func TestCloseRequeuesUnacked(t *testing.T) {
+	for _, c := range heartbeatCases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			key := "test_close_requeues_" + c.name
+			qs1, qs2 := New(getTestRedisURL()), New(getTestRedisURL())
+			defer qs1.Close()
+			defer qs2.Close()
+			c1, q1, push := c.open(qs1, key)
+			delKeys(t, q1.client, key)
+			defer delKeys(t, q1.client, key)
+			c2, q2, _ := c.open(qs2, key)
+			defer c2.Close()
+			wakes(c1)
+
+			require.True(t, push("job"))
+			_, ok, _ := c1.DequeueWithAckId()
+			require.True(t, ok)
+			assert.Zero(t, c1.Len()) // idle: a Close that didn't leave first could wake itself
+
+			// Another idle consumer, without the nudge loop that wakes it anyway.
+			watcher := q2.client.Subscribe(ctx, key+":wake:watcher")
+			defer watcher.Close()
+			_, err := watcher.Receive(ctx)
+			require.NoError(t, err)
+			require.NoError(t, q2.client.SAdd(ctx, q2.getIdleKey(), "watcher").Err())
+
+			require.NoError(t, c1.Close())
+			assert.Equal(t, 0, q2.GetNackedItemsCount(), "requeued by Close itself")
+			wctx, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			_, err = watcher.ReceiveMessage(wctx)
+			require.NoError(t, err, "closing consumer did not wake the other")
+			assert.ErrorIs(t, q2.client.ZScore(ctx, q2.getHeartbeatKey(), q1.ackPrefix).Err(), redis.Nil, "heartbeat dropped")
+
+			if c.name == "priority" {
+				assert.Equal(t, "zset", q2.client.Type(ctx, key).Val())
+				assert.Zero(t, q2.client.HLen(ctx, q2.getPriorityKey()).Val())
+				members := q2.client.ZRangeWithScores(ctx, key, 0, -1).Val()
+				require.Len(t, members, 1)
+				assert.EqualValues(t, 3, members[0].Score, "priority kept")
+			}
+			item, ok, _ := c2.DequeueWithAckId()
+			require.True(t, ok)
+			assert.Equal(t, "job", string(item.([]byte)))
+		})
+	}
+}
+
+// A consumer that dies without Close (here its client is closed, which stops
+// its sweep as a crash would) has its items requeued once its heartbeat runs
+// out, long before the visibility timeout. A producer never gets a heartbeat.
+func TestHeartbeatRunsOutRequeues(t *testing.T) {
+	const ttl = 3 * time.Second
+	for _, c := range heartbeatCases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			key := "test_heartbeat_runs_out_" + c.name
+			qs1, qs2 := New(getTestRedisURL()), New(getTestRedisURL())
+			defer qs2.Close()
+			c1, q1, push := c.open(qs1, key)
+			defer c1.Close()
+			delKeys(t, q1.client, key)
+			c2, q2, _ := c.open(qs2, key)
+			defer c2.Close()
+			defer delKeys(t, q2.client, key)
+			q1.heartbeatTimeout.Store(int64(ttl)) // below the setter's floor
+
+			require.True(t, push("job"))
+			_, ok, _ := c1.DequeueWithAckId()
+			require.True(t, ok)
+			require.NoError(t, qs1.Close())
+
+			time.Sleep(ttl - time.Second)
+			assert.Equal(t, 1, q2.GetNackedItemsCount(), "requeued before the heartbeat ran out")
+			deadline := time.Now().Add(4 * time.Second)
+			for c2.Len() == 0 {
+				require.True(t, time.Now().Before(deadline), "dead consumer's item was not requeued")
+				time.Sleep(50 * time.Millisecond)
+			}
+			item, ok, _ := c2.DequeueWithAckId()
+			require.True(t, ok)
+			assert.Equal(t, "job", string(item.([]byte)))
+			assert.ErrorIs(t, q2.client.ZScore(ctx, q2.getHeartbeatKey(), q1.ackPrefix).Err(), redis.Nil, "dead heartbeat dropped")
+
+			producer, pq, push2 := c.open(qs2, key)
+			defer producer.Close()
+			require.True(t, push2("more"))
+			time.Sleep(1100 * time.Millisecond) // a sweep
+			assert.ErrorIs(t, q2.client.ZScore(ctx, q2.getHeartbeatKey(), pq.ackPrefix).Err(), redis.Nil, "a producer got a heartbeat")
+		})
+	}
+}
+
+// A live consumer keeps its items with no visibility timeout, and a sweeper
+// with none doesn't requeue every pending item as RequeueNackedItems does.
+func TestHeartbeatKeepsLiveConsumersItems(t *testing.T) {
+	const ttl = 3 * time.Second
+	qs := New(getTestRedisURL())
+	defer qs.Close()
+	key := "test_heartbeat_live"
+	holder := qs.NewDistributedQueue(key)
+	defer holder.Close()
+	delKeys(t, holder.Queue.client, key)
+	defer delKeys(t, holder.Queue.client, key)
+	sweeper := qs.NewDistributedQueue(key)
+	defer sweeper.Close()
+	holder.heartbeatTimeout.Store(int64(ttl))
+	holder.SetVisibilityTimeout(0)
+	sweeper.SetVisibilityTimeout(0)
+
+	require.True(t, holder.Enqueue("job"))
+	_, ok, _ := holder.DequeueWithAckId()
+	require.True(t, ok)
+
+	time.Sleep(2*ttl + time.Second)
+	assert.Equal(t, 1, sweeper.GetNackedItemsCount())
+	assert.Zero(t, sweeper.Len())
+}
+
+// A stall of Redis longer than the heartbeat timeout (a failover, a restart,
+// a pause) doesn't make live consumers look dead when it ends: no one could
+// beat during it.
+func TestHeartbeatSurvivesRedisStall(t *testing.T) {
+	const ttl, pause = 3 * time.Second, 4500 * time.Millisecond
+	ctx := context.Background()
+	key := "test_heartbeat_stall"
+	qs1, qs2 := New(getTestRedisURL()), New(getTestRedisURL())
+	defer qs1.Close()
+	defer qs2.Close()
+	a, b := qs1.NewDistributedQueue(key), qs2.NewDistributedQueue(key)
+	defer a.Close()
+	defer b.Close()
+	delKeys(t, a.Queue.client, key)
+	defer delKeys(t, a.Queue.client, key)
+	for _, q := range []*DistributedQueue{a, b} {
+		q.heartbeatTimeout.Store(int64(ttl))
+		require.True(t, q.Enqueue("job"))
+		_, ok, _ := q.DequeueWithAckId()
+		require.True(t, ok)
+	}
+	time.Sleep(1500 * time.Millisecond) // the sweeps set the clock
+
+	opts, err := redis.ParseURL(getTestRedisURL())
+	require.NoError(t, err)
+	admin := redis.NewClient(opts)
+	defer admin.Close()
+	require.NoError(t, admin.Do(ctx, "CLIENT", "PAUSE", pause.Milliseconds()).Err())
+	time.Sleep(pause + ttl)
+
+	assert.EqualValues(t, 2, admin.HLen(ctx, a.getNackedItemKey()).Val(), "a live consumer's item was requeued")
+	assert.Zero(t, admin.LLen(ctx, key).Val())
+	assert.EqualValues(t, 2, admin.ZCard(ctx, a.getHeartbeatKey()).Val())
+}
+
+// Close pushes an item back before it drops it from pending, so a push that
+// fails (here the queue key holds a string) leaves the item pending.
+func TestCloseKeepsItemWhenPushFails(t *testing.T) {
+	for _, c := range retryCases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			q, push, cleanup := c.setup(t, getTestRedisURL())
+			defer cleanup()
+			delKeys(t, q.client, q.queueKey)
+			defer delKeys(t, q.client, q.queueKey)
+			require.True(t, push("a"))
+			var ok bool
+			if c.name == "priority" {
+				_, ok, _ = (&PriorityQueue{Queue: q}).DequeueWithAckId()
+			} else {
+				_, ok, _ = q.DequeueWithAckId()
+			}
+			require.True(t, ok)
+
+			require.NoError(t, q.client.Set(ctx, q.queueKey, "not a queue", 0).Err())
+			assert.Error(t, q.Close())
+			assert.EqualValues(t, 1, q.client.HLen(ctx, q.getNackedItemKey()).Val())
+		})
+	}
 }
