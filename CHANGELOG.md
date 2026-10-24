@@ -7,68 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-24
+
 ### Added
 
-- Heartbeats: a consumer that dies or loses Redis has its unacknowledged
-  items requeued, and idle consumers woken, once its heartbeat timeout runs
-  out (30s by default) instead of after the visibility timeout
-  - `SetHeartbeatTimeout` - how long a queue object may go without reaching
-    Redis before other processes requeue its items (at least 5s; 0 or less
-    turns it off)
-  - A pop renews the heartbeat in the same step, and the sweep every second.
-    Producers never get one, and items of older versions or tracked with
-    `PrepareForFutureAck` still wait for the visibility timeout
-  - A stall of Redis itself (failover, restart, pause) doesn't make live
-    consumers look dead: heartbeats move on by the gap between sweeps
-  - New keys `<key>:heartbeats` and `<key>:heartbeats:clock`
-- Presence: a distributed consumer whose process exits has its items
-  requeued about 5s after Redis drops its pub/sub subscription, without
-  waiting for the heartbeat
-  - A distributed queue's wake channel is now named after its ack ID prefix
-  - Counts as gone only with no subscriber and no sweep of its own for 5s, so
-    a go-redis reconnect or a lone dropped pub/sub connection doesn't count.
-    A lost host, whose socket Redis keeps, still waits for the heartbeat
-  - New key `<key>:presence`
+- `DequeueBatchWithAckIds` pops up to 1000 items in one retry-safe round trip, on all four queue types (#14)
+- `DequeueBatchWithAckIds` sizes each call by recent runs, so it may return fewer items than are queued with `remaining > 0` (#15)
+- `EnqueueOnce` stores a job once per id within a dedup window; `SetDedupWindow` sets it, 5m by default (#18)
+- `SetHeartbeatTimeout`: how long a consumer may go without reaching Redis before its un-acked items are requeued, 30s by default (#21)
+- A distributed consumer that exits without `Close` has its items requeued in about 6s, once its pub/sub subscription has been gone 5s (#21)
+- New keys `<key>:idle`, `<key>:seq`, `<key>:prio`, `<key>:dedup:<id>`, `<key>:heartbeats`, `<key>:heartbeats:clock`, `<key>:presence` and pub/sub channels `<key>:wake:<id>` (#5, #8, #11, #18, #21)
+- `make diagrams` regenerates the animated README diagrams and checks the behaviour they draw (#22)
 
 ### Changed
 
-- `Close` requeues the items the queue object dequeued and has not
-  acknowledged at once, and a distributed queue wakes another consumer for
-  them. Stop or drain workers before `Close`, or jobs still running run again
-  elsewhere. `Close` can now return an error from that requeue
-- The sweep requeues items whose visibility deadline passed even on a queue
-  object whose own visibility timeout is 0, and pushes an item back before
-  removing it from pending
-- The varmq consumer example stops its worker and closes the queue on
-  SIGINT/SIGTERM
-- A distributed consumer busy with work it popped no longer rejoins the idle
-  set within a second of the queue emptying, so an enqueue wakes a free
-  consumer at once instead of the busy one, which ignored the wake while the
-  free one waited up to a second for its nudge. A consumer is idle again once
-  its own `Len()` or dequeue finds the queue empty, so one that takes a
-  single item per wake and never looks again is now only nudged
+- **Breaking:** an enqueue wakes up to one idle consumer per waiting item, each on its own channel, instead of broadcasting to all; upgrade consumers before producers (#11)
+- **Breaking:** heartbeats are on by default: a consumer frozen or cut off from Redis for over 30s has its running jobs requeued, and its late `Acknowledge` still returns true (#21)
+- **Breaking:** `Close` requeues the items the object popped with an ack ID and has not acknowledged, and can return an error; stop workers before `Close` (#21)
+- **Breaking:** priority queue members carry a sequence prefix; upgrade every consumer of a priority queue together (#5)
+- **Breaking:** Redis must allow Lua scripts (`EVALSHA`); pops, pushes, the sweep and `Close` run as scripts (#3, #5, #7, #21)
+- **Breaking:** requires Go 1.26, for go-redis v9.23.0 (#20)
+- On a distributed consumer, a `Len()` of 0 or an empty dequeue joins the idle set (#11)
+- A busy distributed consumer stays out of the idle set, so wakes go to free ones; one that stops pulling before the queue empties waits for the nudge (#23)
+- Each distributed consumer runs a 1s nudge: while items wait, its `Subscribe` handlers get `"enqueued"` even with no new enqueue (#11)
+- The sweep and `Close` of a distributed queue wake up to one idle consumer per item they requeue (#7, #11, #21)
+- varmq's `Submitted` metric counts wakes, not jobs (#11)
+- Ack IDs look like `<prefix>:<reservation>:<index>` instead of a cuid (#14)
+- `PriorityQueue.Remove` scans the queue, O(n), to match a member's sequence prefix (#5)
+- Queue methods no longer hold a mutex across Redis calls (#13)
+- `Notification.Start` does nothing after its first call (#11)
+- Upgraded go-redis from v9.7.3 to v9.23.0; `New` keeps 9.7's 3s read timeout and 512ms max retry backoff unless the URL sets them, and dials once (#20)
+- go-redis v9.23.0 retries pool and dial timeouts, so a call to a host that drops packets can take about 20s to fail (#20)
+- Pipelines use a separate pool of up to 10 connections; `pipeline_pool_size=-1` in the URL turns it off (#20)
+- Maintenance notifications are on by default; go-redis relaxes its timeouts to 10s while Redis Cloud or Redis Software signals maintenance (#20)
+- A zero duration with a unit in the URL (`read_timeout=0s`) turns that timeout off instead of meaning the default (#20)
+- README rewritten, with animated diagrams of acks, wakes, `Close` and crash recovery (#19, #22)
+- The varmq consumer example stops its worker and closes the queue on SIGINT/SIGTERM (#21)
+- CI also runs the tests on Redis 6.0, the oldest supported version (#16)
 
-- Upgraded go-redis from v9.7.3 to v9.23.0, which requires Go 1.26
-- `New` keeps go-redis 9.7's client timings (3s read and write timeouts, 512ms
-  max retry backoff, one dial attempt) unless the URL sets them, so the
-  documented re-send window stays at about 4 minutes
-- Behaviour that comes with go-redis v9.23.0:
-  - A pool timeout on any call, and a dial timeout on a single command or
-    script, is now retried: such a call to a Redis host that drops packets
-    can take about 20s to fail instead of about 5s. Pipelines already
-    retried dial timeouts
-  - Pipelines (`Enqueue` with an expiration, `Acknowledge`) use a separate
-    pool of up to 10 connections; add `pipeline_pool_size=-1` to the URL to
-    turn it off
-  - Maintenance notifications are on by default. Open-source Redis rejects
-    them once; on Redis Cloud and Redis Software timeouts are relaxed to 10s
-    during maintenance
-  - A zero duration with a unit in the URL no longer means the default:
-    `read_timeout=0s`, `write_timeout=0s` and `max_retry_backoff=0s` turn
-    it off (as `read_timeout=0` already did), and `dial_timeout=0s` or
-    `pool_timeout=0s` makes that wait fail at once. Leave the parameter out
-    to get the default
-- CI takes its Go version from `go.mod`
+### Deprecated
+
+- `SetAckTimeout` is an alias of `SetVisibilityTimeout`, and a value of 0 or less is ignored (#4)
+
+### Removed
+
+- **Breaking:** `Notification.Send`, the `"dequeued"` notification and the shared `<key>:notifications` channel (#11)
+- The `github.com/lucsky/cuid` dependency; IDs come from `crypto/rand` (#18)
+
+### Fixed
+
+- A client that dies mid-`DequeueWithAckId` no longer loses the job: pop and pending bookkeeping run in one script (#3)
+- A go-redis re-send of `DequeueWithAckId` no longer loses a job, and a failed call's items come back on the next ack pop with room for them (#12)
+- `PrepareForFutureAck` runs atomically (#12)
+- The ack timeout requeues pending jobs instead of deleting them (#4)
+- Expired items are requeued every second while running, not only when a queue is created; each queue object sweeps until `Close` (#7, #21)
+- Visibility deadlines keep sub-second precision, so a job is no longer requeued up to 1s early (#7)
+- Visibility deadlines come from Redis `TIME` when the pop runs, so a delayed pop or a skewed client clock no longer gets an already-expired item (#16)
+- A priority queue keeps identical jobs, and FIFO order within a priority (#5)
+- Concurrent requeues move each expired item exactly once (#6)
+- Priority jobs are requeued at their original priority (#8)
+- A failed priority enqueue no longer publishes `"enqueued"` (#9)
+- `Listen` stops signal delivery when it returns (#10)
+- Containers started together with the same pid and host can no longer get colliding ack IDs (#18)
 
 ## [1.4.0] - 2026-01-29
 
@@ -186,6 +186,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Graceful handling of Redis connection errors
 - Proper cleanup of resources on shutdown
 
+[Unreleased]: https://github.com/goptics/redisq/compare/v1.5.0...HEAD
 [1.0.0]: https://github.com/goptics/redisq/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/goptics/redisq/releases/tag/v0.1.0
 [1.1.0]: https://github.com/goptics/redisq/compare/v1.0.0...v1.1.0
@@ -193,4 +194,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [1.3.0]: https://github.com/goptics/redisq/compare/v1.2.0...v1.3.0
 [1.3.1]: https://github.com/goptics/redisq/compare/v1.3.0...v1.3.1
 [1.4.0]: https://github.com/goptics/redisq/compare/v1.3.1...v1.4.0
+[1.5.0]: https://github.com/goptics/redisq/compare/v1.4.0...v1.5.0
 
