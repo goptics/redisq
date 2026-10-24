@@ -11,16 +11,14 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Notification wakes consumers of a distributed queue. A busy consumer keeps
-// pulling on its own, so only idle ones need a signal: a consumer that finds
-// the queue empty joins the idle set (<key>:idle), and each enqueue or
-// requeue wakes at most one member, on that member's own channel
-// (<key>:wake:<id>). With every consumer busy, nothing is published. A
-// consumer that popped work stays out of the idle set until its own Len or
-// dequeue finds the queue empty again, so wakes go to consumers that can take
-// the job (the nudge only puts back an idle one). The id is
-// the queue's ack ID prefix, so the sweep can tell from the channel whether
-// the owner of pending items is still connected (see tickBody).
+// Notification wakes consumers of a distributed queue. A consumer that finds
+// the queue empty joins the idle set (<key>:idle), and each enqueue or requeue
+// wakes up to one member per waiting item, on that member's own channel
+// (<key>:wake:<id>). A consumer that popped work stays out of the idle set
+// until its own Len or dequeue finds the queue empty again, so wakes go to
+// consumers that can take the job (the nudge only puts back an idle one). The
+// id is the queue's ack ID prefix, so the sweep can tell from the channel
+// whether the owner of pending items is still connected (see tickBody).
 //
 // An instance counts as a consumer once Subscribe is called; a producer-only
 // instance never joins the idle set.
