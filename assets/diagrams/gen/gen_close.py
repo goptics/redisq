@@ -77,8 +77,8 @@ class Sim:
         self.idle = {"C2"}                           # Subscribe put C2 there before the loop starts
         self.idle_log = {"C1": [], "C2": []}         # (t, member?, why)
         self.c = {m: dict(alive=False, consumer=False, sub=False, closed=False, busy=0, slots=[None] * CONC,
-                          pulling=False, signal=False, seq=0, beat=False, ticks=[]) for m in ("C1", "C2")}
-        self.c["C2"].update(alive=True, consumer=True, sub=True)
+                          pulling=False, signal=False, seq=0, beat=False, ticks=[], free=False) for m in ("C1", "C2")}
+        self.c["C2"].update(alive=True, consumer=True, sub=True, free=True)   # free: Notification.idle
         self.log = []
         self.items = {j: [] for j, _ in ENQ}         # job square keyframes
         self.where = {j: [] for j, _ in ENQ}         # (t, place) per job, for the invariants
@@ -124,6 +124,7 @@ class Sim:
         n = len(self.lst)
         if n == 0 and self.c[m]["consumer"]:
             self.sadd(t, m, "Len() = 0")
+            self.c[m]["free"] = True                 # notification.go:184-186
         return n
 
     def set_busy(self, t, m, d):
@@ -174,6 +175,7 @@ class Sim:
             self.at_(arrive + WORK[job], "job_end", m, slot, job)
         if POP > 1 and not self.lst and len(got) < want and st["consumer"]:     # batch idle rule (queue.go popHead)
             self.sadd(t, m, "short pop")
+        st["free"] = POP > 1 and not self.lst and len(got) < want                # distributed.go:72, 82
         self.say(t, f"{m} pops {got} ({why}) -> pending {self.owners()}, list {self.lst}")
 
     def owners(self):
@@ -231,8 +233,11 @@ class Sim:
             return                                   # leave() / Stop: the nudge loop skips, then returns
         st["ticks"].append(t)
         if not self.lst:
-            if self.sadd(t, m, f"nudge, queue empty, {m} {st['busy']}/{CONC} busy"):
-                self.mark.setdefault(f"nudge-readd-{m}", (t, st["busy"]))
+            if st["free"]:                           # only a consumer whose own last look found no work
+                self.sadd(t, m, "nudge, queue empty")
+            elif m not in self.idle:
+                self.mark.setdefault(f"nudge-stays-{m}", (t, st["busy"]))
+                self.say(t, f"{m} nudge: queue empty, {st['busy']}/{CONC} busy -> stays out of :idle")
         else:
             self.srem(t, m, "nudge, items waiting")
             self.say(t, f"{m} nudge: {len(self.lst)} waiting -> poke")
@@ -241,7 +246,7 @@ class Sim:
             self.at_(t + 1, "nudge", m)
 
     def on_subscribe(self, t, m):
-        self.c[m].update(alive=True, consumer=True, sub=True)
+        self.c[m].update(alive=True, consumer=True, sub=True, free=True)
         self.say(t, f"{m} starts and subscribes")
         self.sadd(t, m, "Subscribe")
         self.at_(t + 1, "nudge", m)                  # the ticker started when the queue was built
@@ -410,10 +415,12 @@ def build():
     landed = {j: s.where[j][0][0] for j, _ in ENQ}                              # RPUSH instants
     assert s.wakes[0][1] == "C2" and s.wakes[0][0] + travel(WAKE_PATH["C2"], WAKE_V) > max(landed.values()), \
         "the whole burst is in the list before C2's wake arrives"
-    # C2's chip is back in :idle by its nudge while full, is there at Close, and leave() removes it before the release
-    t_readd, busy_readd = s.mark["nudge-readd-C2"]
-    assert busy_readd == CONC and t_readd < close, (t_readd, busy_readd)       # notification.go:73-74
-    assert "C2" in s.mark["idle_at_close"] and s.mark["left"] and close < rel_t  # distributed.go:82-83, notification.go:211-214
+    # full C2's nudge leaves it out of :idle (notification.go:74-77), so it is not there at Close; leave() runs
+    # before the release all the same (distributed.go:90-91, notification.go:218-221)
+    t_stay, busy_stay = s.mark["nudge-stays-C2"]
+    assert busy_stay == CONC and t_stay < close, (t_stay, busy_stay)
+    assert "C2" not in s.mark["idle_at_close"] and not s.mark["left"] and close < rel_t
+    assert not [t for t, member, _ in s.idle_log["C2"] if member], "C2 never rejoins :idle while it holds jobs"
     assert all(t < close for t in s.c["C2"]["ticks"]), "no C2 nudge after Close"
     # the release: all of C2's entries in one script, LPUSH in pop order → J3 J2 J1 from the head; beat dropped
     assert rel_ids == ["J1", "J2", "J3"] and rel_list == ["J3", "J2", "J1"], (rel_ids, rel_list)   # queue.go:840-849, 747
@@ -498,7 +505,7 @@ def build():
     steps_end = wake_t + STEPS_FOR
     steps = {"note-leave": close, "note-release": rel_t, "note-wake": wake_t}
     assert close < rel_t < wake_t, steps
-    notes = {"why-nowake": nowake, "note-nudge": [(t_readd, t_readd + 1.1)]}
+    notes = {"why-nowake": nowake, "note-nudge": [(t_stay, t_stay + 1.1)]}
     for k, v in notes.items():
         flash(k, v, 1)
     for k, t0 in steps.items():

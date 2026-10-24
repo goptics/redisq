@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 420" width="960" height="420" role="img" aria-labelledby="title desc">
-  <title id="title">redisq wake-ups: an enqueue wakes a random idle consumer, and a once-a-second nudge catches the wakes that land on a busy one</title>
+  <title id="title">redisq wake-ups: an enqueue wakes a random idle consumer; a busy consumer stays out of the idle set until it finds the queue empty</title>
   <desc id="desc">{DESC}</desc>
   <style>
     :root {

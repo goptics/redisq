@@ -1,7 +1,7 @@
 # redisq README diagrams: storyboard
 
 Four animated SVGs for the README, built from `gen_<slug>.py` + `<slug>.tpl.svg` with `kfu.py`
-(`make diagrams`). Facts cite the code on `docs/readme-explainers` (from `feat/heartbeat-requeue`, `9cdfcf4`)
+(`make diagrams`). Facts cite the code on `docs/readme-explainers` (on top of `fix/wasted-wakes`, `ad8aa9a`)
 and, for consumer behaviour, varmq v1.9.0 (`$GOMODCACHE/github.com/goptics/varmq@v1.9.0`, written `varmq/…`).
 Every timeline below is simulated in its generator, and the invariants are `assert`s there.
 
@@ -32,14 +32,14 @@ Signals run along the top. Times that can't be shown at real speed carry a "time
 | Each Queue object sweeps once a second; the sweep requeues every item whose deadline passed, to the list front (`LPUSH`), push before delete, in one script | `queue.go:884-885`, `queue.go:807`, `queue.go:747-757` |
 | An enqueue pushes and wakes up to *n* idle consumers in one script, *n* = items waiting after the push | `distributed.go:9-11` |
 | Wake = `SPOP` a **random** member of `:idle`, `PUBLISH` to its channel; a member with no subscriber is skipped; nothing is sent when `:idle` is empty | `notification.go:52-64` |
-| A consumer joins `:idle` on `Subscribe`, when its `Len()` reads 0 (varmq calls it at job end and in its pull loop), at its nudge while the queue is empty, and when a pop finds nothing (a race) | `notification.go:161-168`, `notification.go:45-47`, `notification.go:73-75`, `queue.go:476-478`; `varmq/worker_pool.go:166`, `varmq/worker_eventloop.go:26` |
-| **Nudge**: once a second per consumer, busy or not: queue empty → `SADD` itself to `:idle`; items waiting → `SREM` itself and poke its own worker locally | `notification.go:73-75`, `notification.go:122-145` |
+| A consumer joins `:idle` on `Subscribe`, when its `Len()` reads 0 (varmq calls it at job end and in its pull loop), when a pop finds nothing (a race), and at its nudge while the queue is empty, if its own last `Len()` or pop found no work | `notification.go:164-171`, `notification.go:45-47`, `notification.go:184-186`, `notification.go:74-77`, `queue.go:476-478`; `varmq/worker_pool.go:166`, `varmq/worker_eventloop.go:26` |
+| **Nudge**: once a second per consumer: items waiting → `SREM` itself and poke its own worker locally; queue empty → `SADD` itself to `:idle` only if its own last `Len()` or pop found no work (`Notification.idle`: a pop that returns a job clears it, so a busy consumer stays out) | `notification.go:74-77`, `notification.go:125-149`, `distributed.go:60`, `distributed.go:72`, `distributed.go:82` |
 | A busy consumer ignores a wake or poke; a consumer with free slots pops while `Len() > 0`, one `DequeueWithAckId` per free slot (ack sources never batch); a finished job makes it check again | `varmq/worker_eventloop.go:26`, `varmq/worker_eventloop.go:185`, `varmq/source.go:125-136`, `varmq/worker_pool.go:151`, `varmq/source_manager.go:87-91` |
 | A requeue of *n* items wakes up to *n* idle consumers (distributed queues only) | sweep `queue.go:912`, Close `queue.go:1023`, `queue.go:917-923`, `distributed.go:29` |
 | Each pop that hands out items sets the owner's heartbeat to now + heartbeat timeout (default 30 s); its own sweep renews it and resets its presence mark | `queue.go:647-650`, `queue.go:67`, `queue.go:797-800` |
 | Presence: owner with a live heartbeat seen subscribed (mark 0) → a sweep that moves the shared clock and sees no subscriber sets mark = now → a later such sweep with now - mark ≥ 5 s finds it dead | `queue.go:794-795`, `queue.go:811-821`, `queue.go:867` |
 | A dead owner (presence, or heartbeat expired) has all its pending items requeued (list front) and its heartbeat and mark dropped | `queue.go:810`, `queue.go:823-833` |
-| `DistributedQueue.Close`: leave `:idle`, requeue own pending items, drop own heartbeat and presence, wake | `distributed.go:81-86`, `notification.go:211-214`, `queue.go:996-1025`, `queue.go:840-849` |
+| `DistributedQueue.Close`: leave `:idle`, requeue own pending items, drop own heartbeat and presence, wake | `distributed.go:89-94`, `notification.go:218-221`, `queue.go:996-1025`, `queue.go:840-849` |
 | An `Acknowledge` after `Close` fails | `queue.go:337-339` |
 | varmq acknowledges a job whose handler failed or panicked | `varmq/main.go:61-79`, `varmq/worker_pool.go:127-131`, `varmq/job.go:291-330` |
 
@@ -75,36 +75,35 @@ README note: varmq acknowledges failed jobs too; under varmq a job reaches this 
 
 ## 2. Waking idle consumers  (`redisq-wake.svg`)
 
-Question: when a job arrives, who is told, and what if the wake lands on a busy consumer?
+Question: when a job arrives, who is told, and why not a busy consumer?
 Actors: `Enqueue` (one script: `RPUSH` + wake); Redis box: queue, `:idle` set (chips C1, C2); consumers C1, C2
 (`DistributedQueue` + varmq worker, concurrency 1), each with its own wake channel and a nudge tick (once a
 second, fixed phase per consumer: C1 at .3 + k, C2 at .8 + k).
-States: chip in `:idle` or not; consumer idle / busy; wake reached / ignored.
+States: chip in `:idle` or not; consumer idle / busy.
 Start state: queue empty, C1 and C2 idle, both chips in `:idle` (Subscribe added them; nudges keep them there).
 Timeline (simulated):
   0.5 Enqueue X: n = 1 → SPOP (random; here C1) → PUBLISH → C1 pops X at once, busy. Its chip left at the SPOP.
-  C1's next nudge (1.3): queue empty → SADD: C1's chip is back in `:idle` although C1 is busy (purple "nudge")
-  2.0 Enqueue Y (drawn at 2.0, not 2.2: round trips are slowed down, so Y's wake must land before C1's 2.3 nudge):
-      n = 1 → SPOP picks C1 (busy) → PUBLISH counts as a wake, C1 ignores it (red "busy: ignored");
-      Y waits; C2 is still in `:idle`
-  2.8 C2's nudge: Y waiting → SREM C2, poke → C2 pops Y (≤ 1 s late)
-  C1 finishes X → its `Len()` reads 0 → back in `:idle`; C2's next nudge (3.8) puts C2 back in `:idle` while it
-  still runs Y, so its `Len()` at the end of Y changes nothing
+  C1's nudges (1.3, 2.3): queue empty, but C1's last pop found work → no SADD: its chip stays out while it runs X
+      (purple "busy: stays out")
+  1.85 Enqueue Y (after C1's 1.3 nudge; drawn so its slowed wake and pop end before C2's 2.8 nudge):
+      n = 1 → `:idle` holds only C2 → SPOP C2 → PUBLISH → C2 pops Y at once; C2's nudges then leave it out too
+  C1 finishes X → its `Len()` reads 0 → back in `:idle`; C2 finishes Y → back the same way
 Loop: D = ceil(max(last `:idle` change, last job end) + 1.5), whole seconds so the nudge pulses repeat
 Invariants:
   - wakes per enqueue ≤ items waiting after the push and ≤ `:idle` members — `distributed.go:9-11`, `notification.go:57-60`
   - SPOP removes the member before the PUBLISH — `notification.go:58`
-  - a nudge SADDs whenever the queue is empty, busy or not; SREMs + pokes when items wait — `notification.go:73-75`, `notification.go:133-143`
-  - a busy consumer ignores a wake or poke — `varmq/worker_eventloop.go:26`
-  - a waiting item is taken within ≤ 1 s by a free consumer's nudge — `notification.go:123`
+  - a nudge SREMs + pokes when items wait; with the queue empty it SADDs only a consumer whose own last `Len()` or
+    pop found no work — `notification.go:74-77`, `notification.go:140-146`
+  - no consumer rejoins `:idle` while it runs a job; no wake or poke reaches a busy consumer — `varmq/worker_eventloop.go:26`
+  - each job is popped through its own wake, under half a (drawn) second after its enqueue, not by a nudge
   - every job popped once; end: queue empty, both chips in `:idle`
-Why-labels: "busy: ignored"
-Still frame: Y waiting, the ignored wake on C1, C2's chip still in `:idle`
+Why-labels: "busy: stays out"
+Still frame: Y's wake on its way to C2, busy C1 out of `:idle`
 Seam check: queue empty, C1 and C2 idle, both chips in `:idle`
 Builds on: 1, adds consumers that wait for a signal, and the 1 s nudge as fallback
-README note: SPOP is random; with several idle consumers most wakes land on a free one. The nudge (one script per
-consumer per second) bounds a lost wake to ≤ 1 s. The comment at `notification.go:14-18` used to say "With every
-consumer busy, nothing is published"; this branch corrects it (two more lines, so later citations moved by +2).
+README note: SPOP is random among idle consumers; a busy one is not among them. The nudge (one script per consumer
+per second) bounds a lost wake to ≤ 1 s. A wake can still reach a consumer that can't take the job: a paused
+worker, or one marked idle by a `Len()` call from elsewhere while it is busy.
 
 ## 3. `Close` hands work back  (`redisq-close.svg`)
 
@@ -116,7 +115,7 @@ Timeline (simulated):
   0.4 Enqueue J1, J2, J3 back to back: J1's push SPOPs C2 and PUBLISHes; J2 and J3 find `:idle` empty (no wake)
   C2 wakes with 3 free slots → three back-to-back `DequeueWithAckId` calls (one per free slot; varmq ack sources
   never batch), each moving one job to pending (tagged C2) in one script; C2 3/3 busy
-  C2's next nudge: queue empty → C2's chip back in `:idle` although full
+  C2's nudges: queue empty, but its last pop found work → no SADD: C2's chip stays out while it is full
   2.4 C1 starts: `Subscribe` adds its chip
   3.4 C2 `Close()` with J1-J3 still running and unacknowledged:
       leave() pulls C2's chip out of `:idle` → release script: J1-J3 back to the list front (`LPUSH` in pop order,
@@ -128,7 +127,7 @@ Loop: D = ceil(cross-fade end + .5), whole seconds so the nudge pulses repeat
 Invariants:
   - only J1's push wakes (n ≥ 1 but `:idle` empty for J2, J3) — `distributed.go:9-11`, `notification.go:58-59`
   - a woken consumer pops while it has a free slot and `Len() > 0`, one `DequeueWithAckId` per slot — `varmq/source.go:125-136`, `varmq/worker_eventloop.go:26`, `varmq/worker_eventloop.go:185`, `queue.go:463-483`
-  - C2's chip is in `:idle` at Close (nudge), and leave() removes it before the release, so wake(3) can only reach C1 — `notification.go:73-74`, `distributed.go:82-83`, `notification.go:211-214`
+  - C2 is full, so its nudges leave it out of `:idle`; at Close leave() finds it out, before the release, so wake(3) can only reach C1 — `notification.go:74-77`, `distributed.go:90-91`, `notification.go:218-221`
   - all of C2's pending entries move back in one script, list order J3 J2 J1; heartbeat and presence dropped — `queue.go:840-849`, `queue.go:747`
   - Close → C1's pop involves no timer (well under a second)
   - every job is acked once, by C1; C2's runs were wasted (at-least-once) — `queue.go:337-339`, `queue.go:992-995`
@@ -183,7 +182,7 @@ cost per pop.
 | Diagram | Generator | D (s) | Reduced-motion still (s) |
 |---|---|---|---|
 | `redisq-ack.svg` | `gen_ack.py` | 17 | 8.55 (B's deadline bar 80% full, "no Acknowledge") |
-| `redisq-wake.svg` | `gen_wake.py` | 7 | 2.52 (Y waiting, ignored wake on C1, C2 in `:idle`) |
+| `redisq-wake.svg` | `gen_wake.py` | 7 | 2.02 (Y's wake on its way to C2, busy C1 out of `:idle`) |
 | `redisq-close.svg` | `gen_close.py` | 11 | 4.15 (jobs back in the list, wake on its way to C1) |
 | `redisq-dead.svg` | `gen_dead.py` | 19 | 10.19 (real t = 11 s) |
 
@@ -213,3 +212,10 @@ section's invariants; `make diagrams` rebuilds them.
     covers the last job end.
   - Diagram 4: mark at 1.3, reap at 6.3; still moved to real t = 11 s.
   - `notification.go` header comment corrected on this branch; its citations here moved by +2.
+- Rebased onto `fix/wasted-wakes` (#23), which changes the nudge: with the queue empty it re-adds only a consumer
+  whose own last `Len()` or pop found no work, so a busy consumer stays out of `:idle`.
+  - Diagram 2 retold: C1 stays out while it runs X, so Y's wake goes to C2 at once; no wake is ignored.
+  - Diagram 3: full C2 stays out of `:idle`; leave() at Close finds it out; C1 rejoins at its first job end.
+  - Diagram 4: C2, holding J1 and J2, starts out of `:idle` (not drawn; the wake reaches C1 either way).
+  - The `notification.go` header comment fix moved to #23, so this branch changes no Go code; `notification.go`
+    and `distributed.go` citations re-mapped.

@@ -119,7 +119,7 @@ class Redis:
         return n, ticked, notes
 
     def wake(self, count, order):
-        """wakeFn (notification.go:54-63): SPOP members until count are reached; a member whose channel has no
+        """wakeFn (notification.go:54-65): SPOP members until count are reached; a member whose channel has no
         subscriber is skipped. SPOP is random: `order` is one possible sequence of picks."""
         woken = []
         for m in order:
@@ -133,9 +133,9 @@ class Redis:
 
 def simulate(row):
     r = Redis()
-    r.subs = {"C1": 1, "C2": 1}            # both subscribed to their own wake channel (notification.go:83)
-    r.idle = {"C1", "C2"}                  # Subscribe adds them; C2's nudge keeps it in while the queue is empty,
-    r.lst = ["J1", "J2"]                   # busy or not (notification.go:73-75, 161-168)
+    r.subs = {"C1": 1, "C2": 1}            # both subscribed to their own wake channel (notification.go:85)
+    r.idle = {"C1"}                        # Subscribe added both; C2 popped J1, J2, so its nudge leaves it out while
+    r.lst = ["J1", "J2"]                   # it holds them (notification.go:74-77, 164-171)
     for _ in range(2):
         r.pop_one("C2", T0)
     where = {"J1": [(T0, "pending:C2")], "J2": [(T0, "pending:C2")]}

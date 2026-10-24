@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 420" width="960" height="420" role="img" aria-labelledby="title desc">
-  <title id="title">redisq wake-ups: an enqueue wakes a random idle consumer, and a once-a-second nudge catches the wakes that land on a busy one</title>
-  <desc id="desc">Two consumers, C1 and C2, each a DistributedQueue with a varmq worker running one job at a time, wait on one Redis list. At the start the queue is empty, both consumers are free, and both are members of the :idle set, which Subscribe joined them to. Every consumer runs a nudge once a second: when the queue is empty it adds itself to :idle (SADD), and when items wait it removes itself (SREM) and pokes its own worker. Job X is enqueued: one script pushes it (RPUSH) and wakes one idle consumer, because one item waits. SPOP takes a random member of :idle, here C1, and PUBLISH sends the wake on C1's own channel. C1 is free, so it pops X at once and runs it. C1's next nudge finds the queue empty and puts C1 back in :idle although C1 is busy. Job Y is enqueued: SPOP takes C1 again, the PUBLISH reaches C1, and C1 ignores it because it is busy; its own nudge a moment later pokes it and is ignored too. Y waits, and C2 is still in :idle. Less than a second later C2's nudge finds Y waiting: it removes C2 from :idle and pokes C2, which pops Y. C1 finishes X; its Len() call finds the queue empty and puts it back in :idle. C2's next nudge, with the queue empty, puts C2 back in :idle while it still runs Y, and C2 then finishes Y. At the end the queue is empty, both consumers are free, and both are in :idle. Each job was popped once. Redis round trips are slowed down; the nudge period is the real one second.</desc>
+  <title id="title">redisq wake-ups: an enqueue wakes a random idle consumer; a busy consumer stays out of the idle set until it finds the queue empty</title>
+  <desc id="desc">Two consumers, C1 and C2, each a DistributedQueue with a varmq worker running one job at a time, wait on one Redis list. At the start the queue is empty, both consumers are free, and both are members of the :idle set, which Subscribe joined them to. Every consumer runs a nudge once a second: when items wait it removes itself from :idle (SREM) and pokes its own worker, and when the queue is empty it adds itself back (SADD), but only if its own last look at the queue found no work for it. Job X is enqueued: one script pushes it (RPUSH) and wakes one idle consumer, because one item waits. SPOP takes a random member of :idle, here C1, and PUBLISH sends the wake on C1's own channel. C1 pops X at once and runs it. C1's next nudges find the queue empty, but C1 popped work, so they leave it out of :idle while it is busy. Job Y is enqueued: C2 is the only member of :idle, so SPOP takes C2, and C2 pops Y at once. C1 finishes X; its Len() call finds the queue empty and puts it back in :idle. C2 finishes Y and rejoins the same way. At the end the queue is empty, both consumers are free, and both are in :idle. Each job was popped once, by the consumer its wake reached. Redis round trips are slowed down; the nudge period is the real one second.</desc>
   <style>
     :root {
       --dur: 7s;
@@ -75,61 +75,61 @@
     #clC11 { animation-name: clC11; }
     #clC12 { animation-name: clC12; }
     #hlC1pink { animation-name: hlC1pink; }
-    #hlC1purple { animation-name: hlC1purple; }
     #hlC1fg { animation-name: hlC1fg; }
+    #hlC1purple { animation-name: hlC1purple; }
     #chipC2 { animation-name: chipC2; }
     #clC20 { animation-name: clC20; }
     #clC21 { animation-name: clC21; }
+    #clC22 { animation-name: clC22; }
+    #hlC2pink { animation-name: hlC2pink; }
+    #hlC2fg { animation-name: hlC2fg; }
     #hlC2purple { animation-name: hlC2purple; }
     #glowC1 { animation-name: glowC1; }
     #barC1 { animation-name: barC1; }
     #stC10 { animation-name: stC10; }
     #stC11 { animation-name: stC11; }
     #ringC1 { animation-name: ringC1; }
-    #pokeC1 { animation-name: pokeC1; }
-    #whyC1 { animation-name: whyC1; }
     #glowC2 { animation-name: glowC2; }
     #barC2 { animation-name: barC2; }
     #stC20 { animation-name: stC20; }
     #stC21 { animation-name: stC21; }
     #ringC2 { animation-name: ringC2; }
-    #pokeC2 { animation-name: pokeC2; }
     @keyframes itemX { 0% { opacity: 0; transform: translate(100px, 326px); } 1.43% { opacity: 0; transform: translate(100px, 326px); } 2.86% { opacity: 1; transform: translate(112px, 326px); } 7.14% { opacity: 1; transform: translate(392px, 326px); } 10.49% { opacity: 1; transform: translate(392px, 326px); } 12.63% { opacity: 0; transform: translate(400px, 326px); } 100% { opacity: 0; transform: translate(400px, 326px); } }
-    @keyframes itemY { 0% { opacity: 0; transform: translate(100px, 326px); } 22.86% { opacity: 0; transform: translate(100px, 326px); } 24.29% { opacity: 1; transform: translate(112px, 326px); } 28.57% { opacity: 1; transform: translate(392px, 326px); } 40.57% { opacity: 1; transform: translate(392px, 326px); } 42.71% { opacity: 0; transform: translate(400px, 326px); } 100% { opacity: 0; transform: translate(400px, 326px); } }
-    @keyframes enq-glow { 0% { opacity: 0; } 1.43% { opacity: 0; } 3.14% { opacity: 0.25; } 7.14% { opacity: 0.25; } 10.71% { opacity: 0; } 22.86% { opacity: 0; } 24.57% { opacity: 0.25; } 28.57% { opacity: 0.25; } 32.14% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes itemY { 0% { opacity: 0; transform: translate(100px, 326px); } 20.71% { opacity: 0; transform: translate(100px, 326px); } 22.14% { opacity: 1; transform: translate(112px, 326px); } 26.43% { opacity: 1; transform: translate(392px, 326px); } 31.87% { opacity: 1; transform: translate(392px, 326px); } 34.01% { opacity: 0; transform: translate(400px, 326px); } 100% { opacity: 0; transform: translate(400px, 326px); } }
+    @keyframes enq-glow { 0% { opacity: 0; } 1.43% { opacity: 0; } 3.14% { opacity: 0.25; } 7.14% { opacity: 0.25; } 10.71% { opacity: 0; } 20.71% { opacity: 0; } 22.43% { opacity: 0.25; } 26.43% { opacity: 0.25; } 30% { opacity: 0; } 100% { opacity: 0; } }
     @keyframes whl0 { 0% { opacity: 0; } 7.14% { opacity: 0; } 8% { opacity: 0.55; } 9.92% { opacity: 0.55; } 14.2% { opacity: 0; } 100% { opacity: 0; } }
     @keyframes wdot0 { 0% { opacity: 0; transform: translate(440px, 173px); } 6.57% { opacity: 0; transform: translate(440px, 173px); } 7.14% { opacity: 1; transform: translate(440px, 173px); } 9.33% { opacity: 1; transform: translate(624px, 173px); } 9.91% { opacity: 1; transform: translate(624px, 222px); } 11.63% { opacity: 0; transform: translate(624px, 222px); } 100% { opacity: 0; transform: translate(624px, 222px); } }
-    @keyframes whl1 { 0% { opacity: 0; } 28.57% { opacity: 0; } 29.43% { opacity: 0.55; } 31.35% { opacity: 0.55; } 35.63% { opacity: 0; } 100% { opacity: 0; } }
-    @keyframes wdot1 { 0% { opacity: 0; transform: translate(440px, 173px); } 28% { opacity: 0; transform: translate(440px, 173px); } 28.57% { opacity: 1; transform: translate(440px, 173px); } 30.76% { opacity: 1; transform: translate(624px, 173px); } 31.34% { opacity: 1; transform: translate(624px, 222px); } 36.34% { opacity: 1; transform: translate(624px, 222px); } 38.06% { opacity: 0; transform: translate(624px, 222px); } 100% { opacity: 0; transform: translate(624px, 222px); } }
-    @keyframes wtxtX { 0% { opacity: 0; } 7.14% { opacity: 0; } 8.86% { opacity: 1; } 24.29% { opacity: 1; } 27.86% { opacity: 0; } 100% { opacity: 0; } }
-    @keyframes wtxtY { 0% { opacity: 0; } 28.57% { opacity: 0; } 30.29% { opacity: 1; } 45.71% { opacity: 1; } 49.29% { opacity: 0; } 100% { opacity: 0; } }
-    @keyframes pdotX { 0% { opacity: 0; transform: translate(440px, 341px); } 9.91% { opacity: 0; transform: translate(440px, 341px); } 10.49% { opacity: 1; transform: translate(440px, 341px); } 14.87% { opacity: 1; transform: translate(624px, 341px); } 15.33% { opacity: 1; transform: translate(624px, 322px); } 17.04% { opacity: 0; transform: translate(624px, 322px); } 100% { opacity: 0; transform: translate(624px, 322px); } }
-    @keyframes pdotY { 0% { opacity: 0; transform: translate(440px, 341px); } 40% { opacity: 0; transform: translate(440px, 341px); } 40.57% { opacity: 1; transform: translate(440px, 341px); } 49.14% { opacity: 1; transform: translate(800px, 341px); } 49.6% { opacity: 1; transform: translate(800px, 322px); } 51.31% { opacity: 0; transform: translate(800px, 322px); } 100% { opacity: 0; transform: translate(800px, 322px); } }
-    @keyframes chipC1 { 0% { opacity: 1; } 7.14% { opacity: 1; } 10% { opacity: 0; } 18.57% { opacity: 0; } 21.43% { opacity: 1; } 28.57% { opacity: 1; } 31.43% { opacity: 0; } 43.89% { opacity: 0; } 46.75% { opacity: 1; } 100% { opacity: 1; } }
-    @keyframes clC10 { 0% { opacity: 0; } 7.14% { opacity: 0; } 8.86% { opacity: 1; } 14.29% { opacity: 1; } 17.86% { opacity: 0; } 28.57% { opacity: 0; } 30.29% { opacity: 1; } 39.61% { opacity: 1; } 43.18% { opacity: 0; } 100% { opacity: 0; } }
-    @keyframes clC11 { 0% { opacity: 0; } 18.57% { opacity: 0; } 20.29% { opacity: 1; } 24.29% { opacity: 1; } 27.86% { opacity: 0; } 100% { opacity: 0; } }
-    @keyframes clC12 { 0% { opacity: 0; } 43.89% { opacity: 0; } 45.61% { opacity: 1; } 59.61% { opacity: 1; } 63.18% { opacity: 0; } 100% { opacity: 0; } }
-    @keyframes hlC1pink { 0% { opacity: 0; } 7.14% { opacity: 0; } 8% { opacity: 0.9; } 12.14% { opacity: 0.9; } 16.43% { opacity: 0; } 28.57% { opacity: 0; } 29.43% { opacity: 0.9; } 33.57% { opacity: 0.9; } 37.86% { opacity: 0; } 100% { opacity: 0; } }
-    @keyframes hlC1purple { 0% { opacity: 0; } 18.57% { opacity: 0; } 19.43% { opacity: 0.9; } 23.57% { opacity: 0.9; } 27.86% { opacity: 0; } 100% { opacity: 0; } }
-    @keyframes hlC1fg { 0% { opacity: 0; } 43.89% { opacity: 0; } 44.75% { opacity: 0.9; } 48.89% { opacity: 0.9; } 53.18% { opacity: 0; } 100% { opacity: 0; } }
-    @keyframes chipC2 { 0% { opacity: 1; } 40% { opacity: 1; } 42.86% { opacity: 0; } 54.29% { opacity: 0; } 57.14% { opacity: 1; } 100% { opacity: 1; } }
-    @keyframes clC20 { 0% { opacity: 0; } 40% { opacity: 0; } 41.71% { opacity: 1; } 50% { opacity: 1; } 53.57% { opacity: 0; } 100% { opacity: 0; } }
-    @keyframes clC21 { 0% { opacity: 0; } 54.29% { opacity: 0; } 56% { opacity: 1; } 70% { opacity: 1; } 73.57% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes whl1 { 0% { opacity: 0; } 26.43% { opacity: 0; } 27.29% { opacity: 0.55; } 31.3% { opacity: 0.55; } 35.58% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes wdot1 { 0% { opacity: 0; transform: translate(440px, 173px); } 25.86% { opacity: 0; transform: translate(440px, 173px); } 26.43% { opacity: 1; transform: translate(440px, 173px); } 30.71% { opacity: 1; transform: translate(800px, 173px); } 31.3% { opacity: 1; transform: translate(800px, 222px); } 33.01% { opacity: 0; transform: translate(800px, 222px); } 100% { opacity: 0; transform: translate(800px, 222px); } }
+    @keyframes wtxtX { 0% { opacity: 0; } 7.14% { opacity: 0; } 8.86% { opacity: 1; } 22.14% { opacity: 1; } 25.71% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes wtxtY { 0% { opacity: 0; } 26.43% { opacity: 0; } 28.14% { opacity: 1; } 43.57% { opacity: 1; } 47.14% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes pdotX { 0% { opacity: 0; transform: translate(440px, 341px); } 9.91% { opacity: 0; transform: translate(440px, 341px); } 10.49% { opacity: 1; transform: translate(440px, 341px); } 13.41% { opacity: 1; transform: translate(624px, 341px); } 13.71% { opacity: 1; transform: translate(624px, 322px); } 15.43% { opacity: 0; transform: translate(624px, 322px); } 100% { opacity: 0; transform: translate(624px, 322px); } }
+    @keyframes pdotY { 0% { opacity: 0; transform: translate(440px, 341px); } 31.3% { opacity: 0; transform: translate(440px, 341px); } 31.87% { opacity: 1; transform: translate(440px, 341px); } 37.59% { opacity: 1; transform: translate(800px, 341px); } 37.89% { opacity: 1; transform: translate(800px, 322px); } 39.6% { opacity: 0; transform: translate(800px, 322px); } 100% { opacity: 0; transform: translate(800px, 322px); } }
+    @keyframes chipC1 { 0% { opacity: 1; } 7.14% { opacity: 1; } 10% { opacity: 0; } 42.28% { opacity: 0; } 45.14% { opacity: 1; } 100% { opacity: 1; } }
+    @keyframes clC10 { 0% { opacity: 0; } 7.14% { opacity: 0; } 8.86% { opacity: 1; } 14.29% { opacity: 1; } 17.86% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes clC11 { 0% { opacity: 0; } 42.28% { opacity: 0; } 44% { opacity: 1; } 58% { opacity: 1; } 61.57% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes clC12 { 0% { opacity: 0; } 18.57% { opacity: 0; } 20.29% { opacity: 1; } 38% { opacity: 1; } 41.57% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes hlC1pink { 0% { opacity: 0; } 7.14% { opacity: 0; } 8% { opacity: 0.9; } 12.14% { opacity: 0.9; } 16.43% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes hlC1fg { 0% { opacity: 0; } 42.28% { opacity: 0; } 43.14% { opacity: 0.9; } 47.28% { opacity: 0.9; } 51.57% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes hlC1purple { 0% { opacity: 0; } 18.57% { opacity: 0; } 19.43% { opacity: 0.9; } 23.57% { opacity: 0.9; } 27.86% { opacity: 0; } 32.86% { opacity: 0; } 33.71% { opacity: 0.9; } 37.86% { opacity: 0.9; } 42.14% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes chipC2 { 0% { opacity: 1; } 26.43% { opacity: 1; } 29.29% { opacity: 0; } 66.46% { opacity: 0; } 69.31% { opacity: 1; } 100% { opacity: 1; } }
+    @keyframes clC20 { 0% { opacity: 0; } 26.43% { opacity: 0; } 28.14% { opacity: 1; } 35.71% { opacity: 1; } 39.29% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes clC21 { 0% { opacity: 0; } 66.46% { opacity: 0; } 68.17% { opacity: 1; } 82.17% { opacity: 1; } 85.74% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes clC22 { 0% { opacity: 0; } 40% { opacity: 0; } 41.71% { opacity: 1; } 62.17% { opacity: 1; } 65.74% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes hlC2pink { 0% { opacity: 0; } 26.43% { opacity: 0; } 27.29% { opacity: 0.9; } 31.43% { opacity: 0.9; } 35.71% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes hlC2fg { 0% { opacity: 0; } 66.46% { opacity: 0; } 67.31% { opacity: 0.9; } 71.46% { opacity: 0.9; } 75.74% { opacity: 0; } 100% { opacity: 0; } }
     @keyframes hlC2purple { 0% { opacity: 0; } 40% { opacity: 0; } 40.86% { opacity: 0.9; } 45% { opacity: 0.9; } 49.29% { opacity: 0; } 54.29% { opacity: 0; } 55.14% { opacity: 0.9; } 59.29% { opacity: 0.9; } 63.57% { opacity: 0; } 100% { opacity: 0; } }
-    @keyframes glowC1 { 0% { opacity: 0; } 15.32% { opacity: 0; } 17.04% { opacity: 0.14; } 43.89% { opacity: 0.14; } 47.46% { opacity: 0; } 100% { opacity: 0; } }
-    @keyframes barC1 { 0% { opacity: 1; transform: scaleX(0); } 15.32% { opacity: 1; transform: scaleX(0); } 43.89% { opacity: 1; transform: scaleX(1); } 48.18% { opacity: 0; transform: scaleX(1); } 48.32% { opacity: 1; transform: scaleX(0); } 100% { opacity: 1; transform: scaleX(0); } }
-    @keyframes stC10 { 0% { opacity: 1; } 15.32% { opacity: 1; } 16.46% { opacity: 0; } 43.89% { opacity: 0; } 45.04% { opacity: 1; } 100% { opacity: 1; } }
-    @keyframes stC11 { 0% { opacity: 0; } 15.32% { opacity: 0; } 16.46% { opacity: 1; } 43.89% { opacity: 1; } 45.04% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes glowC1 { 0% { opacity: 0; } 13.71% { opacity: 0; } 15.43% { opacity: 0.14; } 42.28% { opacity: 0.14; } 45.85% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes barC1 { 0% { opacity: 1; transform: scaleX(0); } 13.71% { opacity: 1; transform: scaleX(0); } 42.28% { opacity: 1; transform: scaleX(1); } 46.57% { opacity: 0; transform: scaleX(1); } 46.71% { opacity: 1; transform: scaleX(0); } 100% { opacity: 1; transform: scaleX(0); } }
+    @keyframes stC10 { 0% { opacity: 1; } 13.71% { opacity: 1; } 14.85% { opacity: 0; } 42.28% { opacity: 0; } 43.43% { opacity: 1; } 100% { opacity: 1; } }
+    @keyframes stC11 { 0% { opacity: 0; } 13.71% { opacity: 0; } 14.85% { opacity: 1; } 42.28% { opacity: 1; } 43.43% { opacity: 0; } 100% { opacity: 0; } }
     @keyframes ringC1 { 0% { opacity: 0.000; transform: scale(2.050); } 4.29% { opacity: 0.000; transform: scale(1.000); } 5.43% { opacity: 0.900; transform: scale(1.250); } 12.86% { opacity: 0.000; transform: scale(2.400); } 18.57% { opacity: 0.000; transform: scale(1.000); } 19.71% { opacity: 0.900; transform: scale(1.250); } 27.14% { opacity: 0.000; transform: scale(2.400); } 32.86% { opacity: 0.000; transform: scale(1.000); } 34% { opacity: 0.900; transform: scale(1.250); } 41.43% { opacity: 0.000; transform: scale(2.400); } 47.14% { opacity: 0.000; transform: scale(1.000); } 48.29% { opacity: 0.900; transform: scale(1.250); } 55.71% { opacity: 0.000; transform: scale(2.400); } 61.43% { opacity: 0.000; transform: scale(1.000); } 62.57% { opacity: 0.900; transform: scale(1.250); } 70% { opacity: 0.000; transform: scale(2.400); } 75.71% { opacity: 0.000; transform: scale(1.000); } 76.86% { opacity: 0.900; transform: scale(1.250); } 84.29% { opacity: 0.000; transform: scale(2.400); } 90% { opacity: 0.000; transform: scale(1.000); } 91.14% { opacity: 0.900; transform: scale(1.250); } 98.57% { opacity: 0.000; transform: scale(2.400); } 100% { opacity: 0.000; transform: scale(2.050); } }
-    @keyframes pokeC1 { 0% { opacity: 0; } 32.86% { opacity: 0; } 34.57% { opacity: 1; } 40% { opacity: 1; } 43.57% { opacity: 0; } 100% { opacity: 0; } }
-    @keyframes whyC1 { 0% { opacity: 0; } 31.35% { opacity: 0; } 33.06% { opacity: 1; } 40.32% { opacity: 1; } 43.89% { opacity: 0; } 100% { opacity: 0; } }
-    @keyframes glowC2 { 0% { opacity: 0; } 49.6% { opacity: 0; } 51.31% { opacity: 0.14; } 78.17% { opacity: 0.14; } 81.74% { opacity: 0; } 100% { opacity: 0; } }
-    @keyframes barC2 { 0% { opacity: 1; transform: scaleX(0); } 49.6% { opacity: 1; transform: scaleX(0); } 78.17% { opacity: 1; transform: scaleX(1); } 82.45% { opacity: 0; transform: scaleX(1); } 82.6% { opacity: 1; transform: scaleX(0); } 100% { opacity: 1; transform: scaleX(0); } }
-    @keyframes stC20 { 0% { opacity: 1; } 49.6% { opacity: 1; } 50.74% { opacity: 0; } 78.17% { opacity: 0; } 79.31% { opacity: 1; } 100% { opacity: 1; } }
-    @keyframes stC21 { 0% { opacity: 0; } 49.6% { opacity: 0; } 50.74% { opacity: 1; } 78.17% { opacity: 1; } 79.31% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes glowC2 { 0% { opacity: 0; } 37.88% { opacity: 0; } 39.6% { opacity: 0.14; } 66.46% { opacity: 0.14; } 70.03% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes barC2 { 0% { opacity: 1; transform: scaleX(0); } 37.88% { opacity: 1; transform: scaleX(0); } 66.46% { opacity: 1; transform: scaleX(1); } 70.74% { opacity: 0; transform: scaleX(1); } 70.88% { opacity: 1; transform: scaleX(0); } 100% { opacity: 1; transform: scaleX(0); } }
+    @keyframes stC20 { 0% { opacity: 1; } 37.88% { opacity: 1; } 39.03% { opacity: 0; } 66.46% { opacity: 0; } 67.6% { opacity: 1; } 100% { opacity: 1; } }
+    @keyframes stC21 { 0% { opacity: 0; } 37.88% { opacity: 0; } 39.03% { opacity: 1; } 66.46% { opacity: 1; } 67.6% { opacity: 0; } 100% { opacity: 0; } }
     @keyframes ringC2 { 0% { opacity: 0.692; transform: scale(1.515); } 5.71% { opacity: 0.000; transform: scale(2.400); } 11.43% { opacity: 0.000; transform: scale(1.000); } 12.57% { opacity: 0.900; transform: scale(1.250); } 20% { opacity: 0.000; transform: scale(2.400); } 25.71% { opacity: 0.000; transform: scale(1.000); } 26.86% { opacity: 0.900; transform: scale(1.250); } 34.29% { opacity: 0.000; transform: scale(2.400); } 40% { opacity: 0.000; transform: scale(1.000); } 41.14% { opacity: 0.900; transform: scale(1.250); } 48.57% { opacity: 0.000; transform: scale(2.400); } 54.29% { opacity: 0.000; transform: scale(1.000); } 55.43% { opacity: 0.900; transform: scale(1.250); } 62.86% { opacity: 0.000; transform: scale(2.400); } 68.57% { opacity: 0.000; transform: scale(1.000); } 69.71% { opacity: 0.900; transform: scale(1.250); } 77.14% { opacity: 0.000; transform: scale(2.400); } 82.86% { opacity: 0.000; transform: scale(1.000); } 84% { opacity: 0.900; transform: scale(1.250); } 91.43% { opacity: 0.000; transform: scale(2.400); } 97.14% { opacity: 0.000; transform: scale(1.000); } 98.29% { opacity: 0.900; transform: scale(1.250); } 100% { opacity: 0.692; transform: scale(1.515); } }
-    @keyframes pokeC2 { 0% { opacity: 0; } 40% { opacity: 0; } 41.71% { opacity: 1; } 47.14% { opacity: 1; } 50.71% { opacity: 0; } 100% { opacity: 0; } }
-    @media (prefers-reduced-motion: reduce) { .a { animation-play-state: paused; animation-delay: -2.52s; } }
+    @media (prefers-reduced-motion: reduce) { .a { animation-play-state: paused; animation-delay: -2.02s; } }
   </style>
   <defs>
     <marker id="arr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto">
@@ -152,7 +152,7 @@
     <circle class="ring" cx="286" cy="40" r="5"/><circle class="pip" cx="286" cy="40" r="2.5"/><text class="lg" x="304" y="40">nudge: each consumer, once a second</text>
   </g>
   <text class="m" x="936" y="30" style="text-anchor:end">times not to scale: round trips slowed down</text>
-  <text class="m" x="936" y="48" style="text-anchor:end">SPOP is random; this run draws C1 both times</text>
+  <text class="m" x="936" y="48" style="text-anchor:end">SPOP is random; this run draws C1 first</text>
 
   <!-- producer: one script, RPUSH + wake(n) -->
   <rect class="box prod" x="24" y="318" width="92" height="46" rx="8"/>
@@ -224,26 +224,26 @@
 <g id="itemY" class="a"><rect class="item" x="0" y="0" width="30" height="30" rx="5"/><text class="itxt" x="15" y="15">Y</text></g>
 <path id="whl0" class="a shl" d="M440 173H624V222"/>
 <circle id="wdot0" class="a lin sdot" cx="0" cy="0" r="6"/>
-<path id="whl1" class="a shl" d="M440 173H624V222"/>
+<path id="whl1" class="a shl" d="M440 173H800V222"/>
 <circle id="wdot1" class="a lin sdot" cx="0" cy="0" r="6"/>
 <text id="wtxtX" class="a ptxt" x="311" y="280">wake(1): SPOP → C1, PUBLISH</text>
-<text id="wtxtY" class="a ptxt" x="311" y="280">wake(1): SPOP → C1, PUBLISH</text>
+<text id="wtxtY" class="a ptxt" x="311" y="280">wake(1): SPOP → C2, PUBLISH</text>
 <circle id="pdotX" class="a lin dot" cx="0" cy="0" r="7"/>
 <circle id="pdotY" class="a lin dot" cx="0" cy="0" r="7"/>
 <text id="clC10" class="a ptxt" x="240" y="205">SPOP</text>
-<text id="clC11" class="a note" x="240" y="205">nudge: SADD</text>
-<text id="clC12" class="a ftxt" x="240" y="205">Len() = 0: SADD</text>
+<text id="clC11" class="a ftxt" x="240" y="205">Len() = 0: SADD</text>
+<text id="clC12" class="a note" x="240" y="205">busy: stays out</text>
 <rect id="hlC1pink" class="a hl-pink" x="207" y="157" width="66" height="32" rx="16"/>
-<rect id="hlC1purple" class="a hl-purple" x="207" y="157" width="66" height="32" rx="16"/>
 <rect id="hlC1fg" class="a hl-fg" x="207" y="157" width="66" height="32" rx="16"/>
-<text id="clC20" class="a note" x="356" y="205">nudge: SREM</text>
-<text id="clC21" class="a note" x="356" y="205">nudge: SADD</text>
+<rect id="hlC1purple" class="a hl-purple" x="207" y="157" width="66" height="32" rx="16"/>
+<text id="clC20" class="a ptxt" x="356" y="205">SPOP</text>
+<text id="clC21" class="a ftxt" x="356" y="205">Len() = 0: SADD</text>
+<text id="clC22" class="a note" x="356" y="205">busy: stays out</text>
+<rect id="hlC2pink" class="a hl-pink" x="323" y="157" width="66" height="32" rx="16"/>
+<rect id="hlC2fg" class="a hl-fg" x="323" y="157" width="66" height="32" rx="16"/>
 <rect id="hlC2purple" class="a hl-purple" x="323" y="157" width="66" height="32" rx="16"/>
 <text id="stC10" class="a st" x="680" y="273">free</text>
 <text id="stC11" class="a st" x="680" y="273">runs X</text>
-<g id="pokeC1" class="a"><rect class="tag" x="658" y="298" width="81" height="16" rx="4"/><text class="note" x="736" y="306" style="text-anchor:end">nudge: poke</text></g>
-<text id="whyC1" class="a why start" x="632" y="200">busy: ignored</text>
 <text id="stC20" class="a st" x="856" y="273">free</text>
 <text id="stC21" class="a st" x="856" y="273">runs Y</text>
-<g id="pokeC2" class="a"><rect class="tag" x="834" y="298" width="81" height="16" rx="4"/><text class="note" x="912" y="306" style="text-anchor:end">nudge: poke</text></g>
 </svg>

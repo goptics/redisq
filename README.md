@@ -206,10 +206,11 @@ job.
 ### Waking idle consumers
 
 A distributed consumer that finds the queue empty joins the idle set `<key>:idle`. An enqueue pushes the job and,
-in the same script, wakes up to one idle consumer per waiting job, each on its own pub/sub channel. Busy consumers
-pull the next job themselves when one finishes. Every consumer also runs a nudge once a second: with the queue
-empty it rejoins the idle set, busy or not; with jobs waiting it pulls. So a wake can land on a busy consumer,
-which ignores it, and a free consumer's nudge takes the job within a second.
+in the same script, wakes up to one idle consumer per waiting job, each on its own pub/sub channel. A consumer
+that took a job stays out of the idle set until its own `Len()` or dequeue finds the queue empty again, so wakes
+go to free consumers; a busy one pulls the next job itself when one finishes (varmq does). Every consumer also
+runs a nudge once a second: with jobs waiting it pulls, and with the queue empty it puts an idle consumer back in
+the idle set, in case a wake was lost.
 
 ![redisq waking idle consumers](./assets/diagrams/redisq-wake.svg)
 
@@ -254,8 +255,10 @@ consumer's next pop; varmq's persistent queues pull only after a local `Add`, a 
   stall of Redis itself (failover, restart, pause) does not count: when no process could sweep, every heartbeat
   moves on by the gap. Visibility deadlines don't: keep the visibility timeout above your slowest job and the
   client's re-send window (about 4 minutes).
-- **Wakes are best-effort.** A wake can reach a busy consumer and be ignored; the once-a-second nudge bounds the
-  delay to about a second, at the cost of one Redis script per consumer per second.
+- **Wakes are best-effort.** A wake can be lost in a pub/sub reconnect, or reach a consumer that can't take the
+  job (paused, or marked idle by a `Len()` call from elsewhere while busy); the once-a-second nudge bounds the
+  delay to about a second, at the cost of one Redis script per consumer per second. A consumer that stops pulling
+  before the queue is empty isn't woken again, only nudged.
 - **No retry limit or dead-letter queue.** A job that crashes every consumer that takes it keeps coming back
   after each crash: about 6 s later on a distributed queue, 31 s otherwise.
 - **Cost.** Every queue object, producers included, runs one sweep script a second; about once a second per key
