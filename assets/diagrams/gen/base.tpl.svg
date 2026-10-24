@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 420" width="960" height="420" role="img" aria-labelledby="title desc">
+  <!-- Starting template: copy to <slug>.tpl.svg. kfu.render() fills the loop length, the reduced-motion frame,
+       the legend marker and the keyframes slot in the style block. Never hand-edit the generated SVG. -->
+  <title id="title">TITLE: what this diagram shows, one line</title>
+  <desc id="desc">DESC: the whole story in plain sentences, start state to end state, for screen readers.</desc>
+  <style>
+    :root {
+      --dur: {D}s;
+      --bg: #f6f8fa; --border: #d0d7de; --box: #ffffff; --fg: #1f2328; --muted: #59636e; --line: #8c959f;
+      --yellow: #f5c451; --yellow-tint: #fff1d6;
+      --purple: #8250df; --green: #1a7f37; --blue: #0969da; --pink: #bf3989; --red: #cf222e;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #161b22; --border: #30363d; --box: #0d1117; --fg: #e6edf3; --muted: #9198a1; --line: #6e7681;
+        --yellow: #d29922; --yellow-tint: #2b2111;
+        --purple: #a371f7; --green: #3fb950; --blue: #58a6ff; --pink: #db61a2; --red: #f85149;
+      }
+    }
+    .bg { fill: var(--bg); stroke: var(--border); }
+    .box { fill: var(--box); stroke: var(--line); stroke-width: 1.5; }
+    .edge { fill: none; stroke: var(--line); stroke-width: 1.5; }
+    .sig { fill: none; stroke: var(--pink); stroke-width: 1.5; stroke-dasharray: 5 4; }
+    .slot { fill: none; stroke: var(--yellow); stroke-width: 1; stroke-dasharray: 3 3; opacity: .5; }
+    .arrow { fill: var(--line); }
+    .arrow-sig { fill: var(--pink); }
+    text { font-family: system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: var(--fg); text-anchor: middle; dominant-baseline: central; }
+    .t { font-size: 14px; font-weight: 600; }
+    .h { font-size: 13px; font-weight: 600; text-anchor: start; }
+    .m { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; fill: var(--muted); }
+    .why { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; font-weight: 600; fill: var(--red); }
+    .lg { font-size: 12px; fill: var(--muted); text-anchor: start; }
+
+    /* motion: one shared --dur loop; keyframes generated from a seconds timeline, keyframe name == element id */
+    .a { animation: var(--dur) cubic-bezier(.65, 0, .35, 1) infinite; transform-box: fill-box; opacity: 0; }
+    .lin { animation-timing-function: linear; }
+    .dot { fill: var(--green); }
+    .glow { fill: var(--blue); }
+    .bar { fill: var(--blue); transform-origin: left center; }
+    /* your classes here, after the base rules: with equal specificity the later rule wins */
+    /*KEYFRAMES*/
+    @media (prefers-reduced-motion: reduce) { .a { animation-play-state: paused; animation-delay: -{STILL}s; } }
+  </style>
+  <defs>
+    <marker id="arr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto">
+      <path class="arrow" d="M0 0L8 4L0 8z"/>
+    </marker>
+    <marker id="arr-sig" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto">
+      <path class="arrow-sig" d="M0 0L8 4L0 8z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0.5" y="0.5" width="959" height="419" rx="12"/>
+
+  <!--LEGEND-->
+
+  <!-- static layout: boxes, labels, edges (class="edge" marker-end="url(#arr)") -->
+  <rect class="box" x="400" y="180" width="160" height="60" rx="8"/>
+  <text class="t" x="480" y="210">Box</text>
+
+  <!-- moving parts: class="a" plus an id that matches a kf() name; animated by transform/opacity only -->
+  <circle id="dot0" class="a dot" cx="0" cy="0" r="6"/>
+</svg>

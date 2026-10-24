@@ -1,0 +1,155 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 420" width="960" height="420" role="img" aria-labelledby="title desc">
+  <title id="title">redisq wake-ups: an enqueue wakes a random idle consumer, and a once-a-second nudge catches the wakes that land on a busy one</title>
+  <desc id="desc">{DESC}</desc>
+  <style>
+    :root {
+      --dur: {D}s;
+      --bg: #f6f8fa; --border: #d0d7de; --box: #ffffff; --fg: #1f2328; --muted: #59636e; --line: #8c959f;
+      --yellow: #f5c451; --yellow-tint: #fff1d6;
+      --purple: #8250df; --green: #1a7f37; --blue: #0969da; --pink: #bf3989; --red: #cf222e;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #161b22; --border: #30363d; --box: #0d1117; --fg: #e6edf3; --muted: #9198a1; --line: #6e7681;
+        --yellow: #d29922; --yellow-tint: #2b2111;
+        --purple: #a371f7; --green: #3fb950; --blue: #58a6ff; --pink: #db61a2; --red: #f85149;
+      }
+    }
+    .bg { fill: var(--bg); stroke: var(--border); }
+    .box { fill: var(--box); stroke: var(--line); stroke-width: 1.5; }
+    .edge { fill: none; stroke: var(--line); stroke-width: 1.5; }
+    .sig { fill: none; stroke: var(--pink); stroke-width: 1.5; stroke-dasharray: 5 4; }
+    .slot { fill: none; stroke: var(--yellow); stroke-width: 1; stroke-dasharray: 3 3; opacity: .5; }
+    .arrow { fill: var(--line); }
+    .arrow-sig { fill: var(--pink); }
+    text { font-family: system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: var(--fg); text-anchor: middle; dominant-baseline: central; }
+    .t { font-size: 14px; font-weight: 600; }
+    .h { font-size: 13px; font-weight: 600; text-anchor: start; }
+    .m { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; fill: var(--muted); }
+    .why { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; font-weight: 600; fill: var(--red); }
+    .lg { font-size: 12px; fill: var(--muted); text-anchor: start; }
+
+    /* motion: one shared --dur loop; keyframes generated from a seconds timeline, keyframe name == element id */
+    .a { animation: var(--dur) cubic-bezier(.65, 0, .35, 1) infinite; transform-box: fill-box; opacity: 0; }
+    .lin { animation-timing-function: linear; }
+    .dot { fill: var(--green); }
+    .glow { fill: var(--blue); }
+    .bar { fill: var(--blue); transform-origin: left center; }
+    /* redisq diagram classes, after the base rules */
+    .panel { fill: none; stroke: var(--border); stroke-width: 1.5; stroke-dasharray: 6 4; }
+    .lane { fill: var(--yellow-tint); stroke: var(--yellow); stroke-width: 1.5; }
+    .item { fill: var(--yellow); }
+    .itxt { fill: #1f2328; font-size: 13px; font-weight: 700; }
+    .track { fill: var(--border); }
+    .wk { stroke: var(--blue); }
+    .prod { stroke: var(--yellow); stroke-width: 2; }
+    .ring { fill: none; stroke: var(--purple); stroke-width: 1.5; transform-origin: center; }
+    .pip { fill: var(--purple); }
+    .note { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; font-weight: 600; fill: var(--purple); }
+    .chip { fill: var(--box); stroke: var(--blue); stroke-width: 1.5; }
+    .ghost { fill: none; stroke: var(--line); stroke-width: 1; stroke-dasharray: 3 3; }
+    .ctxt { font-size: 13px; font-weight: 700; }
+    .sdot { fill: var(--pink); }
+    .shl { fill: none; stroke: var(--pink); stroke-width: 2.5; }
+    .hl-pink { fill: none; stroke: var(--pink); stroke-width: 2.5; }
+    .hl-purple { fill: none; stroke: var(--purple); stroke-width: 2.5; }
+    .hl-fg { fill: none; stroke: var(--fg); stroke-width: 2; }
+    .ptxt { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; font-weight: 600; fill: var(--pink); }
+    .ftxt { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; font-weight: 600; fill: var(--fg); }
+    .st { font-size: 13px; fill: var(--fg); }
+    .start { text-anchor: start; }
+    .tag { fill: var(--box); }
+    /*KEYFRAMES*/
+    @media (prefers-reduced-motion: reduce) { .a { animation-play-state: paused; animation-delay: -{STILL}s; } }
+  </style>
+  <defs>
+    <marker id="arr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto">
+      <path class="arrow" d="M0 0L8 4L0 8z"/>
+    </marker>
+    <marker id="arr-sig" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto">
+      <path class="arrow-sig" d="M0 0L8 4L0 8z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0.5" y="0.5" width="959" height="419" rx="12"/>
+
+  <!-- legend -->
+  <g transform="translate(24 30)">
+    <rect class="item" x="0" y="-6" width="12" height="12" rx="3"/><text class="lg" x="20" y="0">job waiting in the queue</text>
+    <circle class="dot" cx="6" cy="20" r="6"/><text class="lg" x="20" y="20">job popped by a consumer</text>
+    <rect class="bar" x="0" y="37" width="12" height="6" rx="2"/><text class="lg" x="20" y="40">consumer busy (concurrency 1)</text>
+    <rect class="chip" x="276" y="-6" width="20" height="12" rx="6"/><text class="lg" x="304" y="0">consumer in the :idle set</text>
+    <circle class="sdot" cx="286" cy="20" r="6"/><text class="lg" x="304" y="20">wake: SPOP (random member), PUBLISH</text>
+    <circle class="ring" cx="286" cy="40" r="5"/><circle class="pip" cx="286" cy="40" r="2.5"/><text class="lg" x="304" y="40">nudge: each consumer, once a second</text>
+  </g>
+  <text class="m" x="936" y="30" style="text-anchor:end">times not to scale: round trips slowed down</text>
+  <text class="m" x="936" y="48" style="text-anchor:end">{SPOPNOTE}</text>
+
+  <!-- producer: one script, RPUSH + wake(n) -->
+  <rect class="box prod" x="24" y="318" width="92" height="46" rx="8"/>
+  <rect id="enq-glow" class="a item" x="24" y="318" width="92" height="46" rx="8"/>
+  <text class="t" x="70" y="341">Enqueue</text>
+  <path class="edge" d="M116 341H180" marker-end="url(#arr)"/>
+  <text class="m" x="138" y="328">RPUSH</text>
+  <text class="m" x="70" y="380">one script:</text>
+  <text class="m" x="70" y="394">RPUSH + wake(n)</text>
+
+  <!-- Redis -->
+  <rect class="panel" x="160" y="96" width="416" height="306" rx="12"/>
+  <text class="h" x="176" y="114">Redis</text>
+
+  <!-- :idle set -->
+  <text class="h" x="182" y="136">:idle</text>
+  <text class="m" x="220" y="136" style="text-anchor:start">&lt;key&gt;:idle · set</text>
+  <rect class="box" x="182" y="148" width="258" height="70" rx="8"/>
+  <rect class="ghost" x="210" y="160" width="60" height="26" rx="13"/>
+  <rect class="ghost" x="326" y="160" width="60" height="26" rx="13"/>
+  <g id="chipC1" class="a"><rect class="chip" x="210" y="160" width="60" height="26" rx="13"/><text class="ctxt" x="240" y="173">C1</text></g>
+  <g id="chipC2" class="a"><rect class="chip" x="326" y="160" width="60" height="26" rx="13"/><text class="ctxt" x="356" y="173">C2</text></g>
+
+  <!-- wake(n) -->
+  <text class="m" x="311" y="240">Enqueue's script: RPUSH, then wake(n),</text>
+  <text class="m" x="311" y="256">n = items waiting after the push</text>
+
+  <!-- queue -->
+  <text class="h" x="182" y="306">queue</text>
+  <text class="m" x="230" y="306" style="text-anchor:start">&lt;key&gt; · list</text>
+  <rect class="lane" x="182" y="318" width="258" height="46" rx="8"/>
+  <rect class="slot" x="320" y="326" width="30" height="30" rx="5"/>
+  <rect class="slot" x="356" y="326" width="30" height="30" rx="5"/>
+  <rect class="slot" x="392" y="326" width="30" height="30" rx="5"/>
+  <text class="m" x="335" y="376">tail</text>
+  <text class="m" x="407" y="376">head</text>
+
+  <!-- wake: PUBLISH on the consumer's own channel (signals along the top) -->
+  <path class="sig" d="M440 173H624V222" marker-end="url(#arr-sig)"/>
+  <path class="sig" d="M440 173H800V222" marker-end="url(#arr-sig)"/>
+  <text class="m" x="712" y="160" style="fill: var(--pink)">PUBLISH &lt;key&gt;:wake:&lt;id&gt;</text>
+
+  <!-- pop -->
+  <path class="edge" d="M440 341H624V322" marker-end="url(#arr)"/>
+  <path class="edge" d="M440 341H800V322" marker-end="url(#arr)"/>
+  <text class="m" x="508" y="328">pop: LPOP → pending</text>
+
+  <!-- consumers: DistributedQueue + varmq worker, concurrency 1; the nudge ring sits bottom-right, where the
+       generator shows a local "nudge: poke" tag -->
+  <rect class="box wk" x="600" y="224" width="160" height="96" rx="8"/>
+  <rect id="glowC1" class="a glow" x="600" y="224" width="160" height="96" rx="8"/>
+  <text class="t" x="680" y="240">Consumer C1</text>
+  <text class="m" x="680" y="256">concurrency 1</text>
+  <rect class="track" x="630" y="287" width="100" height="4" rx="2"/>
+  <rect id="barC1" class="a lin bar" x="630" y="287" width="100" height="4" rx="2"/>
+  <circle class="pip" cx="748" cy="306" r="3"/>
+  <circle id="ringC1" class="a lin ring" cx="748" cy="306" r="4.5"/>
+
+  <rect class="box wk" x="776" y="224" width="160" height="96" rx="8"/>
+  <rect id="glowC2" class="a glow" x="776" y="224" width="160" height="96" rx="8"/>
+  <text class="t" x="856" y="240">Consumer C2</text>
+  <text class="m" x="856" y="256">concurrency 1</text>
+  <rect class="track" x="806" y="287" width="100" height="4" rx="2"/>
+  <rect id="barC2" class="a lin bar" x="806" y="287" width="100" height="4" rx="2"/>
+  <circle class="pip" cx="924" cy="306" r="3"/>
+  <circle id="ringC2" class="a lin ring" cx="924" cy="306" r="4.5"/>
+  <!-- moving parts and labels whose count and text the simulation decides -->
+  <!--ELEMENTS-->
+</svg>

@@ -1,10 +1,11 @@
-.PHONY: test format release help
+.PHONY: test format diagrams release help
 
 # Default target
 help:
 	@echo "Available commands:"
 	@echo "  make test     - Run all tests with race detection and coverage"
 	@echo "  make format   - Format code"
+	@echo "  make diagrams - Regenerate the animated README diagrams (assets/diagrams/gen)"
 	@echo "  make release  - Create and push a new release tag (usage: make release VERSION=v1.0.0)"
 
 # Run all tests with race detection and coverage
@@ -14,6 +15,10 @@ test:
 # Format code
 format:
 	gofmt -w .
+
+# Regenerate the animated README diagrams; each generator asserts the behaviour it draws
+diagrams:
+	cd assets/diagrams/gen && for g in gen_*.py; do python3 "$$g" || exit 1; done
 
 # Create and push a new release tag
 release:

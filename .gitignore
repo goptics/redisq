@@ -1,2 +1,5 @@
 .env
 coverage.txt
+assets/diagrams/frames/
+assets/diagrams/*.motion.json
+__pycache__/
