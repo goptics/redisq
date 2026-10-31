@@ -1031,9 +1031,7 @@ func (q *Queue) Close() error {
 	q.closeOnce.Do(func() {
 		q.cancel() // Cancel context to stop notification listener
 		err = q.release()
-		if q.presence != nil {
-			q.presence.Close()
-		}
+		q.presence.Close()
 	})
 	return err
 }

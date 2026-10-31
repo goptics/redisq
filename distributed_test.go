@@ -629,8 +629,12 @@ func TestGoneConsumerRequeues(t *testing.T) {
 // for dead, the grace counting from when it went. A plain queue resubscribes
 // as a distributed one does.
 func TestPresenceGrace(t *testing.T) {
-	for _, distributed := range []bool{true, false} {
-		t.Run(map[bool]string{true: "distributed", false: "plain"}[distributed], func(t *testing.T) {
+	for _, c := range []struct {
+		name        string
+		distributed bool
+	}{{"distributed", true}, {"plain", false}} {
+		distributed := c.distributed
+		t.Run(c.name, func(t *testing.T) {
 			ctx := context.Background()
 			key := fmt.Sprintf("test_presence_grace_%t", distributed)
 			qs := New(getTestRedisURL())
