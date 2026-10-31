@@ -6,9 +6,9 @@ STORYBOARD.md, section 1.
 import kfu
 from kfu import at, bar, flash, kf, ring
 
-VT = 4.0              # visibility timeout as drawn (default 5 min, queue.go:65)
+VT = 4.0              # visibility timeout as drawn (default 5 min, queue.go:83)
 WORK = 2.0            # seconds a job takes
-SWEEP_PHASE = .3      # the object's sweep ticks at k + .3 (queue.go:884-885); a pulse lasts .6 s, so all fit in D
+SWEEP_PHASE = .3      # the object's sweep ticks at k + .3 (queue.go:908-909); a pulse lasts .6 s, so all fit in D
 ENQ = {"A": .4, "B": .9}
 DOT_V = 420           # px/s for dots on edges
 
@@ -59,7 +59,7 @@ def build():
     rows = iter([0, 1, 0])                      # drawn row per pending entry (a hash has no order): A, B, B again
 
     def pop(t, acked):
-        """DequeueWithAckId: LPOP head → pending + deadline + reply, one script (queue.go:463-483, 488, 498)."""
+        """DequeueWithAckId: LPOP head → pending + deadline + reply, one script (queue.go:481-501, 488, 498)."""
         k = lst.pop(0)
         row = next(rows)
         rows_free.remove(row)
@@ -68,12 +68,12 @@ def build():
         for i, other in enumerate(lst):          # the rest move up one slot once the head has left
             item[other] += [at(t + .35, SLOT[i + 1], HEAD[1], 1), at(t + .8, SLOT[i], HEAD[1], 1)]
         place(k, t, "pending")
-        deadlines[k] = t + VT                  # Redis TIME + vt (queue.go:631-638)
+        deadlines[k] = t + VT                  # Redis TIME + vt (queue.go:649-656)
         arrive = walk(next(dots), t, POP_EDGE)
         done = arrive + WORK
         busy.append((arrive, done))
         pops.append((t, k))
-        if acked:                               # Acknowledge deletes entry + deadline (queue.go:335-355)
+        if acked:                               # Acknowledge deletes entry + deadline (queue.go:353-373)
             a = walk(next(ack_dots), done, ACK_EDGE)
             item[k] += [at(a, *ROW[row], 1), at(a + .3, *ROW[row], 0)]
             place(k, a, "done")
@@ -93,7 +93,7 @@ def build():
     assert doneB < dlB, "B's run ends before its deadline: only the missing ack brings it back"
     flash("noack", [(doneB, doneB + 1.6)], 1)
 
-    # ---- sweep: first tick at or after B's deadline moves B back to the list front (queue.go:807, 747) ----
+    # ---- sweep: first tick at or after B's deadline moves B back to the list front (queue.go:827, 747) ----
     ticks = [k + SWEEP_PHASE for k in range(40)]
     req = next(s for s in ticks if s >= dlB)
     assert 0 <= req - dlB < 1, "requeue at the first sweep at/after the deadline"

@@ -33,7 +33,7 @@
 - **FIFO and priority queues** on Redis lists and sorted sets; lower priority number is served first.
 - **Distributed variants** that wake idle consumers, up to one per waiting job.
 - **Acknowledgments** with a [visibility timeout](#acknowledgments-and-the-visibility-timeout) on Redis's clock.
-- **Fast handover**: a consumer that [closes](#when-a-consumer-closes) hands its unacknowledged jobs back at once; a distributed one that [dies](#when-a-consumer-dies), in about 6 s; any other silent one, after a 30 s heartbeat.
+- **Fast handover**: a consumer that [closes](#when-a-consumer-closes) hands its unacknowledged jobs back at once; one that [dies](#when-a-consumer-dies), in about 3-4 s; one cut off from Redis, after a 30 s heartbeat.
 - **Batch dequeue** of up to 1000 items per round trip, each under its own ack ID.
 - **Deduplicated enqueue**: `EnqueueOnce` stores a job once per id within a dedup window.
 - **Queue TTL**, refreshed on every enqueue.
@@ -227,19 +227,22 @@ consumer runs again on the next one: stop or drain workers before `Close`.
 
 A consumer killed without `Close` (kill -9, OOM, a crash) can't hand anything back, so the other processes find
 out. Every ack pop that hands out a job sets the queue object's heartbeat in `<key>:heartbeats`, and its sweep
-renews it every second. A distributed consumer is also subscribed to its wake channel, and Redis drops that
-subscription as soon as the process exits. Any process's sweep then requeues the dead consumer's jobs and, on a
-distributed queue, wakes up to one idle consumer per job:
+renews it every second. Every queue object is also subscribed to its own wake channel, and Redis drops that
+subscription as soon as the process exits. Any process's sweep, including the first one of a restarted process,
+then requeues the dead consumer's jobs and, on a distributed queue, wakes up to one idle consumer per job. A
+process that is still sweeping is never taken for gone, so a second process on the key (a rolling deploy) keeps
+its running jobs:
 
-| Consumer 2 holds unacknowledged jobs and…                                       | They are back in the queue after    |
-| ------------------------------------------------------------------------------- | ----------------------------------- |
-| calls `Close` on shutdown (trap SIGINT/SIGTERM, e.g. with `Listen()`)            | at once                             |
-| dies; distributed queue                                                         | about 6 s (no subscriber for 5 s)   |
-| dies; `Queue` or `PriorityQueue`, or a distributed one within ~1 s of its first pop | the heartbeat timeout (30 s) + ~1 s |
-| loses Redis, or its host goes down (Redis keeps the socket)                     | the heartbeat timeout (30 s) + ~1 s |
-| stays alive but a job hangs                                                     | the visibility timeout (5 min)      |
+| Consumer 2 holds unacknowledged jobs and…                             | They are back in the queue after      |
+| --------------------------------------------------------------------- | ------------------------------------- |
+| calls `Close` on shutdown (trap SIGINT/SIGTERM, e.g. with `Listen()`) | at once                               |
+| dies (kill -9, OOM, a crash)                                          | about 3-4 s (no subscriber for 2.5 s) |
+| dies within ~1 s of its first pop                                     | the heartbeat timeout (30 s) + ~1 s   |
+| loses Redis, or its host goes down (Redis keeps the socket)           | the heartbeat timeout (30 s) + ~1 s   |
+| stays alive but a job hangs                                           | the visibility timeout (5 min)        |
 
-Only a distributed queue wakes a consumer for requeued jobs. On a `Queue` or `PriorityQueue` they wait for a
+A process restarted alone after a crash gets its old jobs back about 3 s after it starts: its first sweep runs at
+once. Only a distributed queue wakes a consumer for requeued jobs. On a `Queue` or `PriorityQueue` they wait for a
 consumer's next pop; varmq's persistent queues pull only after a local `Add`, a start or a finished job.
 
 ![redisq detecting a dead consumer](./assets/diagrams/redisq-dead.svg)
@@ -260,9 +263,10 @@ consumer's next pop; varmq's persistent queues pull only after a local `Add`, a 
   delay to about a second, at the cost of one Redis script per consumer per second. A consumer that stops pulling
   before the queue is empty isn't woken again, only nudged.
 - **No retry limit or dead-letter queue.** A job that crashes every consumer that takes it keeps coming back
-  after each crash: about 6 s later on a distributed queue, 31 s otherwise.
-- **Cost.** Every queue object, producers included, runs one sweep script a second; about once a second per key
-  it also counts subscribers (`PUBSUB NUMSUB`) for the consumers holding jobs. Each pop that hands out jobs also
+  after each crash, about 3-4 s later.
+- **Cost.** Every queue object, producers included, runs one sweep script a second and holds one pub/sub
+  connection (count them against Redis's `maxclients`); about once a second per key it also counts subscribers
+  (`PUBSUB NUMSUB`) for the consumers holding jobs. Each pop that hands out jobs also
   writes the heartbeat. A dead consumer or a `Close` reads every pending ack ID once.
 - **One Redis server.** `New` uses a single-node client; Redis Cluster isn't supported.
 

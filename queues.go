@@ -44,11 +44,15 @@ func New(url string) Queues {
 }
 
 func (qs *queues) NewQueue(queueKey string) *Queue {
-	return newQueue(qs.client, queueKey)
+	q := newQueue(qs.client, queueKey)
+	go q.drain()
+	return q
 }
 
 func (qs *queues) NewPriorityQueue(queueKey string) *PriorityQueue {
-	return newPriorityQueue(qs.client, queueKey)
+	q := newPriorityQueue(qs.client, queueKey)
+	go q.drain()
+	return q
 }
 
 func (qs *queues) NewDistributedQueue(queueKey string) *DistributedQueue {

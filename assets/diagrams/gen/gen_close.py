@@ -29,7 +29,7 @@ POP_GAP = .05             # back-to-back pops of one pull loop, drawn
 POP_MOVE = .6             # list → pending row, drawn
 CHIP_IN, CHIP_OUT = .25, .15                     # a chip slides into / out of :idle, drawn
 STEPS_FOR = 1.3           # Close's step list stays this long after its last step (the wake)
-VT = 16.0                 # visibility timeout as drawn (default 5 min, queue.go:65)
+VT = 16.0                 # visibility timeout as drawn (default 5 min, queue.go:83)
 HOLD, XFADE = 1.0, .5     # end state held, then cross-fade to the start state
 DOT_V, WAKE_V = 520, 520  # px/s
 HORIZON = 30
@@ -160,7 +160,7 @@ class Sim:
             used = {p["row"] for p in self.pending.values()}
             row = max(r for r in range(3) if r not in used)                       # drawn row: lowest free
             self.pending[job] = dict(owner=m, row=row, t=t, seq=st["seq"])
-            st["beat"] = True                                                    # queue.go:541-543
+            st["beat"] = True                                                    # queue.go:559-561
             slot = st["slots"].index(None)
             st["slots"][slot] = job
             self.set_busy(t, m, +1)
@@ -264,7 +264,7 @@ class Sim:
     def on_release(self, t, m):
         ids = sorted((p["seq"], j) for j, p in self.pending.items() if p["owner"] == m)   # table.sort: pop order
         for _, j in ids:
-            self.lst.insert(0, j)                                                # LPUSH each (queue.go:747)
+            self.lst.insert(0, j)                                                # LPUSH each (queue.go:765)
         for _, j in ids:
             p = self.pending.pop(j)
             x = SLOT_X[self.lst.index(j)]
@@ -274,7 +274,7 @@ class Sim:
                               at(t + REL, x, LIST_Y, 1)]
             self.where[j].append((t, "list"))
             self.entries.append(dict(owner=m, row=p["row"], t=p["t"], end=t, how="release"))
-        self.c[m]["beat"] = False                    # ZREM heartbeat + presence (queue.go:840-849)
+        self.c[m]["beat"] = False                    # ZREM heartbeat + presence (queue.go:860-869)
         self.mark["release"] = (t, [j for _, j in ids], list(self.lst))
         self.say(t, f"{m} release script: LPUSH {[j for _, j in ids]} -> list {self.lst}; heartbeat, presence dropped")
         self.at_(t + REL, "release_wake", m, len(ids))
@@ -302,9 +302,9 @@ class Sim:
         r = next(r for r in self.runs if r["c"] == m and r["slot"] == slot and r["job"] == job and r["end"] is None)
         r["end"] = t
         if st["closed"]:
-            self.failed_acks.append((t, m, job))     # Acknowledge after Close fails (queue.go:337-339)
+            self.failed_acks.append((t, m, job))     # Acknowledge after Close fails (queue.go:355-357)
         else:
-            p = self.pending.pop(job)                # Acknowledge: HDEL + ZREM (queue.go:335-355)
+            p = self.pending.pop(job)                # Acknowledge: HDEL + ZREM (queue.go:353-373)
             assert p["owner"] == m, (job, p, m)
             self.acks.append((t, m, job))
             self.items[job] += [at(t, ROW_X, ROW_Y[p["row"]], 1), at(t + .3, ROW_X, ROW_Y[p["row"]], 0)]
@@ -423,7 +423,7 @@ def build():
     assert not [t for t, member, _ in s.idle_log["C2"] if member], "C2 never rejoins :idle while it holds jobs"
     assert all(t < close for t in s.c["C2"]["ticks"]), "no C2 nudge after Close"
     # the release: all of C2's entries in one script, LPUSH in pop order → J3 J2 J1 from the head; beat dropped
-    assert rel_ids == ["J1", "J2", "J3"] and rel_list == ["J3", "J2", "J1"], (rel_ids, rel_list)   # queue.go:840-849, 747
+    assert rel_ids == ["J1", "J2", "J3"] and rel_list == ["J3", "J2", "J1"], (rel_ids, rel_list)   # queue.go:860-869, 747
     assert not s.c["C2"]["beat"]
     assert [e["how"] for e in s.entries if e["owner"] == "C2"] == ["release"] * 3
     # wake(3) can only reach C1: :idle == {C1} when it runs; woken 1, the second SPOP finds nothing

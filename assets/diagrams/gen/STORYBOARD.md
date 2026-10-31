@@ -26,21 +26,21 @@ Signals run along the top. Times that can't be shown at real speed carry a "time
 
 | Fact | Citation |
 |---|---|
-| A pop moves the item from the list head into `<key>:nacked`, sets its deadline in `<key>:timeouts` and renews the owner's heartbeat, in one script | `queue.go:463-483`, `queue.go:488`, `queue.go:498`, `queue.go:541-543`; batch: `queue.go:388-427` |
-| Deadline = Redis `TIME` + visibility timeout (default 5 min) | `queue.go:631-638`, `queue.go:65` |
-| `Acknowledge` deletes the pending entry and its deadline | `queue.go:335-355` |
-| Each Queue object sweeps once a second; the sweep requeues every item whose deadline passed, to the list front (`LPUSH`), push before delete, in one script | `queue.go:884-885`, `queue.go:807`, `queue.go:747-757` |
+| A pop moves the item from the list head into `<key>:nacked`, sets its deadline in `<key>:timeouts` and renews the owner's heartbeat, in one script | `queue.go:481-501`, `queue.go:506`, `queue.go:516`, `queue.go:559-561`; batch: `queue.go:406-445` |
+| Deadline = Redis `TIME` + visibility timeout (default 5 min) | `queue.go:649-656`, `queue.go:83` |
+| `Acknowledge` deletes the pending entry and its deadline | `queue.go:353-373` |
+| Each Queue object sweeps once a second; the sweep requeues every item whose deadline passed, to the list front (`LPUSH`), push before delete, in one script | `queue.go:908-909`, `queue.go:827`, `queue.go:765-775` |
 | An enqueue pushes and wakes up to *n* idle consumers in one script, *n* = items waiting after the push | `distributed.go:9-11` |
 | Wake = `SPOP` a **random** member of `:idle`, `PUBLISH` to its channel; a member with no subscriber is skipped; nothing is sent when `:idle` is empty | `notification.go:52-64` |
-| A consumer joins `:idle` on `Subscribe`, when its `Len()` reads 0 (varmq calls it at job end and in its pull loop), when a pop finds nothing (a race), and at its nudge while the queue is empty, if its own last `Len()` or pop found no work | `notification.go:164-171`, `notification.go:45-47`, `notification.go:184-186`, `notification.go:74-77`, `queue.go:476-478`; `varmq/worker_pool.go:166`, `varmq/worker_eventloop.go:26` |
+| A consumer joins `:idle` on `Subscribe`, when its `Len()` reads 0 (varmq calls it at job end and in its pull loop), when a pop finds nothing (a race), and at its nudge while the queue is empty, if its own last `Len()` or pop found no work | `notification.go:164-171`, `notification.go:45-47`, `notification.go:184-186`, `notification.go:74-77`, `queue.go:494-496`; `varmq/worker_pool.go:166`, `varmq/worker_eventloop.go:26` |
 | **Nudge**: once a second per consumer: items waiting → `SREM` itself and poke its own worker locally; queue empty → `SADD` itself to `:idle` only if its own last `Len()` or pop found no work (`Notification.idle`: a pop that returns a job clears it, so a busy consumer stays out) | `notification.go:74-77`, `notification.go:125-149`, `distributed.go:60`, `distributed.go:72`, `distributed.go:82` |
 | A busy consumer ignores a wake or poke; a consumer with free slots pops while `Len() > 0`, one `DequeueWithAckId` per free slot (ack sources never batch); a finished job makes it check again | `varmq/worker_eventloop.go:26`, `varmq/worker_eventloop.go:185`, `varmq/source.go:125-136`, `varmq/worker_pool.go:151`, `varmq/source_manager.go:87-91` |
-| A requeue of *n* items wakes up to *n* idle consumers (distributed queues only) | sweep `queue.go:912`, Close `queue.go:1023`, `queue.go:917-923`, `distributed.go:29` |
-| Each pop that hands out items sets the owner's heartbeat to now + heartbeat timeout (default 30 s); its own sweep renews it and resets its presence mark | `queue.go:647-650`, `queue.go:67`, `queue.go:797-800` |
-| Presence: owner with a live heartbeat seen subscribed (mark 0) → a sweep that moves the shared clock and sees no subscriber sets mark = now → a later such sweep with now - mark ≥ 5 s finds it dead | `queue.go:794-795`, `queue.go:811-821`, `queue.go:867` |
-| A dead owner (presence, or heartbeat expired) has all its pending items requeued (list front) and its heartbeat and mark dropped | `queue.go:810`, `queue.go:823-833` |
-| `DistributedQueue.Close`: leave `:idle`, requeue own pending items, drop own heartbeat and presence, wake | `distributed.go:89-94`, `notification.go:218-221`, `queue.go:996-1025`, `queue.go:840-849` |
-| An `Acknowledge` after `Close` fails | `queue.go:337-339` |
+| A requeue of *n* items wakes up to *n* idle consumers (distributed queues only) | sweep `queue.go:945`, Close `queue.go:1059`, `queue.go:950-956`, `distributed.go:29` |
+| Each pop that hands out items sets the owner's heartbeat to now + heartbeat timeout (default 30 s); its own sweep renews it and resets its presence mark | `queue.go:665-668`, `queue.go:85`, `queue.go:817-820` |
+| Presence: owner with a live heartbeat seen subscribed (mark 0) → a sweep that moves the shared clock and sees no subscriber sets mark = now → a later such sweep with now - mark ≥ 2.5 s finds it dead. Every queue object subscribes (`Queue.start`), plain ones included | `queue.go:814-815`, `queue.go:831-841`, `queue.go:891`, `queue.go:61-65` |
+| A dead owner (presence, or heartbeat expired) has all its pending items requeued (list front) and its heartbeat and mark dropped | `queue.go:830`, `queue.go:843-853` |
+| `DistributedQueue.Close`: leave `:idle`, requeue own pending items, drop own heartbeat and presence, wake | `distributed.go:89-94`, `notification.go:218-221`, `queue.go:1029-1061`, `queue.go:860-869` |
+| An `Acknowledge` after `Close` fails | `queue.go:355-357` |
 | varmq acknowledges a job whose handler failed or panicked | `varmq/main.go:61-79`, `varmq/worker_pool.go:127-131`, `varmq/job.go:291-330` |
 
 ## 1. Ack and visibility timeout  (`redisq-ack.svg`)
@@ -61,12 +61,12 @@ Timeline (simulated; visibility timeout drawn as 4 s, labelled "5 min"; times no
   next poll pops B again (new ack ID, new deadline), consumer acks → pending empty
 Loop: D = derived: last ack + 1.5
 Invariants:
-  - an item is in exactly one of {list, pending, done} at every keyframe: pop and requeue are each one script — `queue.go:498`, `queue.go:749-757`
-  - the deadline bar spans exactly the visibility timeout from the pop — `queue.go:631-638`
-  - ack removes the entry and its deadline — `queue.go:335-355`
-  - B returns at the first sweep at or after its deadline (not at the deadline itself), to the list front — `queue.go:884-885`, `queue.go:807`, `queue.go:747`
+  - an item is in exactly one of {list, pending, done} at every keyframe: pop and requeue are each one script — `queue.go:516`, `queue.go:767-775`
+  - the deadline bar spans exactly the visibility timeout from the pop — `queue.go:649-656`
+  - ack removes the entry and its deadline — `queue.go:353-373`
+  - B returns at the first sweep at or after its deadline (not at the deadline itself), to the list front — `queue.go:908-909`, `queue.go:827`, `queue.go:765`
   - B is delivered twice, A once; end: list and pending empty, consumer idle
-  - (no other requeue path fires: one live object, no Close, own sweep keeps its heartbeat alive — `queue.go:796-800`)
+  - (no other requeue path fires: one live object, no Close, own sweep keeps its heartbeat alive — `queue.go:816-820`)
 Why-labels: "no Acknowledge", "deadline passed"
 Still frame (reduced motion): B's deadline bar ~80% full, A acked
 Seam check: list empty, pending empty, consumer idle, no dots
@@ -126,11 +126,11 @@ Timeline (simulated):
 Loop: D = ceil(cross-fade end + .5), whole seconds so the nudge pulses repeat
 Invariants:
   - only J1's push wakes (n ≥ 1 but `:idle` empty for J2, J3) — `distributed.go:9-11`, `notification.go:58-59`
-  - a woken consumer pops while it has a free slot and `Len() > 0`, one `DequeueWithAckId` per slot — `varmq/source.go:125-136`, `varmq/worker_eventloop.go:26`, `varmq/worker_eventloop.go:185`, `queue.go:463-483`
+  - a woken consumer pops while it has a free slot and `Len() > 0`, one `DequeueWithAckId` per slot — `varmq/source.go:125-136`, `varmq/worker_eventloop.go:26`, `varmq/worker_eventloop.go:185`, `queue.go:481-501`
   - C2 is full, so its nudges leave it out of `:idle`; at Close leave() finds it out, before the release, so wake(3) can only reach C1 — `notification.go:74-77`, `distributed.go:90-91`, `notification.go:218-221`
-  - all of C2's pending entries move back in one script, list order J3 J2 J1; heartbeat and presence dropped — `queue.go:840-849`, `queue.go:747`
+  - all of C2's pending entries move back in one script, list order J3 J2 J1; heartbeat and presence dropped — `queue.go:860-869`, `queue.go:765`
   - Close → C1's pop involves no timer (well under a second)
-  - every job is acked once, by C1; C2's runs were wasted (at-least-once) — `queue.go:337-339`, `queue.go:992-995`
+  - every job is acked once, by C1; C2's runs were wasted (at-least-once) — `queue.go:355-357`, `queue.go:1025-1028`
 Why-labels: "acks after Close fail · runs again on C1"
 Still frame: jobs back in the list, wake on its way to C1
 Seam check: cross-fade proves only the reset (C2 is gone; the system does not return to its start)
@@ -151,30 +151,30 @@ Timeline (simulated in real seconds; sweep phases fixed so the clock-move rule i
   0   C2 stops in both rows: no more sweeps, so no heartbeat renewal and no mark reset.
   Row A: Redis drops the subscription at once. The first C1 sweep that moves the shared clock (≥ .5 s since its
          last move) sees no subscriber with mark 0 → mark = now (1.3 as built: C1's sweep at 0.3 doesn't move the
-         clock, C2's own last sweep at 0 did). The first such sweep with now - mark ≥ 5 (6.3) → C2 dead → J1, J2
-         back to the list front, C2's heartbeat and mark dropped → wake → C1 pops them (≈ 6 s; 5-7.5 s in general)
+         clock, C2's own last sweep at 0 did). The first such sweep with now - mark ≥ 2.5 (4.3) → C2 dead → J1, J2
+         back to the list front, C2's heartbeat and mark dropped → wake → C1 pops them (≈ 4 s; 2.5-5 s in general)
   Row B: Redis still counts the subscription (the dead host never closed it), so the mark stays 0; the heartbeat
          runs out at 30 s → first C1 sweep after it (30.x) → same requeue and wake (≈ 30-31 s)
   end: both rows hold 1 s, cross-fade to start, "↻ replay"
 Loop: D = derived from the scaled 31 s + tail
 Invariants:
   - presence: live heartbeat, seen subscribed (mark 0), then a clock-moving sweep with no subscriber sets the mark,
-    then a clock-moving sweep with now - mark ≥ 5 s and no own sweep or subscriber in between — `queue.go:794-795`, `queue.go:800`, `queue.go:811-821`, `queue.go:867`
-  - heartbeat = last renewal + 30 s; reaped at the first sweep at or after it, ticked or not — `queue.go:67`, `queue.go:647-650`, `queue.go:799`, `queue.go:810`
-  - a reap requeues all of C2's items (list front) and drops its heartbeat and mark; the distributed sweeper wakes — `queue.go:823-833`, `queue.go:912`, `distributed.go:29`
+    then a clock-moving sweep with now - mark ≥ 2.5 s and no own sweep or subscriber in between — `queue.go:814-815`, `queue.go:820`, `queue.go:831-841`, `queue.go:891`
+  - heartbeat = last renewal + 30 s; reaped at the first sweep at or after it, ticked or not — `queue.go:85`, `queue.go:665-668`, `queue.go:819`, `queue.go:830`
+  - a reap requeues all of C2's items (list front) and drops its heartbeat and mark; the distributed sweeper wakes — `queue.go:843-853`, `queue.go:945`, `distributed.go:29`
   - row A requeues before row B; row A's heartbeat is dropped at the reap, not left to run out
-  - a lost host's socket stays open to Redis until TCP notices (minutes), so its subscription still counts — `queue.go:781-782` **(inferred: Redis/TCP behaviour, not redisq code; no duration printed)**
+  - a lost host's socket stays open to Redis until TCP notices (minutes), so its subscription still counts — `queue.go:801-802` **(inferred: Redis/TCP behaviour, not redisq code; no duration printed)**
 Why-labels: "subscription gone", "socket still open: wait for heartbeat"
 Still frame: real t = 11 s: row A requeued and acked, row B still waiting on its heartbeat (before the fast-forward,
 clear of the clock readout's fades)
 Seam check: cross-fade proves only the reset
 Builds on: 3, adds death without Close
-README note: a plain `Queue` never subscribes, so it also waits for the heartbeat (≈ 30-31 s) and gets no wake; its
-consumers find the items on their next poll.
+README note: a plain `Queue` or `PriorityQueue` is detected the same way (it subscribes to its wake channel too)
+but gets no wake; its consumers find the items on their next poll.
 
 Not animated, in the README text: the stall guard (no sweep moved the clock for over 2 s: Redis paused, failed
 over or restarted, or every process stalled → the next sweep moves every heartbeat and every running presence mark
-on by the whole gap, `queue.go:790-793`, `queue.go:862`), at-least-once caveats, timeouts, no redelivery limit,
+on by the whole gap, `queue.go:810-813`, `queue.go:882`), at-least-once caveats, timeouts, no redelivery limit,
 cost per pop.
 
 ## As built
@@ -200,7 +200,7 @@ section's invariants; `make diagrams` rebuilds them.
   - Diagram 3: J1-J3 arrive as a burst (one wake, one pop of 3); C2's chip is back in `:idle` (nudge) at Close,
     which is what makes leave() matter.
   - Diagram 1: "returns without Acknowledge" (varmq acks failed jobs); one sweeper stated.
-  - Diagram 4: row B is "host lost" only (a plain Queue never subscribes); mark lands within 1.5 s, reap at
+  - Diagram 4: row B is "host lost" only (a plain Queue never subscribed then); mark lands within 1.5 s, reap at
     5-7.5 s; no "~10 min" figure.
   - Citations corrected throughout.
 - Checkpoint 2: user approved the corrected storyboard.
@@ -219,3 +219,5 @@ section's invariants; `make diagrams` rebuilds them.
   - Diagram 4: C2, holding J1 and J2, starts out of `:idle` (not drawn; the wake reaches C1 either way).
   - The `notification.go` header comment fix moved to #23, so this branch changes no Go code; `notification.go`
     and `distributed.go` citations re-mapped.
+- Plain queues subscribe to their wake channel too, and `presenceGrace` went from 5 s to 2.5 s: row A now
+  reaps at 4.3 s (2.5-5 s in general); the labels say "gone ≥ 2.5 s", since sweeps land a second apart.

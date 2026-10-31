@@ -625,47 +625,66 @@ func TestGoneConsumerRequeues(t *testing.T) {
 // A consumer whose subscription drops for less than the grace keeps its
 // items, even with its sweep stalled (stopped here), so only the
 // subscription speaks for it: first a go-redis reconnect after Redis kills
-// the connection, then a gap of a few seconds. One that stays gone is taken
-// for dead, the grace counting from when it went.
+// the connection, then a gap of over a second. One that stays gone is taken
+// for dead, the grace counting from when it went. A plain queue resubscribes
+// as a distributed one does.
 func TestPresenceGrace(t *testing.T) {
-	ctx := context.Background()
-	key := "test_presence_grace"
-	qs := New(getTestRedisURL())
-	defer qs.Close()
-	c1, c2 := qs.NewDistributedQueue(key), qs.NewDistributedQueue(key)
-	defer c2.Close()
-	delKeys(t, c2.Queue.client, key)
-	defer delKeys(t, c2.Queue.client, key)
-	ch := c1.wakePrefix + c1.id
-	subs := func() int64 { return c2.Queue.client.PubSubNumSub(ctx, ch).Val()[ch] }
+	for _, c := range []struct {
+		name        string
+		distributed bool
+	}{{"distributed", true}, {"plain", false}} {
+		distributed := c.distributed
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			key := fmt.Sprintf("test_presence_grace_%t", distributed)
+			qs := New(getTestRedisURL())
+			defer qs.Close()
+			var c1, c2 *Queue
+			if distributed {
+				d1, d2 := qs.NewDistributedQueue(key), qs.NewDistributedQueue(key)
+				defer d1.Close()
+				defer d2.Close()
+				c1, c2 = d1.Queue, d2.Queue
+			} else {
+				c1, c2 = qs.NewQueue(key), qs.NewQueue(key)
+				defer c1.Close()
+				defer c2.Close()
+			}
+			delKeys(t, c2.client, key)
+			defer delKeys(t, c2.client, key)
+			ch := key + ":wake:" + c1.ackPrefix
+			subs := func() int64 { return c2.client.PubSubNumSub(ctx, ch).Val()[ch] }
 
-	require.True(t, c1.Enqueue("job"))
-	_, ok, _ := c1.DequeueWithAckId()
-	require.True(t, ok)
-	seen(t, c2.Queue, c1.ackPrefix)
-	c1.Queue.cancel() // its sweep stops
-	defer c1.Close()
+			require.True(t, c1.Enqueue("job"))
+			_, ok, _ := c1.DequeueWithAckId()
+			require.True(t, ok)
+			seen(t, c2, c1.ackPrefix)
+			c1.cancel() // its sweep stops
 
-	require.NoError(t, c2.Queue.client.Do(ctx, "CLIENT", "KILL", "TYPE", "pubsub").Err())
-	require.Eventually(t, func() bool { return subs() == 1 }, 2*time.Second, 10*time.Millisecond, "go-redis resubscribed")
+			require.NoError(t, c2.client.Do(ctx, "CLIENT", "KILL", "TYPE", "pubsub").Err())
+			require.Eventually(t, func() bool { return subs() == 1 }, 2*time.Second, 10*time.Millisecond, "go-redis resubscribed")
+			time.Sleep(presenceGrace + 1500*time.Millisecond)
+			assert.Equal(t, 1, c2.GetNackedItemsCount(), "requeued after a reconnect")
 
-	require.NoError(t, c1.pubsub.Close())
-	went := time.Now()
-	time.Sleep(presenceGrace - 3*time.Second)
-	back := c1.Queue.client.Subscribe(ctx, ch)
-	_, err := back.Receive(ctx)
-	require.NoError(t, err)
-	time.Sleep(presenceGrace + 1500*time.Millisecond - time.Since(went))
-	assert.Equal(t, 1, c2.GetNackedItemsCount(), "requeued after a short drop")
+			require.NoError(t, c1.presence.Close())
+			went := time.Now()
+			time.Sleep(presenceGrace - time.Second)
+			back := c1.client.Subscribe(ctx, ch)
+			_, err := back.Receive(ctx)
+			require.NoError(t, err)
+			time.Sleep(presenceGrace + 1500*time.Millisecond - time.Since(went))
+			assert.Equal(t, 1, c2.GetNackedItemsCount(), "requeued after a short drop")
 
-	require.NoError(t, back.Close())
-	went = time.Now()
-	for c2.GetNackedItemsCount() > 0 {
-		require.Less(t, time.Since(went), presenceGrace+3*time.Second, "gone consumer's item was not requeued")
-		time.Sleep(50 * time.Millisecond)
+			require.NoError(t, back.Close())
+			went = time.Now()
+			for c2.GetNackedItemsCount() > 0 {
+				require.Less(t, time.Since(went), presenceGrace+3*time.Second, "gone consumer's item was not requeued")
+				time.Sleep(50 * time.Millisecond)
+			}
+			assert.Less(t, presenceGrace-time.Second, time.Since(went), "the grace counted again from the last drop")
+			assert.EqualValues(t, 1, c2.client.LLen(ctx, key).Val())
+		})
 	}
-	assert.Less(t, presenceGrace-time.Second, time.Since(went), "the grace counted again from the last drop")
-	assert.EqualValues(t, 1, c2.Queue.client.LLen(ctx, key).Val())
 }
 
 // Close pushes an item back before it drops it from pending, so a push that
