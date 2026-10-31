@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-10-31
+
 ### Added
 
 - `Queue` and `PriorityQueue` subscribe to their wake channel as distributed queues do, so one whose process exits without `Close` has its items requeued in about 3-4s instead of after the 30s heartbeat timeout, and a restarted process gets back the jobs its crashed run held about 3s after it starts; a live process's jobs stay put, as no blind requeue runs on start (#26)
@@ -196,7 +198,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Graceful handling of Redis connection errors
 - Proper cleanup of resources on shutdown
 
-[Unreleased]: https://github.com/goptics/redisq/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/goptics/redisq/compare/v1.5.1...HEAD
 [1.0.0]: https://github.com/goptics/redisq/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/goptics/redisq/releases/tag/v0.1.0
 [1.1.0]: https://github.com/goptics/redisq/compare/v1.0.0...v1.1.0
@@ -205,4 +207,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [1.3.1]: https://github.com/goptics/redisq/compare/v1.3.0...v1.3.1
 [1.4.0]: https://github.com/goptics/redisq/compare/v1.3.1...v1.4.0
 [1.5.0]: https://github.com/goptics/redisq/compare/v1.4.0...v1.5.0
-
+[1.5.1]: https://github.com/goptics/redisq/compare/v1.5.0...v1.5.1
