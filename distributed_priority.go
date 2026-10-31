@@ -24,7 +24,7 @@ func newDistributedPriorityQueue(client *redis.Client, queueKey string) *Distrib
 	base := newPriorityQueue(client, queueKey)
 	q := &DistributedPriorityQueue{
 		PriorityQueue: base,
-		Notification:  newNotification(client, queueKey, "ZCARD", base.ackPrefix),
+		Notification:  newNotification(client, base.presence, queueKey, "ZCARD", base.ackPrefix),
 	}
 	q.setOnRequeue(q.wake)
 	defer q.Start()

@@ -39,18 +39,36 @@ type Queue struct {
 	tickScript        *redis.Script               // the sweep for this storage (see tickBody)
 	releaseScript     *redis.Script               // what Close runs to requeue this queue's items (see releaseBody)
 	storageKeys       []string                    // keys both take after the deadlines: :seq and :prio for a zset
+	presence          *redis.PubSub               // this object's wake channel subscription (see start)
 	closeOnce         sync.Once
 }
 
 func newQueue(c *redis.Client, queueKey string) *Queue {
 	q := newQueueBase(c, queueKey)
 	q.tickScript, q.releaseScript = listTick, listRelease
-
-	// requeue nacked items
-	q.RequeueNackedItems()
-	go q.sweep()
-
+	q.start()
 	return q
+}
+
+// start subscribes this queue object to its wake channel and sweeps once
+// now, which requeues the items past their deadline or held by a dead or
+// gone owner, and then every second.
+// The subscription says the process is alive: Redis drops it within
+// milliseconds of the process exiting, and other processes' sweeps then
+// requeue its items (see tickBody). A distributed queue's Notification reads
+// it for wakes; a plain queue drains it (see drain). Sweeping at once lets
+// a restarted process start the grace of one that crashed straight away.
+func (q *Queue) start() {
+	q.presence = q.client.Subscribe(q.ctx, q.queueKey+":wake:"+q.ackPrefix)
+	q.tick()
+	go q.sweep()
+}
+
+// drain reads a plain queue's wake channel, where nothing is published, so
+// go-redis pings the connection and resubscribes after a reconnect.
+func (q *Queue) drain() {
+	for range q.presence.Channel() {
+	}
 }
 
 func newQueueBase(c *redis.Client, queueKey string) *Queue {
@@ -123,8 +141,8 @@ const minHeartbeat = 5 * time.Second
 // Set it above the longest freeze or network cut you want to ride out: a job
 // still running when its queue's heartbeat runs out runs again elsewhere, and
 // its later Acknowledge still reports success. A stall of Redis itself, such
-// as a failover, doesn't count. A distributed queue whose process exits is
-// taken for dead sooner, about 5s after Redis drops its pub/sub connection.
+// as a failover, doesn't count. A queue whose process exits is taken for dead
+// sooner, about 3s after Redis drops its pub/sub connection.
 // 0 or less turns both off, so this queue's items wait for the visibility
 // timeout.
 func (q *Queue) SetHeartbeatTimeout(d time.Duration) {
@@ -770,16 +788,18 @@ end
 // then, so the heartbeats move on by the gap first, and a stall doesn't make
 // every consumer look dead. With no clock yet, no owner is taken for dead.
 //
-// Presence: a distributed queue's wake channel is ARGV[4] .. its ack ID
-// prefix (see Notification), and Redis drops its subscription within
+// Presence: a queue object's wake channel is ARGV[4] .. its ack ID prefix
+// (see Queue.start), and Redis drops its subscription within
 // milliseconds of the process exiting. The sweep that moves the clock on
 // counts the subscribers of every owner with a live heartbeat and keeps the
 // result in the presence ZSET: 0 once it has seen one, else when it first
 // saw none. An owner seen subscribed and then without one for ARGV[5]
 // seconds is gone. Its own sweep sets it back to 0, so a process that still
 // sweeps is never taken for gone, whatever its connection does. Owners never
-// seen subscribed (plain queues) are left to their heartbeat, and so is a
-// lost host, whose subscription Redis keeps until TCP keepalive drops it.
+// seen subscribed (older versions, which subscribed only distributed queues,
+// or a process gone within a second of its first pop) are left to
+// their heartbeat, and so is a lost host, whose subscription Redis keeps
+// until TCP keepalive drops it.
 // ponytail: a dead owner, like a Close (releaseBody), costs a read of every
 // pending ID (HKEYS); index pending items by owner if pending runs to millions.
 // The presence count covers 1000 owners per sweep; the rest keep heartbeats.
@@ -861,10 +881,14 @@ var listTick, listRelease = heartbeatScripts(listRepush)
 // slow call, below minHeartbeat.
 const sweepGap = 2 * time.Second
 
-// presenceGrace is how long a distributed queue may go without a subscriber
-// on its wake channel and without a sweep of its own before other processes
-// take it for gone (see tickBody): well above a go-redis pub/sub reconnect.
-const presenceGrace = 5 * time.Second
+// presenceGrace is how long a queue object may go without a subscriber on
+// its wake channel and without a sweep of its own before other processes
+// take it for gone (see tickBody). A live owner sweeps every second and
+// resubscribes within milliseconds of Redis dropping its connection, so the
+// grace only has to outlast one missed sweep (a 2s gap) while it reconnects.
+// Sweeps land 1s apart, so a gone owner is reaped on the third one after the
+// first that sees it unsubscribed.
+const presenceGrace = 2500 * time.Millisecond
 
 // RequeueNackedItems returns un-acknowledged items whose visibility timeout
 // has passed (every pending item when it is 0) to the queue.
@@ -892,25 +916,34 @@ func (q *Queue) sweep() {
 		case <-tick.C:
 		}
 
-		keys := append(q.requeueKeys(), q.getHeartbeatKey(), q.getHeartbeatKey()+":clock", q.getPresenceKey())
-		wakePrefix := q.queueKey + ":wake:" // as Notification names the channels
-		r, err := q.tickScript.Run(q.ctx, q.client, keys, q.ackPrefix, q.hbt(), sweepGap.Seconds(), wakePrefix, presenceGrace.Seconds()).Int64Slice()
-		if errors.Is(err, redis.ErrClosed) {
-			return // the client was closed without closing this queue
+		if !q.tick() {
+			return
 		}
-		if err != nil {
-			if q.ctx.Err() == nil {
-				log.Printf("Error requeueing pending items: %v", err)
-			}
-			continue
-		}
-
-		if r[1] == 1 && q.hbt() > 0 && q.beating.CompareAndSwap(true, false) {
-			log.Printf("queue %s: taken for dead (heartbeat ran out, or pub/sub connection and sweep gone); its unacknowledged items may have been requeued to other consumers", q.queueKey)
-		}
-
-		q.requeued(r[0])
 	}
+}
+
+// tick runs the sweep script once, and returns false once the client is
+// closed.
+func (q *Queue) tick() bool {
+	keys := append(q.requeueKeys(), q.getHeartbeatKey(), q.getHeartbeatKey()+":clock", q.getPresenceKey())
+	wakePrefix := q.queueKey + ":wake:" // as start and Notification name the channels
+	r, err := q.tickScript.Run(q.ctx, q.client, keys, q.ackPrefix, q.hbt(), sweepGap.Seconds(), wakePrefix, presenceGrace.Seconds()).Int64Slice()
+	if errors.Is(err, redis.ErrClosed) {
+		return false // the client was closed without closing this queue
+	}
+	if err != nil {
+		if q.ctx.Err() == nil {
+			log.Printf("Error requeueing pending items: %v", err)
+		}
+		return true
+	}
+
+	if r[1] == 1 && q.hbt() > 0 && q.beating.CompareAndSwap(true, false) {
+		log.Printf("queue %s: taken for dead (heartbeat ran out, or pub/sub connection and sweep gone); its unacknowledged items may have been requeued to other consumers", q.queueKey)
+	}
+
+	q.requeued(r[0])
+	return true
 }
 
 // requeued calls onRequeue after n items went back to the queue.
@@ -998,6 +1031,9 @@ func (q *Queue) Close() error {
 	q.closeOnce.Do(func() {
 		q.cancel() // Cancel context to stop notification listener
 		err = q.release()
+		if q.presence != nil {
+			q.presence.Close()
+		}
 	})
 	return err
 }

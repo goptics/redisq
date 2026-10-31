@@ -56,9 +56,7 @@ func newPriorityQueue(client *redis.Client, queueKey string) *PriorityQueue {
 	q.isPriority = true
 	q.tickScript, q.releaseScript = zsetTick, zsetRelease
 	q.storageKeys = []string{q.queueKey + ":seq", q.getPriorityKey()}
-
-	q.RequeueNackedItems()
-	go q.sweep()
+	q.start()
 	return q
 }
 

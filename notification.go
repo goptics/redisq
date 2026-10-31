@@ -76,18 +76,18 @@ if n > 0 then redis.call('SREM', KEYS[2], ARGV[2])
 elseif ARGV[3] == '1' then redis.call('SADD', KEYS[2], ARGV[2]) end
 return n`)
 
-func newNotification(client *redis.Client, queueKey, lenCmd, id string) *Notification {
+// newNotification reads pubsub, the subscription to channel <queueKey>:wake:<id>.
+func newNotification(client *redis.Client, pubsub *redis.PubSub, queueKey, lenCmd, id string) *Notification {
 	ctx, cancel := context.WithCancel(context.Background())
-	wakePrefix := queueKey + ":wake:"
 
 	return &Notification{
 		client:      client,
-		pubsub:      client.Subscribe(ctx, wakePrefix+id),
+		pubsub:      pubsub,
 		id:          id,
 		queueKey:    queueKey,
 		lenCmd:      lenCmd,
 		idleKey:     queueKey + ":idle",
-		wakePrefix:  wakePrefix,
+		wakePrefix:  queueKey + ":wake:",
 		subscribers: make([]func(action string), 0),
 		ctx:         ctx,
 		cancel:      cancel,

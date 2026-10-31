@@ -1286,3 +1286,144 @@ func TestHeartbeatSetterAndLapse(t *testing.T) {
 	require.NoError(t, q.client.ZAdd(ctx, q.getTimeoutKey(), redis.Z{Score: 1, Member: ackID}).Err())
 	assert.Eventually(t, func() bool { return q.Len() == 1 }, 3*time.Second, 20*time.Millisecond, "the sweep stopped after a failure")
 }
+
+// plainCases open a plain queue of each storage on key, with its push
+// (priority 3) and ack pop.
+var plainCases = []struct {
+	name string
+	open func(qs Queues, key string) (*Queue, func(string) bool, func() (any, bool, string))
+}{
+	{"list", func(qs Queues, key string) (*Queue, func(string) bool, func() (any, bool, string)) {
+		q := qs.NewQueue(key)
+		return q, func(v string) bool { return q.Enqueue(v) }, q.DequeueWithAckId
+	}},
+	{"priority", func(qs Queues, key string) (*Queue, func(string) bool, func() (any, bool, string)) {
+		q := qs.NewPriorityQueue(key)
+		return q.Queue, func(v string) bool { return q.Enqueue(v, 3) }, q.DequeueWithAckId
+	}},
+}
+
+// popWithin pops from a queue until it hands out an item, and fails after d.
+func popWithin(t *testing.T, d time.Duration, pop func() (any, bool, string), msg string) (string, string) {
+	t.Helper()
+	start := time.Now()
+	for {
+		item, ok, ackID := pop()
+		if ok {
+			return string(item.([]byte)), ackID
+		}
+		require.Less(t, time.Since(start), d, msg)
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// A plain queue whose process dies without Close (its client closes, taking
+// its pub/sub connection and sweep, as kill -9 would) gets the job it was
+// running back once the process restarts, within the presence grace of the
+// restart rather than the heartbeat timeout: Redis dropped its subscription,
+// and the restarted process's first sweep sees that at once. The restart
+// outlasts sweepGap, which moves heartbeats on but not presence.
+func TestRestartedQueueGetsCrashedJobBack(t *testing.T) {
+	for _, c := range plainCases {
+		t.Run(c.name, func(t *testing.T) {
+			key := "test_restart_" + c.name
+			qs1 := New(getTestRedisURL())
+			q1, push, pop := c.open(qs1, key)
+			delKeys(t, q1.client, key)
+			require.True(t, push("job"))
+			_, ok, _ := pop()
+			require.True(t, ok)
+			seen(t, q1, q1.ackPrefix) // by its own sweep
+			require.NoError(t, qs1.Close())
+			time.Sleep(sweepGap + 500*time.Millisecond)
+
+			qs2 := New(getTestRedisURL())
+			defer qs2.Close()
+			restarted := time.Now()
+			q2, _, pop2 := c.open(qs2, key)
+			defer q2.Close()
+			defer delKeys(t, q2.client, key)
+			item, ackID := popWithin(t, presenceGrace+time.Second, pop2, "the crashed job is not back")
+			assert.Equal(t, "job", item)
+			assert.True(t, q2.Acknowledge(ackID))
+			t.Logf("back %v after the restart", time.Since(restarted).Round(10*time.Millisecond))
+		})
+	}
+}
+
+// Two live processes share a key, as in a rolling deploy, each running a
+// job. One dies and restarts: its job comes back, and the other's, still
+// running, is never requeued, as a blind requeue on start would do.
+func TestRestartKeepsLiveProcessJobs(t *testing.T) {
+	for _, c := range plainCases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			key := "test_restart_live_" + c.name
+			qsA, qsB := New(getTestRedisURL()), New(getTestRedisURL())
+			defer qsB.Close()
+			a, push, popA := c.open(qsA, key)
+			delKeys(t, a.client, key)
+			b, _, popB := c.open(qsB, key)
+			defer b.Close()
+			defer delKeys(t, b.client, key)
+			require.True(t, push("a"))
+			require.True(t, push("b"))
+			_, ok, _ := popA()
+			require.True(t, ok)
+			itemB, ok, ackB := popB()
+			require.True(t, ok)
+			require.Equal(t, "b", string(itemB.([]byte)))
+			seen(t, b, a.ackPrefix)
+			seen(t, b, b.ackPrefix)
+
+			require.NoError(t, qsA.Close())
+			died := time.Now()
+			qsA2 := New(getTestRedisURL())
+			defer qsA2.Close()
+			a2, _, popA2 := c.open(qsA2, key)
+			defer a2.Close()
+			item, ackID := popWithin(t, presenceGrace+3*time.Second, popA2, "the dead process's job is not back")
+			assert.Equal(t, "a", item)
+			assert.True(t, a2.Acknowledge(ackID))
+			t.Logf("back %v after the kill", time.Since(died).Round(10*time.Millisecond))
+
+			time.Sleep(2 * presenceGrace)
+			_, ok, _ = popA2()
+			assert.False(t, ok, "the live process's job was requeued")
+			assert.True(t, b.client.HExists(ctx, b.getNackedItemKey(), ackB).Val(), "the live process's job left pending")
+			assert.True(t, b.Acknowledge(ackB))
+		})
+	}
+}
+
+// A new queue object requeues the items past their deadline at once, into
+// its own storage: a priority queue's go back into its sorted set.
+func TestNewQueueRequeuesExpiredItems(t *testing.T) {
+	for _, c := range plainCases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			key := "test_new_requeues_" + c.name
+			qs := New(getTestRedisURL())
+			defer qs.Close()
+			q1, push, pop := c.open(qs, key)
+			defer q1.Close()
+			delKeys(t, q1.client, key)
+			defer delKeys(t, q1.client, key)
+			q1.SetVisibilityTimeout(100 * time.Millisecond)
+			q1.SetHeartbeatTimeout(0) // so only the deadline can bring it back
+			require.True(t, push("job"))
+			kind := q1.client.Type(ctx, key).Val()
+			_, ok, _ := pop()
+			require.True(t, ok)
+			q1.cancel() // its sweep stops
+			time.Sleep(200 * time.Millisecond)
+
+			q2, _, pop2 := c.open(qs, key)
+			defer q2.Close()
+			assert.Equal(t, kind, q2.client.Type(ctx, key).Val(), "the key keeps its type")
+			item, ok, _ := pop2()
+			require.True(t, ok)
+			assert.Equal(t, "job", string(item.([]byte)), "back before the sweep's first tick")
+		})
+	}
+}

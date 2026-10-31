@@ -137,7 +137,7 @@ def simulate():
             signal(t, *a)
         elif kind == "pop":                         # DequeueWithAckId: LPOP into pending (queue.go popOneTail)
             c = a[0]
-            if not queue:                           # a race: the pop finds nothing → SADD (queue.go:476-478)
+            if not queue:                           # a race: the pop finds nothing → SADD (queue.go:494-496)
                 member(t, c, True, "pop-miss")
                 free[c] = True
                 busy[c] = None

@@ -2,8 +2,8 @@
 
 Two rows on one real-seconds clock. A: the process is killed, so Redis drops its subscription at once.
 B: the host is lost, so Redis keeps its socket and still counts the subscription. In both rows C1, alive and
-idle, sweeps once a second. Every sweep runs a port of the sweep script (tickBody, queue.go:786-836), in whole
-milliseconds so "now - mark >= 5 s" is exact. Facts and invariants: STORYBOARD.md, section 4.
+idle, sweeps once a second. Every sweep runs a port of the sweep script (tickBody, queue.go:806-856), in whole
+milliseconds so "now - mark >= 2.5 s" is exact. Facts and invariants: STORYBOARD.md, section 4.
 """
 import heapq
 import itertools
@@ -14,12 +14,13 @@ import kfu
 from kfu import at, bar, flash, kf, ring
 
 # ---- the rules, in milliseconds ----
-HBT = 30_000          # heartbeat timeout, default 30 s (queue.go:67)
-GRACE = 5_000         # presenceGrace (queue.go:867)
-TICK = 500            # a sweep moves the shared clock only if >= .5 s since the last move (queue.go:794)
-GAP = 2_000           # sweepGap: a longer gap is a stall (queue.go:790-793, 862); must not fire here
-VT = 300_000          # visibility timeout, default 5 min (queue.go:65): out of reach in this story
-C2_PHASE, C1_PHASE = 0, 300   # each Queue object sweeps once a second (queue.go:884-885); fixed phases
+HBT = 30_000          # heartbeat timeout, default 30 s (queue.go:85)
+GRACE = 2_500         # presenceGrace (queue.go:891)
+GRACE_S = f"{GRACE / 1000:g}"   # as the labels print it
+TICK = 500            # a sweep moves the shared clock only if >= .5 s since the last move (queue.go:814)
+GAP = 2_000           # sweepGap: a longer gap is a stall (queue.go:810-813, 862); must not fire here
+VT = 300_000          # visibility timeout, default 5 min (queue.go:83): out of reach in this story
+C2_PHASE, C1_PHASE = 0, 300   # each Queue object sweeps once a second (queue.go:908-909); fixed phases
 T0 = -5_000           # history: C2 popped J1, then J2 (varmq pops one per call for ack storage)
 KILL = 100            # C2 stops 0.1 s after its own sweep at 0
 END = 34_600          # real time drawn (the clock shows 0-34 s)
@@ -56,7 +57,7 @@ class Redis:
 
     def pop_one(self, owner, now):
         """listAckPopOne: LPOP the head into pending with a deadline, renew the owner's heartbeat, one script
-        (queue.go:521-540, 588-592; beat: queue.go:647-650)."""
+        (queue.go:539-558, 588-592; beat: queue.go:665-668)."""
         if not self.lst:
             self.idle.add(owner)
             return None
@@ -66,11 +67,11 @@ class Redis:
         return aid, v
 
     def ack(self, aid):
-        """Acknowledge deletes the entry and its deadline (queue.go:335-355)."""
+        """Acknowledge deletes the entry and its deadline (queue.go:353-373)."""
         del self.pending[aid], self.dl[aid]
 
     def move(self, aid):
-        """moveFn + listRepush: LPUSH to the front, then drop from pending (queue.go:731-757)."""
+        """moveFn + listRepush: LPUSH to the front, then drop from pending (queue.go:749-775)."""
         v = self.pending.get(aid)
         if v is not None:
             self.lst.insert(0, v)
@@ -79,7 +80,7 @@ class Redis:
         return int(v is not None)
 
     def tick(self, me, now):
-        """tickBody (queue.go:786-836) for Queue object `me`. Returns (moved, ticked, notes)."""
+        """tickBody (queue.go:806-856) for Queue object `me`. Returns (moved, ticked, notes)."""
         notes = []
         last = self.clock
         assert not (last is not None and now - last > GAP), ("stall guard fired", now, last)
@@ -93,9 +94,9 @@ class Redis:
         n = 0
         assert all(d > now for d in self.dl.values()), "no visibility deadline passes in this story"
         if last is not None:
-            dead = {m for m, s in self.hb.items() if s <= now}            # heartbeat ran out (queue.go:810)
+            dead = {m for m, s in self.hb.items() if s <= now}            # heartbeat ran out (queue.go:830)
             notes += [("heartbeat ran out", m) for m in sorted(dead)]
-            if ticked:                                                    # presence (queue.go:811-821)
+            if ticked:                                                    # presence (queue.go:831-841)
                 for m in sorted(m for m, s in self.hb.items() if s >= now):
                     s = self.pres.get(m)
                     if self.subs.get(m, 0) > 0:
@@ -109,7 +110,7 @@ class Redis:
                         notes.append(("gone", m))
                     elif s is not None:
                         notes.append(("waiting", m))
-            if dead:                                                      # reap (queue.go:823-833)
+            if dead:                                                      # reap (queue.go:843-853)
                 for aid in sorted(a for a in self.pending if a.split(":")[0] in dead):
                     n += self.move(aid)
                 for m in dead:
@@ -163,7 +164,7 @@ def simulate(row):
             if any(k_ == "reap" for k_, *_ in notes):
                 for v in r.lst:
                     where[v].append((t, "list"))
-            if n and arg == "C1":          # a DistributedQueue's onRequeue is wake(n) (distributed.go:29, queue.go:917-923)
+            if n and arg == "C1":          # a DistributedQueue's onRequeue is wake(n) (distributed.go:29, queue.go:950-956)
                 heapq.heappush(ev, (t + WAKE_MS, next(seq), "wake", n))
         elif kind == "wake":
             members = sorted(r.idle)
@@ -225,13 +226,13 @@ def facts(row, r, start, log, where):
             "mark = now at the first clock-moving sweep with no subscriber"
         assert all(e["mark"] == 0 for t, e in sw if c2_first <= t < mark), "mark 0 from the first check until then"
         assert reap == next(t for t, e in c1 if t > mark and e["ticked"] and t - mark >= GRACE), \
-            "dead at the first clock-moving sweep with now - mark >= 5 s"
+            "dead at the first clock-moving sweep with now - mark >= 2.5 s"
         assert ("gone", "C2") in reaper["notes"] and ("heartbeat ran out", "C2") not in reaper["notes"]
         assert not [t for t, e in sw if e["who"] == "C2" and mark <= t <= reap], "no own sweep in between"
         assert all(e["ticked"] and ("waiting", "C2") in e["notes"] for t, e in c1 if mark < t < reap), \
             "every sweep in between moves the clock and finds no subscriber (one would reset the mark to 0)"
         assert hb_out > reap, "row A's heartbeat still had time left: it is dropped at the reap, not run out"
-        assert 5_000 <= reap - kill <= 7_500, "5-7.5 s"
+        assert GRACE <= reap - kill <= GRACE + 2_500, "2.5-5 s"
     else:
         mark = None
         assert not marks and all(e["mark"] == 0 for t, e in sw if c2_first <= t < reap), "subscriber counted: mark stays 0"
@@ -411,11 +412,11 @@ def draw_row(row, f, M):
         els.append(text(f"hbc-{r}-{i}", 214, 111, "why start" if s.startswith("ran out") else "m start", s))
     swap(f"hbc-{r}-", hch, len(hbc))
 
-    # presence mark: A sets it at the first clock-moving sweep with no subscriber, dead 5 s later
+    # presence mark: A sets it at the first clock-moving sweep with no subscriber, dead 2.5 s later
     mkc = ["0 = seen subscribed"]
     if row == "A":
         mark_d = M(f["mark"])
-        mkc += [f"gone since {f['mark']:g} s", f"gone {GRACE // 1000} s: C2 counts as dead", "dropped at the reap"]
+        mkc += [f"gone since {f['mark']:g} s", f"gone ≥ {GRACE_S} s: C2 counts as dead", "dropped at the reap"]
         mch = [(0, 0), (mark_d, 1), (reap_d, 2), (reap_d + 1.6, 3), (XF0, 0, XF)]
         kf(f"gr-{r}", [(0, sx(0, 1)), (mark_d - .01, sx(0, 1)), (mark_d, sx(1, 1)), (reap_d, sx(1, 0)),
                        (reap_d + .3, sx(0, 0))])
@@ -433,7 +434,7 @@ def draw_row(row, f, M):
            f"C1's sweep at {skip[0]:g} s: clock moved {skip[0] - f['c2_last']:g} s ago (< .5 s), so no presence check"]
     if row == "A":
         nar += [f"C1's sweep at {chk[0]:g} s moves the clock: no subscriber, so mark = {f['mark']:g}",
-                f"C1's sweep at {f['reap']:g} s: gone {GRACE // 1000} s, so C2 is dead: J1, J2 to the list front"]
+                f"C1's sweep at {f['reap']:g} s: gone ≥ {GRACE_S} s, so C2 is dead: J1, J2 to the list front"]
     else:
         nar += [f"C1's sweep at {chk[0]:g} s: C2's subscriber still counted, so mark stays 0",
                 f"C1's sweep at {f['reap']:g} s: heartbeat ran out, so C2 is dead: J1, J2 to the list front"]
@@ -502,7 +503,7 @@ DESC = ("Two rows show the same start on one clock, in real seconds (times not t
         "clock, so it checks heartbeats but not subscribers. "
         "Row A, process killed: Redis drops the dead process's subscription at once. C1's sweep at {mark} s moves "
         "the clock, finds no subscriber and sets C2's presence mark to {mark}. At {reapA} s a sweep finds C2 gone "
-        "for {grace} seconds and takes it for dead: J1 and J2 go back to the front of the list in one step (J2 at "
+        "for at least {grace} seconds and takes it for dead: J1 and J2 go back to the front of the list in one step (J2 at "
         "the head), and C2's heartbeat and mark are dropped although the heartbeat had time left. "
         "Row B, host lost: Redis keeps the lost host's socket open, so it still counts C2's subscription and the "
         "mark stays 0. C2's heartbeat runs out at {hbt} s and C1's sweep at {reapB} s takes C2 for dead, with the "
@@ -546,7 +547,7 @@ def build():
     vis("replay", [(XF0 - .3, XF1 + .3)])
 
     desc = DESC.format(hbt=HBT // 1000, kill=f"{fa['kill']:g}", skip=f"{fa['skip']:g}", mark=f"{fa['mark']:g}",
-                       reapA=f"{fa['reap']:g}", reapB=f"{fb['reap']:g}", grace=GRACE // 1000)
+                       reapA=f"{fa['reap']:g}", reapB=f"{fb['reap']:g}", grace=GRACE_S)
     sep = ROWS["B"]["Y"] - 8
     svg = (head + "".join(rows) + tail).replace("<!--CLOCK-->", "\n  ".join(clock))
     for k, v in (("{H}", str(H)), ("{H1}", str(H - 1)), ("{SEP}", str(sep)), ("{DESC}", esc(desc))):
