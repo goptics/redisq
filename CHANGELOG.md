@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `New` takes options; `WithNamespace(ns)` scopes every key and channel as `ns:fifo:{key}` / `ns:prio:{key}`, so a FIFO and a priority queue of one name no longer collide and a queue's keys share a Redis Cluster slot. Without it keys are unchanged
+
 ## [1.5.1] - 2026-10-31
 
 ### Added

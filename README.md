@@ -99,6 +99,16 @@ pq.Enqueue("high", 1)
 data, ok := pq.Dequeue() // "high"
 ```
 
+### Namespace
+
+```go
+qs := redisq.New(url, redisq.WithNamespace("app"))
+qs.NewQueue("orders")         // keys app:fifo:{orders}, app:fifo:{orders}:idle, ...
+qs.NewPriorityQueue("orders") // keys app:prio:{orders}, ... (a separate queue)
+```
+
+Without a namespace, keys are the queue key as given (`orders`, `orders:idle`, ...), as in earlier versions. Setting one moves a queue to new keys, so drain the old ones first. `{` and `}` are reserved: `New` panics on a namespace containing them, and so does a constructor on such a queue key under a namespace.
+
 ### Distributed queue
 
 ```go
