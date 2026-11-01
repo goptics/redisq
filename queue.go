@@ -307,8 +307,13 @@ func (q *Queue) Len() int {
 	return int(length)
 }
 
+// Purge deletes the queue's items, in one step: waiting and pending ones
+// (an Acknowledge of a purged item then does nothing), deadlines, and a priority
+// queue's sequence and priorities. Consumer state stays (the idle set,
+// heartbeats, presence), and so do EnqueueOnce ids, which expire on their
+// own (see EnqueueOnce).
 func (q *Queue) Purge() {
-	q.client.Del(q.ctx, q.queueKey)
+	q.client.Del(q.ctx, q.requeueKeys()...)
 }
 
 func (q *Queue) Values() []any {

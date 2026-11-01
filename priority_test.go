@@ -514,3 +514,28 @@ func TestPriorityQueueAckClearsPriority(t *testing.T) {
 	require.NoError(t, err)
 	assert.Zero(t, n)
 }
+
+// Purge drops the queue's data keys, pending items and priorities included;
+// only consumer liveness state (heartbeats, presence) is left.
+func TestPriorityQueuePurgeDropsSidecars(t *testing.T) {
+	qs := New(getTestRedisURL())
+	defer qs.Close()
+	key := "purge-sidecars-" + newID()
+	pq := qs.NewPriorityQueue(key)
+	defer pq.Close()
+	ctx := context.Background()
+
+	require.True(t, pq.Enqueue("a", 1))
+	require.True(t, pq.Enqueue("b", 2))
+	_, ok, _ := pq.DequeueWithAckId() // pending: :nacked, :timeouts, :prio
+	require.True(t, ok)
+
+	pq.Purge()
+
+	keys, err := pq.client.Keys(ctx, key+"*").Result()
+	require.NoError(t, err)
+	for _, k := range keys {
+		assert.Contains(t, []string{pq.getHeartbeatKey(), pq.getHeartbeatKey() + ":clock", pq.getPresenceKey()}, k)
+	}
+	assert.Zero(t, pq.GetNackedItemsCount())
+}

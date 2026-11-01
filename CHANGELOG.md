@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `Purge` deletes a queue's pending items, deadlines and a priority queue's `:seq` and `:prio` keys along with its items, in one `DEL`, instead of only the main key; consumer state and `EnqueueOnce` ids stay
+
 ## [1.5.1] - 2026-10-31
 
 ### Added
