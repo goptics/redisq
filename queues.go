@@ -1,13 +1,32 @@
 package redisq
 
 import (
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
 type queues struct {
-	client *redis.Client
+	client    *redis.Client
+	namespace string
+}
+
+// Option configures New. An invalid option makes New panic, as a bad URL does.
+type Option func(*queues) error
+
+// WithNamespace scopes every key and channel the queues use under ns, as
+// redisq:ns:fifo:{key} and redisq:ns:prio:{key} (see docs/adr/0002-redisq-key-prefix.md).
+// An empty ns is the same as none: redisq:fifo:{key}.
+func WithNamespace(ns string) Option {
+	return func(qs *queues) error {
+		if strings.ContainsAny(ns, "{}") {
+			return fmt.Errorf("redisq: namespace %q must not contain '{' or '}'", ns)
+		}
+		qs.namespace = ns
+		return nil
+	}
 }
 
 type Queues interface {
@@ -18,7 +37,14 @@ type Queues interface {
 	Close() error
 }
 
-func New(url string) Queues {
+func New(url string, options ...Option) Queues {
+	qs := &queues{}
+	for _, o := range options {
+		if err := o(qs); err != nil {
+			panic(err)
+		}
+	}
+
 	opts, err := redis.ParseURL(url)
 	if err != nil {
 		panic(err)
@@ -36,31 +62,45 @@ func New(url string) Queues {
 	}
 	opts.DialerRetries = 1 // one dial attempt; a URL can't set this
 
-	client := redis.NewClient(opts)
+	qs.client = redis.NewClient(opts)
+	return qs
+}
 
-	return &queues{
-		client: client,
+// prefix starts every Redis name redisq creates, so SCAN redisq:* finds them all.
+const prefix = "redisq:"
+
+// key is the Redis name of queue queueKey of kind fifo or prio. The hashtag
+// wraps only queueKey, so a queue and its sidecar keys share a cluster slot
+// and FIFO and priority queues of one name never meet.
+func (qs *queues) key(kind, queueKey string) string {
+	if queueKey == "" || strings.ContainsAny(queueKey, "{}") { // {} would hash the whole name
+		panic(fmt.Sprintf("redisq: queue key %q must be non-empty and free of '{' and '}'", queueKey))
 	}
+	ns := prefix
+	if qs.namespace != "" {
+		ns += qs.namespace + ":"
+	}
+	return ns + kind + ":{" + queueKey + "}"
 }
 
 func (qs *queues) NewQueue(queueKey string) *Queue {
-	q := newQueue(qs.client, queueKey)
+	q := newQueue(qs.client, qs.key("fifo", queueKey))
 	go q.drain()
 	return q
 }
 
 func (qs *queues) NewPriorityQueue(queueKey string) *PriorityQueue {
-	q := newPriorityQueue(qs.client, queueKey)
+	q := newPriorityQueue(qs.client, qs.key("prio", queueKey))
 	go q.drain()
 	return q
 }
 
 func (qs *queues) NewDistributedQueue(queueKey string) *DistributedQueue {
-	return newDistributedQueue(qs.client, queueKey)
+	return newDistributedQueue(qs.client, qs.key("fifo", queueKey))
 }
 
 func (qs *queues) NewDistributedPriorityQueue(queueKey string) *DistributedPriorityQueue {
-	return newDistributedPriorityQueue(qs.client, queueKey)
+	return newDistributedPriorityQueue(qs.client, qs.key("prio", queueKey))
 }
 
 func (qs *queues) Close() error {
