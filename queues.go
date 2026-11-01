@@ -17,8 +17,8 @@ type queues struct {
 type Option func(*queues) error
 
 // WithNamespace scopes every key and channel the queues use under ns, as
-// varmq:ns:fifo:{key} and varmq:ns:prio:{key} (see docs/adr/0002-varmq-key-prefix.md).
-// An empty ns is the same as none: varmq:fifo:{key}.
+// redisq:ns:fifo:{key} and redisq:ns:prio:{key} (see docs/adr/0002-redisq-key-prefix.md).
+// An empty ns is the same as none: redisq:fifo:{key}.
 func WithNamespace(ns string) Option {
 	return func(qs *queues) error {
 		if strings.ContainsAny(ns, "{}") {
@@ -66,8 +66,8 @@ func New(url string, options ...Option) Queues {
 	return qs
 }
 
-// prefix starts every Redis name redisq creates, so SCAN varmq:* finds them all.
-const prefix = "varmq:"
+// prefix starts every Redis name redisq creates, so SCAN redisq:* finds them all.
+const prefix = "redisq:"
 
 // key is the Redis name of queue queueKey of kind fifo or prio. The hashtag
 // wraps only queueKey, so a queue and its sidecar keys share a cluster slot

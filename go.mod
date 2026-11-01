@@ -1,4 +1,4 @@
-module github.com/goptics/redisq/v2
+module github.com/goptics/redisq
 
 go 1.26.0
 

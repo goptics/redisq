@@ -9,7 +9,7 @@ The name a caller gives a queue; identifies that queue's data within a Namespace
 _Avoid_: queue name, queue ID
 
 **Namespace**:
-An optional, client-wide name that scopes every Redis name redisq creates, keys and pub/sub channels alike, beneath the fixed `varmq` root. Empty unless the caller sets one.
+An optional, client-wide name that scopes every Redis name redisq creates, keys and pub/sub channels alike, beneath the fixed `redisq` root. Empty unless the caller sets one.
 _Avoid_: prefix, tenant, scope
 
 **Order Kind**:

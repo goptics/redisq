@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/goptics/redisq/v2"
+	"github.com/goptics/redisq"
 	"github.com/goptics/varmq"
 )
 

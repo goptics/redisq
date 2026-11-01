@@ -9,13 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Breaking:** the module path is `github.com/goptics/redisq/v2`
-- **Breaking:** every key and channel is now `varmq:[ns:]fifo:{key}` or `varmq:[ns:]prio:{key}` plus its suffix, so a FIFO and a priority queue of one name no longer collide and a queue's keys share a Redis Cluster slot. v2 does not read v1 keys: drain v1 queues before upgrading
+- **Breaking:** every key and channel is now `redisq:[ns:]fifo:{key}` or `redisq:[ns:]prio:{key}` plus its suffix, so a FIFO and a priority queue of one name no longer collide and a queue's keys share a Redis Cluster slot. Keys written by 1.5.x and earlier are not read: drain those queues before upgrading
 - Queue keys must be non-empty and free of `{` and `}`; a constructor panics otherwise
 
 ### Added
 
-- `New` takes options; `WithNamespace(ns)` scopes keys under `varmq:ns:`
+- `New` takes options; `WithNamespace(ns)` scopes keys under `redisq:ns:`
 
 ## [1.5.1] - 2026-10-31
 

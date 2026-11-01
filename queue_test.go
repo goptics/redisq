@@ -58,7 +58,7 @@ func TestNewQueue(t *testing.T) {
 	defer qs.Close()
 	defer q.Close()
 
-	assert.Equal(t, "varmq:fifo:{"+testQueueKey+"}", q.queueKey, "Queue key should match")
+	assert.Equal(t, "redisq:fifo:{"+testQueueKey+"}", q.queueKey, "Queue key should match")
 	assert.NotNil(t, q.client, "Redis client should not be nil")
 	assert.Equal(t, 5*time.Minute, q.getVisibilityTimeout(), "Default visibility timeout should be 5 minutes")
 }

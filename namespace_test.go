@@ -17,9 +17,9 @@ func TestNamespace(t *testing.T) {
 	pq := qs.NewPriorityQueue("orders")
 	defer pq.Close()
 
-	assert.Equal(t, "varmq:ns_test:fifo:{orders}", q.queueKey)
-	assert.Equal(t, "varmq:ns_test:prio:{orders}", pq.queueKey)
-	assert.Equal(t, "varmq:ns_test:fifo:{orders}:idle", q.getIdleKey())
+	assert.Equal(t, "redisq:ns_test:fifo:{orders}", q.queueKey)
+	assert.Equal(t, "redisq:ns_test:prio:{orders}", pq.queueKey)
+	assert.Equal(t, "redisq:ns_test:fifo:{orders}:idle", q.getIdleKey())
 
 	ctx := context.Background()
 	q.client.Del(ctx, q.queueKey, pq.queueKey, pq.queueKey+":seq")
@@ -48,5 +48,5 @@ func TestNamespaceRejectsBraces(t *testing.T) {
 	assert.Panics(t, func() { plain.NewQueue("x{y}") })
 	q := plain.NewQueue("orders")
 	defer q.Close()
-	assert.Equal(t, "varmq:fifo:{orders}", q.queueKey)
+	assert.Equal(t, "redisq:fifo:{orders}", q.queueKey)
 }
