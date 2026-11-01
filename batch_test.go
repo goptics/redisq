@@ -45,8 +45,16 @@ func popAll(t *testing.T, q interface {
 	}
 }
 
+// delKeys deletes a queue's keys; key is its full name, or a bare queue key
+// for both the FIFO and priority queues of that name.
 func delKeys(t *testing.T, c *redis.Client, key string) {
 	t.Helper()
+	if !strings.HasPrefix(key, prefix) {
+		qs := &queues{}
+		delKeys(t, c, qs.key("fifo", key))
+		delKeys(t, c, qs.key("prio", key))
+		return
+	}
 	ctx := context.Background()
 	dedup, err := c.Keys(ctx, key+":dedup:*").Result()
 	require.NoError(t, err)

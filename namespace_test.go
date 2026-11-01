@@ -17,15 +17,14 @@ func TestNamespace(t *testing.T) {
 	pq := qs.NewPriorityQueue("orders")
 	defer pq.Close()
 
-	assert.Equal(t, "ns_test:fifo:{orders}", q.queueKey)
-	assert.Equal(t, "ns_test:prio:{orders}", pq.queueKey)
-	assert.Equal(t, "ns_test:fifo:{orders}:idle", q.getIdleKey())
+	assert.Equal(t, "varmq:ns_test:fifo:{orders}", q.queueKey)
+	assert.Equal(t, "varmq:ns_test:prio:{orders}", pq.queueKey)
+	assert.Equal(t, "varmq:ns_test:fifo:{orders}:idle", q.getIdleKey())
 
 	ctx := context.Background()
 	q.client.Del(ctx, q.queueKey, pq.queueKey, pq.queueKey+":seq")
 
-	// A FIFO and a priority queue of one name are separate queues; on the
-	// legacy layout they would share one key and fail with WRONGTYPE.
+	// A FIFO and a priority queue of one name are separate queues.
 	require.True(t, q.Enqueue("a"))
 	require.True(t, pq.Enqueue("b", 1))
 	item, ok := q.Dequeue()
@@ -44,9 +43,10 @@ func TestNamespaceRejectsBraces(t *testing.T) {
 	assert.Panics(t, func() { qs.NewQueue("x{y}") })
 	assert.Panics(t, func() { qs.NewQueue("") })
 
-	legacy := New(getTestRedisURL(), WithNamespace(""))
-	defer legacy.Close()
-	q := legacy.NewQueue("legacy_{key}") // legacy layout keeps any key as is
+	plain := New(getTestRedisURL())
+	defer plain.Close()
+	assert.Panics(t, func() { plain.NewQueue("x{y}") })
+	q := plain.NewQueue("orders")
 	defer q.Close()
-	assert.Equal(t, "legacy_{key}", q.queueKey)
+	assert.Equal(t, "varmq:fifo:{orders}", q.queueKey)
 }

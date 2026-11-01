@@ -6,7 +6,7 @@
 </picture>
 
   <p>
-    <a href="https://pkg.go.dev/github.com/goptics/redisq"><img src="https://img.shields.io/badge/go-pkg-00ADD8.svg?logo=go" alt="Go Reference" /></a>
+    <a href="https://pkg.go.dev/github.com/goptics/redisq/v2"><img src="https://img.shields.io/badge/go-pkg-00ADD8.svg?logo=go" alt="Go Reference" /></a>
     <a href="https://github.com/goptics/redisq/actions/workflows/redisq.yml"><img src="https://github.com/goptics/redisq/actions/workflows/redisq.yml/badge.svg" alt="CI" /></a>
     <a href="https://codecov.io/gh/goptics/redisq"><img src="https://codecov.io/gh/goptics/redisq/branch/main/graph/badge.svg" alt="Codecov" /></a>
     <a href="https://golang.org/doc/devel/release.html"><img src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat-square&logo=go" alt="Go Version" /></a>
@@ -43,7 +43,7 @@
 ## Quick Start
 
 ```bash
-go get github.com/goptics/redisq
+go get github.com/goptics/redisq/v2
 ```
 
 Requires Go 1.26+ and Redis 6.0+.
@@ -54,7 +54,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/goptics/redisq"
+	"github.com/goptics/redisq/v2"
 )
 
 func main() {
@@ -99,15 +99,22 @@ pq.Enqueue("high", 1)
 data, ok := pq.Dequeue() // "high"
 ```
 
-### Namespace
+### Keys and namespaces
+
+Every key and channel starts with `varmq:`, so `SCAN varmq:*` finds all of redisq's data. A namespace goes after it:
 
 ```go
-qs := redisq.New(url, redisq.WithNamespace("app"))
-qs.NewQueue("orders")         // keys app:fifo:{orders}, app:fifo:{orders}:idle, ...
-qs.NewPriorityQueue("orders") // keys app:prio:{orders}, ... (a separate queue)
+qs := redisq.New(url)
+qs.NewQueue("orders")         // varmq:fifo:{orders}, varmq:fifo:{orders}:idle, ...
+qs.NewPriorityQueue("orders") // varmq:prio:{orders}, ... (a separate queue)
+
+qs = redisq.New(url, redisq.WithNamespace("app"))
+qs.NewQueue("orders")         // varmq:app:fifo:{orders}, ...
 ```
 
-Without a namespace, keys are the queue key as given (`orders`, `orders:idle`, ...), as in earlier versions. Setting one moves a queue to new keys, so drain the old ones first. `{` and `}` are reserved: `New` panics on a namespace containing them, and so does a constructor on such a queue key under a namespace.
+A queue and its keys share one Redis Cluster hash slot. `{` and `}` are reserved: `New` panics on a namespace containing them, and a constructor on an empty queue key or one containing them.
+
+> **Upgrading from v1:** v1 used the queue key as given (`orders`, `orders:idle`, ...). v2 does not read those keys, so drain v1 queues (or move their items) before switching.
 
 ### Distributed queue
 
@@ -315,7 +322,7 @@ The diagrams' facts, with code citations, are in [`assets/diagrams/gen/STORYBOAR
 
 ## API Reference
 
-See [GoDoc](https://pkg.go.dev/github.com/goptics/redisq).
+See [GoDoc](https://pkg.go.dev/github.com/goptics/redisq/v2).
 
 ## Star History
 

@@ -35,13 +35,13 @@ func setupTestQueue(t *testing.T) (*Queue, func()) {
 	}
 
 	// Clear the queue before test
-	require.NoError(t, q.client.Del(ctx, testQueueKey).Err(), "Failed to clear test queue")
+	require.NoError(t, q.client.Del(ctx, q.queueKey).Err(), "Failed to clear test queue")
 	require.NoError(t, q.client.Del(ctx, q.getNackedItemKey()).Err(), "Failed to clear nacked queue")
 	require.NoError(t, q.client.Del(ctx, q.getTimeoutKey()).Err(), "Failed to clear timeout key")
 
 	cleanup := func() {
 		q.Close() // first: it requeues what the test left pending
-		q.client.Del(ctx, testQueueKey)
+		q.client.Del(ctx, q.queueKey)
 		q.client.Del(ctx, q.getNackedItemKey())
 		q.client.Del(ctx, q.getTimeoutKey())
 		q.client.Del(ctx, q.getHeartbeatKey())
@@ -58,7 +58,7 @@ func TestNewQueue(t *testing.T) {
 	defer qs.Close()
 	defer q.Close()
 
-	assert.Equal(t, testQueueKey, q.queueKey, "Queue key should match")
+	assert.Equal(t, "varmq:fifo:{"+testQueueKey+"}", q.queueKey, "Queue key should match")
 	assert.NotNil(t, q.client, "Redis client should not be nil")
 	assert.Equal(t, 5*time.Minute, q.getVisibilityTimeout(), "Default visibility timeout should be 5 minutes")
 }
@@ -1412,7 +1412,7 @@ func TestNewQueueRequeuesExpiredItems(t *testing.T) {
 			q1.SetVisibilityTimeout(100 * time.Millisecond)
 			q1.SetHeartbeatTimeout(0) // so only the deadline can bring it back
 			require.True(t, push("job"))
-			kind := q1.client.Type(ctx, key).Val()
+			kind := q1.client.Type(ctx, q1.queueKey).Val()
 			_, ok, _ := pop()
 			require.True(t, ok)
 			q1.cancel() // its sweep stops
@@ -1420,7 +1420,7 @@ func TestNewQueueRequeuesExpiredItems(t *testing.T) {
 
 			q2, _, pop2 := c.open(qs, key)
 			defer q2.Close()
-			assert.Equal(t, kind, q2.client.Type(ctx, key).Val(), "the key keeps its type")
+			assert.Equal(t, kind, q2.client.Type(ctx, q2.queueKey).Val(), "the key keeps its type")
 			item, ok, _ := pop2()
 			require.True(t, ok)
 			assert.Equal(t, "job", string(item.([]byte)), "back before the sweep's first tick")

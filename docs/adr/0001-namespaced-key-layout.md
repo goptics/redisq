@@ -1,3 +1,7 @@
+---
+status: superseded by ADR-0002
+---
+
 # Namespaced key layout: `ns:kind:{key}`, opt-in
 
 Setting a Namespace (`New(url, WithNamespace("app"))`) switches a client to a new key layout, `app:fifo:{orders}` / `app:prio:{orders}`, with Sidecar Keys and wake channels appended (`app:prio:{orders}:seq`). Without a Namespace the legacy layout (`orders`, `orders:idle`, …) is kept byte for byte, so upgrading never strands data in existing deployments; opting in to a Namespace is the one migration point, so hashtags and the Order Kind segment ride along with it instead of costing a second key move later.

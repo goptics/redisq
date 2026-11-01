@@ -174,10 +174,10 @@ func TestEnqueueOnceFailedPushKeepsIdFree(t *testing.T) {
 			client := qs.(*queues).client
 			delKeys(t, client, c.key())
 			defer delKeys(t, client, c.key())
-			_, push, size, done := c.open(qs, c.key())
+			q, push, size, done := c.open(qs, c.key())
 			defer done()
 
-			bad := c.key()
+			bad := q.queueKey
 			if strings.Contains(c.name, "priority") {
 				bad += ":seq" // INCR fails on it
 			}
@@ -295,7 +295,7 @@ func TestEnqueueOnceSetsExpiration(t *testing.T) {
 
 			q.SetExpiration(10 * time.Second)
 			require.True(t, push("a", "x"))
-			ttl := client.PTTL(ctx, c.key()).Val()
+			ttl := client.PTTL(ctx, q.queueKey).Val()
 			assert.Greater(t, ttl, time.Duration(0))
 			assert.LessOrEqual(t, ttl, 10*time.Second)
 		})

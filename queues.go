@@ -17,8 +17,8 @@ type queues struct {
 type Option func(*queues) error
 
 // WithNamespace scopes every key and channel the queues use under ns, as
-// ns:fifo:{key} and ns:prio:{key} (see docs/adr/0001-namespaced-key-layout.md).
-// An empty ns keeps the legacy layout, where the key is used as is.
+// varmq:ns:fifo:{key} and varmq:ns:prio:{key} (see docs/adr/0002-varmq-key-prefix.md).
+// An empty ns is the same as none: varmq:fifo:{key}.
 func WithNamespace(ns string) Option {
 	return func(qs *queues) error {
 		if strings.ContainsAny(ns, "{}") {
@@ -66,17 +66,21 @@ func New(url string, options ...Option) Queues {
 	return qs
 }
 
-// key is the Redis name of queue queueKey of kind fifo or prio. Under a
-// namespace the hashtag wraps only queueKey, so a queue and its sidecar keys
-// share a cluster slot and FIFO and priority queues of one name never meet.
+// prefix starts every Redis name redisq creates, so SCAN varmq:* finds them all.
+const prefix = "varmq:"
+
+// key is the Redis name of queue queueKey of kind fifo or prio. The hashtag
+// wraps only queueKey, so a queue and its sidecar keys share a cluster slot
+// and FIFO and priority queues of one name never meet.
 func (qs *queues) key(kind, queueKey string) string {
-	if qs.namespace == "" {
-		return queueKey // legacy layout, kept byte for byte
-	}
 	if queueKey == "" || strings.ContainsAny(queueKey, "{}") { // {} would hash the whole name
-		panic(fmt.Sprintf("redisq: queue key %q must be non-empty and free of '{' and '}' under a namespace", queueKey))
+		panic(fmt.Sprintf("redisq: queue key %q must be non-empty and free of '{' and '}'", queueKey))
 	}
-	return qs.namespace + ":" + kind + ":{" + queueKey + "}"
+	ns := prefix
+	if qs.namespace != "" {
+		ns += qs.namespace + ":"
+	}
+	return ns + kind + ":{" + queueKey + "}"
 }
 
 func (qs *queues) NewQueue(queueKey string) *Queue {

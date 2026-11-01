@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/goptics/redisq"
+	"github.com/goptics/redisq/v2"
 	"github.com/goptics/varmq"
 )
 
