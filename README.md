@@ -36,6 +36,7 @@
 - **Fast handover**: a consumer that [closes](#when-a-consumer-closes) hands its unacknowledged jobs back at once; one that [dies](#when-a-consumer-dies), in about 3-4 s; one cut off from Redis, after a 30 s heartbeat.
 - **Batch dequeue** of up to 1000 items per round trip, each under its own ack ID.
 - **Deduplicated enqueue**: `EnqueueOnce` stores a job once per id within a dedup window.
+- **Job records and stats** in Redis, shared by every instance: completed and failed jobs with payloads, kept by count and age.
 - **Queue TTL**, refreshed on every enqueue.
 - **Thread-safe**: share one queue object across goroutines.
 - **Storage for [varmq](https://github.com/goptics/varmq)** persistent and distributed queues.
@@ -167,6 +168,29 @@ pq.EnqueueOnce("rebuild index", 1, "job-5f1d3e77")
 An id stays taken for the whole window, even after its job is handled, removed or purged, so producers that reuse
 an id drop each other's jobs.
 
+### Job records and stats
+
+`Acknowledge` marks a job completed and `Reject` marks it failed for good (no requeue). Each, in one atomic
+script, counts the job, keeps its Job Record (item verbatim, start and finish times, attempts, `Reject`'s reason)
+and trims old records. Every enqueue counts as submitted, except an `EnqueueOnce` repeat.
+
+```go
+queue.Reject(ackID, "payment declined")
+
+queue.SetCompletedRetention(1000, 24*time.Hour)  // default; 0 for either keeps none
+queue.SetFailedRetention(10000, 7*24*time.Hour)  // default
+
+queue.QueueID()    // "redisq:fifo:{orders}", the same on every instance
+queue.QueueStats() // counts per Job State now, totals since the counters began
+queue.Jobs(contract.JobFailed, 0, 50) // newest first; pending in hand-out order
+```
+
+All four queue types implement `contract.QueueInspector` (`github.com/goptics/varmq/contract`), which varmq's
+`Handler` serves as `GET /queues` and `GET /queues/{id}/jobs`. The layout is varmq's
+[`spec/redis-storage.md`](https://github.com/goptics/varmq/blob/main/spec/redis-storage.md) 1.0.0. Retention is set
+per queue object, so give every instance of a queue the same values. Records hold a copy of each payload, so
+retention bounds Redis memory. `Purge` deletes all of a queue's jobs, records and counters.
+
 ### Batch dequeue
 
 Takes up to `len(items)` items (max 1000) in one round trip, sized by recent calls. Keep calling while
@@ -296,6 +320,7 @@ go-redis re-sends a command whose reply was lost, so:
 | `DequeueWithAckId`, `DequeueBatchWithAckIds` | At least once | Items come back on retry, the next call, or after a timeout        |
 | `Enqueue`                                    | At least once | May store the job twice; `false` is not proof                      |
 | `EnqueueOnce`                                | Once per id   | Stored once within the dedup window                                |
+| `Acknowledge`, `Reject`                      | Once          | The re-send finds the job finished and does nothing                |
 | `Dequeue`                                    | At most once  | Item is gone                                                       |
 | `Remove`                                     | –             | May remove a second identical item                                 |
 

@@ -4,10 +4,12 @@ import "github.com/redis/go-redis/v9"
 
 // zsetPushWake is zsetPush plus waking idle consumers, up to one per waiting
 // item, in a single round trip. ARGV[3] is the priority and ARGV[4] the wake
-// channel prefix (see Queue.enqueueWith for ARGV[1] and ARGV[2]).
+// channel prefix (see Queue.enqueueWith for ARGV[1] and ARGV[2]). KEYS[4]
+// is :stats, where the job counts as submitted.
 const zsetPushWakeBody = `local s = redis.call('INCR', KEYS[2])
 redis.call('ZADD', KEYS[1], ARGV[3], '\255' .. string.format('%016x', s) .. ARGV[1])
 if tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
+redis.call('HINCRBY', KEYS[4], 'submitted', 1)
 return wake(KEYS[3], ARGV[4], redis.call('ZCARD', KEYS[1]))`
 
 var (
@@ -33,7 +35,7 @@ func newDistributedPriorityQueue(client *redis.Client, queueKey string) *Distrib
 }
 
 func (q *DistributedPriorityQueue) Enqueue(item any, priority int) bool {
-	keys := []string{q.Notification.queueKey, q.Notification.queueKey + ":seq", q.idleKey}
+	keys := []string{q.Notification.queueKey, q.Notification.queueKey + ":seq", q.idleKey, q.getStatsKey()}
 	return q.enqueueWith(zsetPushWake, keys, item, priority, q.wakePrefix)
 }
 
@@ -43,7 +45,7 @@ func (q *DistributedPriorityQueue) EnqueueOnce(item any, priority int, id string
 	if id == "" || q.dedupWindow.Load() <= 0 {
 		return q.Enqueue(item, priority)
 	}
-	keys := []string{q.Notification.queueKey, q.Notification.queueKey + ":seq", q.idleKey}
+	keys := []string{q.Notification.queueKey, q.Notification.queueKey + ":seq", q.idleKey, q.getStatsKey()}
 	return q.enqueueOnceWith(zsetPushWakeOnce, keys, item, id, priority, q.wakePrefix)
 }
 

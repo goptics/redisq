@@ -5,9 +5,10 @@ import "github.com/redis/go-redis/v9"
 // listPushWake pushes an item and wakes idle consumers in a single round
 // trip, up to one per waiting item, so a backlog wakes them all (see
 // Queue.enqueueWith for ARGV[1] and ARGV[2]; ARGV[3] is the wake channel
-// prefix).
+// prefix), and counts the job as submitted in KEYS[3], :stats.
 const listPushWakeBody = `local n = redis.call('RPUSH', KEYS[1], ARGV[1])
 if tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
+redis.call('HINCRBY', KEYS[3], 'submitted', 1)
 return wake(KEYS[2], ARGV[3], n)`
 
 var (
@@ -33,7 +34,7 @@ func newDistributedQueue(client *redis.Client, queueKey string) *DistributedQueu
 }
 
 func (q *DistributedQueue) Enqueue(item any) bool {
-	keys := []string{q.Notification.queueKey, q.idleKey}
+	keys := []string{q.Notification.queueKey, q.idleKey, q.getStatsKey()}
 	return q.enqueueWith(listPushWake, keys, item, q.wakePrefix)
 }
 
@@ -43,7 +44,7 @@ func (q *DistributedQueue) EnqueueOnce(item any, id string) bool {
 	if id == "" || q.dedupWindow.Load() <= 0 {
 		return q.Enqueue(item)
 	}
-	keys := []string{q.Notification.queueKey, q.idleKey}
+	keys := []string{q.Notification.queueKey, q.idleKey, q.getStatsKey()}
 	return q.enqueueOnceWith(listPushWakeOnce, keys, item, id, q.wakePrefix)
 }
 

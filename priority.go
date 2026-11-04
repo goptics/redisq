@@ -18,10 +18,12 @@ type PriorityQueue struct {
 const seqPrefixLen = 17
 
 // zsetPushBody adds item ARGV[1] at score ARGV[3] under the next sequence
-// number, and sets the queue to expire in ARGV[2] ms when that is above 0.
+// number, sets the queue to expire in ARGV[2] ms when that is above 0, and
+// counts the job as submitted in KEYS[3], :stats (see listPushBody).
 const zsetPushBody = `local s = redis.call('INCR', KEYS[2])
 redis.call('ZADD', KEYS[1], ARGV[3], '\255' .. string.format('%016x', s) .. ARGV[1])
 if tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
+redis.call('HINCRBY', KEYS[3], 'submitted', 1)
 return s`
 
 var (
@@ -46,7 +48,7 @@ func itemOf(m string) []byte {
 }
 
 func (pq *PriorityQueue) pushKeys() []string {
-	return []string{pq.queueKey, pq.queueKey + ":seq"}
+	return []string{pq.queueKey, pq.queueKey + ":seq", pq.getStatsKey()}
 }
 
 func newPriorityQueue(client *redis.Client, queueKey string) *PriorityQueue {
@@ -136,18 +138,19 @@ func (pq *PriorityQueue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n
 }
 
 // zsetRequeue re-adds requeued items at the priority they were dequeued at
-// (KEYS[5]; 1 for items made pending without one) under a new sequence number.
-var zsetRequeue = redis.NewScript(requeueLoop + `local s = redis.call('INCR', KEYS[4])
-		local p = redis.call('HGET', KEYS[5], id) or 1
-		redis.call('HDEL', KEYS[5], id)
+// (KEYS[7]; 1 for items made pending without one) under a new sequence
+// number from KEYS[6] (see requeueKeys).
+var zsetRequeue = redis.NewScript(requeueLoop + `local s = redis.call('INCR', KEYS[6])
+		local p = redis.call('HGET', KEYS[7], id) or 1
+		redis.call('HDEL', KEYS[7], id)
 		redis.call('ZADD', KEYS[1], p, '\255' .. string.format('%016x', s) .. v)` + requeueEnd)
 
 // zsetRepush is zsetRequeue's push for the sweep and release scripts (see
-// moveFn): KEYS[4] is :seq and KEYS[5] :prio.
+// moveFn): KEYS[6] is :seq and KEYS[7] :prio (see requeueKeys).
 const zsetRepush = `local function repush(v, id)
-	local s = redis.call('INCR', KEYS[4])
-	redis.call('ZADD', KEYS[1], redis.call('HGET', KEYS[5], id) or 1, '\255' .. string.format('%016x', s) .. v)
-	redis.call('HDEL', KEYS[5], id)
+	local s = redis.call('INCR', KEYS[6])
+	redis.call('ZADD', KEYS[1], redis.call('HGET', KEYS[7], id) or 1, '\255' .. string.format('%016x', s) .. v)
+	redis.call('HDEL', KEYS[7], id)
 end
 `
 
@@ -156,6 +159,6 @@ var zsetTick, zsetRelease = heartbeatScripts(zsetRepush)
 // RequeueNackedItems returns un-acknowledged items whose visibility timeout
 // has passed (every pending item when it is 0) to the priority queue.
 func (pq *PriorityQueue) RequeueNackedItems() error {
-	_, err := pq.requeue(zsetRequeue, pq.queueKey+":seq", pq.getPriorityKey())
+	_, err := pq.requeue(zsetRequeue)
 	return err
 }
