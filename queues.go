@@ -17,7 +17,7 @@ type queues struct {
 type Option func(*queues) error
 
 // WithNamespace scopes every key and channel the queues use under ns, as
-// redisq:ns:fifo:{key} and redisq:ns:prio:{key} (see docs/adr/0002-redisq-key-prefix.md).
+// redisq:ns:fifo:{key} and redisq:ns:prio:{key}.
 // An empty ns is the same as none: redisq:fifo:{key}.
 func WithNamespace(ns string) Option {
 	return func(qs *queues) error {
