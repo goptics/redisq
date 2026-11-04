@@ -132,18 +132,18 @@ func (q *Queue) Jobs(state contract.JobState, offset, limit int) ([]contract.Job
 				continue // trimmed between the two reads
 			}
 			var rec struct {
-				ID         string            `json:"id"`
-				State      contract.JobState `json:"state"`
-				Item       json.RawMessage   `json:"item"`
-				StartedAt  int64             `json:"started_at"`
-				FinishedAt int64             `json:"finished_at"`
-				Attempts   int               `json:"attempts"`
-				LastError  string            `json:"last_error"`
+				ID         string              `json:"id"`
+				State      contract.JobState   `json:"state"`
+				Item       json.RawMessage     `json:"item"`
+				StartedAt  int64               `json:"started_at"`
+				FinishedAt int64               `json:"finished_at"`
+				Attempts   int                 `json:"attempts"`
+				Errors     []contract.JobError `json:"errors"`
 			}
 			if json.Unmarshal([]byte(s), &rec) != nil {
 				continue
 			}
-			j := contract.JobRecord{ID: rec.ID, State: rec.State, StartedAt: rec.StartedAt, FinishedAt: rec.FinishedAt, Attempts: rec.Attempts, LastError: rec.LastError}
+			j := contract.JobRecord{ID: rec.ID, State: rec.State, StartedAt: rec.StartedAt, FinishedAt: rec.FinishedAt, Attempts: rec.Attempts, Errors: rec.Errors}
 			j.Payload, j.EnqueuedAt = unwrap(rec.Item)
 			jobs = append(jobs, j)
 			continue

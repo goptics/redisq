@@ -111,7 +111,7 @@ func TestAcknowledgeAndRejectWriteRecords(t *testing.T) {
 		require.NoError(t, err)
 		assert.Contains(t, rec, `"item":`+envelope("order-1", big), "the item is recorded as stored")
 		assert.Contains(t, rec, `"state":"completed"`)
-		assert.NotContains(t, rec, "last_error")
+		assert.NotContains(t, rec, `"errors"`)
 
 		assert.Equal(t, contract.QueueStats{
 			Counts: contract.JobCounts{Completed: 1, Failed: 1},
@@ -139,7 +139,7 @@ func TestAcknowledgeAndRejectWriteRecords(t *testing.T) {
 		bad := jobs(t, in, contract.JobFailed, 0, 10)
 		require.Len(t, bad, 1)
 		assert.Equal(t, "order-2", bad[0].ID)
-		assert.Equal(t, `out of "stock"`, bad[0].LastError)
+		assert.Equal(t, []contract.JobError{{Attempt: 1, At: bad[0].FinishedAt, Error: `out of "stock"`}}, bad[0].Errors)
 		assert.Equal(t, `"x"`, string(bad[0].Payload))
 	})
 }

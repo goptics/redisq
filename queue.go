@@ -470,7 +470,9 @@ if keep > 0 and age > 0 then
 	local rec = '{"id":' .. cjson.encode(id) .. ',"state":"' .. ARGV[2] .. '","item":' .. item
 	if started then rec = rec .. ',"started_at":' .. string.format('%.0f', started) end
 	rec = rec .. ',"finished_at":' .. string.format('%.0f', now) .. ',"attempts":' .. string.format('%.0f', attempts)
-	if ARGV[2] == 'failed' then rec = rec .. ',"last_error":' .. cjson.encode(ARGV[3]) end
+	if ARGV[2] == 'failed' then
+		rec = rec .. ',"errors":[{"attempt":' .. string.format('%.0f', attempts) .. ',"at":' .. string.format('%.0f', now) .. ',"error":' .. cjson.encode(ARGV[3]) .. '}]'
+	end
 	redis.call('HSET', KEYS[6], id, rec .. '}')
 	redis.call('ZADD', KEYS[7], string.format('%.0f', now), id)
 	redis.call('ZREM', KEYS[8], id)

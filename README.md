@@ -171,7 +171,7 @@ an id drop each other's jobs.
 ### Job records and stats
 
 `Acknowledge` marks a job completed and `Reject` marks it failed for good (no requeue). Each, in one atomic
-script, counts the job, keeps its Job Record (item verbatim, start and finish times, attempts, `Reject`'s reason)
+script, counts the job, keeps its Job Record (item verbatim, start and finish times, attempts, and `Reject`'s reason as its `errors` entry)
 and trims old records. Every enqueue counts as submitted, except an `EnqueueOnce` repeat.
 
 ```go
