@@ -2,6 +2,7 @@ package redisq
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -24,20 +25,20 @@ func (q *Queue) QueueID() string {
 }
 
 // QueueStats returns the queue's counts and totals, read in one MULTI.
-func (q *Queue) QueueStats() (contract.QueueStats, error) {
+func (q *Queue) QueueStats(ctx context.Context) (contract.QueueStats, error) {
 	var pending *redis.IntCmd
 	var processing, completed, failed *redis.IntCmd
 	var totals *redis.SliceCmd
-	_, err := q.client.TxPipelined(q.ctx, func(p redis.Pipeliner) error {
+	_, err := q.client.TxPipelined(ctx, func(p redis.Pipeliner) error {
 		if q.isPriority {
-			pending = p.ZCard(q.ctx, q.queueKey)
+			pending = p.ZCard(ctx, q.queueKey)
 		} else {
-			pending = p.LLen(q.ctx, q.queueKey)
+			pending = p.LLen(ctx, q.queueKey)
 		}
-		processing = p.HLen(q.ctx, q.getNackedItemKey())
-		completed = p.ZCard(q.ctx, q.getCompletedKey())
-		failed = p.ZCard(q.ctx, q.getFailedKey())
-		totals = p.HMGet(q.ctx, q.getStatsKey(), "submitted", "completed", "failed")
+		processing = p.HLen(ctx, q.getNackedItemKey())
+		completed = p.ZCard(ctx, q.getCompletedKey())
+		failed = p.ZCard(ctx, q.getFailedKey())
+		totals = p.HMGet(ctx, q.getStatsKey(), "submitted", "completed", "failed")
 		return nil
 	})
 	if err != nil {
@@ -103,7 +104,7 @@ return out`)
 // Jobs returns up to limit jobs in state, skipping the first offset: pending
 // in hand-out order, processing by ack ID, completed and failed newest
 // first. A record that doesn't parse is left out.
-func (q *Queue) Jobs(state contract.JobState, offset, limit int) ([]contract.JobRecord, error) {
+func (q *Queue) Jobs(ctx context.Context, state contract.JobState, offset, limit int) ([]contract.JobRecord, error) {
 	switch state {
 	case contract.JobPending, contract.JobProcessing, contract.JobCompleted, contract.JobFailed:
 	default:
@@ -120,7 +121,7 @@ func (q *Queue) Jobs(state contract.JobState, offset, limit int) ([]contract.Job
 		prio = "1"
 	}
 	keys := []string{q.queueKey, q.getNackedItemKey(), q.getStartedKey(), q.getAttemptsKey(), q.getJobsKey(), q.getCompletedKey(), q.getFailedKey()}
-	rows, err := jobsScript.Run(q.ctx, q.client, keys, string(state), offset, offset+limit-1, prio).Slice()
+	rows, err := jobsScript.Run(ctx, q.client, keys, string(state), offset, offset+limit-1, prio).Slice()
 	if err != nil {
 		return nil, err
 	}

@@ -68,14 +68,14 @@ func envelope(id string, data string) string {
 
 func stats(t *testing.T, in contract.QueueInspector) contract.QueueStats {
 	t.Helper()
-	s, err := in.QueueStats()
+	s, err := in.QueueStats(t.Context())
 	require.NoError(t, err)
 	return s
 }
 
 func jobs(t *testing.T, in contract.QueueInspector, state contract.JobState, offset, limit int) []contract.JobRecord {
 	t.Helper()
-	j, err := in.Jobs(state, offset, limit)
+	j, err := in.Jobs(t.Context(), state, offset, limit)
 	require.NoError(t, err)
 	return j
 }
@@ -237,6 +237,14 @@ func TestReusedJobIDMovesState(t *testing.T) {
 		got := jobs(t, in, contract.JobFailed, 0, 10)
 		require.Len(t, got, 1)
 		assert.Equal(t, "2", string(got[0].Payload))
+
+		q.SetCompletedRetention(0, time.Hour)
+		require.True(t, push(envelope("same", "3"), ""))
+		a, _ = pop()
+		require.True(t, q.Acknowledge(a))
+		assert.Empty(t, jobs(t, in, contract.JobFailed, 0, 10), "the old state goes even when the new one keeps none")
+		assert.Empty(t, jobs(t, in, contract.JobCompleted, 0, 10))
+		assert.False(t, q.client.HExists(context.Background(), q.getJobsKey(), "same").Val())
 	})
 }
 
@@ -277,7 +285,7 @@ func TestJobsPaging(t *testing.T) {
 		assert.Equal(t, []string{"j3", "j2", "j1"}, ids(jobs(t, in, contract.JobCompleted, 0, 10)), "newest first")
 		assert.Equal(t, []string{"j2"}, ids(jobs(t, in, contract.JobCompleted, 1, 1)))
 
-		_, err := in.Jobs("done", 0, 1)
+		_, err := in.Jobs(t.Context(), "done", 0, 1)
 		assert.Error(t, err)
 		assert.Equal(t, q.queueKey, in.QueueID())
 	})

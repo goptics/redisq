@@ -464,6 +464,7 @@ end
 redis.call('HINCRBY', KEYS[5], ARGV[2], 1)
 local now = tonumber(nowms())
 local keep, age = tonumber(ARGV[4]), tonumber(ARGV[5])
+redis.call('ZREM', KEYS[8], id)
 if keep > 0 and age > 0 then
 	local ok, e = pcall(cjson.decode, item)
 	if not ok or (type(e) == 'number' and not string.match(item, '^%s*-?%d[%d.eE+-]*%s*$')) then item = cjson.encode(item) end
@@ -475,7 +476,8 @@ if keep > 0 and age > 0 then
 	end
 	redis.call('HSET', KEYS[6], id, rec .. '}')
 	redis.call('ZADD', KEYS[7], string.format('%.0f', now), id)
-	redis.call('ZREM', KEYS[8], id)
+else
+	redis.call('HDEL', KEYS[6], id)
 end
 trim(KEYS[7], KEYS[6], keep, age, now)
 return 1`)

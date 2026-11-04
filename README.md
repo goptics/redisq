@@ -181,8 +181,8 @@ queue.SetCompletedRetention(1000, 24*time.Hour)  // default; 0 for either keeps 
 queue.SetFailedRetention(10000, 7*24*time.Hour)  // default
 
 queue.QueueID()    // "redisq:fifo:{orders}", the same on every instance
-queue.QueueStats() // counts per Job State now, totals since the counters began
-queue.Jobs(contract.JobFailed, 0, 50) // newest first; pending in hand-out order
+queue.QueueStats(ctx) // counts per Job State now, totals since the counters began
+queue.Jobs(ctx, contract.JobFailed, 0, 50) // newest first; pending in hand-out order
 ```
 
 All four queue types implement `contract.QueueInspector` (`github.com/goptics/varmq/contract`), which varmq's
