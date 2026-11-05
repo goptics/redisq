@@ -166,7 +166,8 @@ func unwrap(item []byte) (json.RawMessage, int64) {
 		Data       json.RawMessage `json:"data"`
 		EnqueuedAt json.RawMessage `json:"enqueued_at"`
 	}
-	if bytes.HasPrefix(bytes.TrimSpace(item), []byte("{")) && json.Unmarshal(item, &env) == nil {
+	// Data is nil only when the key is absent: a JSON null still sets it to "null".
+	if bytes.HasPrefix(bytes.TrimSpace(item), []byte("{")) && json.Unmarshal(item, &env) == nil && env.Data != nil {
 		var at int64
 		_ = json.Unmarshal(env.EnqueuedAt, &at)
 		return env.Data, at
