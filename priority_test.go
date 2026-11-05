@@ -134,14 +134,14 @@ func setupTestPriorityQueue(t *testing.T) (*PriorityQueue, func()) {
 		return nil, func() {}
 	}
 
-	require.NoError(t, pq.client.Del(ctx, testQueueKey).Err(), "Failed to clear test queue")
+	require.NoError(t, pq.client.Del(ctx, pq.queueKey).Err(), "Failed to clear test queue")
 	require.NoError(t, pq.client.Del(ctx, pq.getNackedItemKey()).Err(), "Failed to clear nacked queue")
 	require.NoError(t, pq.client.Del(ctx, pq.getTimeoutKey()).Err(), "Failed to clear timeout key")
 	require.NoError(t, pq.client.Del(ctx, pq.getPriorityKey()).Err(), "Failed to clear priority key")
 
 	cleanup := func() {
 		pq.Close() // first: it requeues what the test left pending
-		pq.client.Del(ctx, testQueueKey)
+		pq.client.Del(ctx, pq.queueKey)
 		pq.client.Del(ctx, pq.getNackedItemKey())
 		pq.client.Del(ctx, pq.getTimeoutKey())
 		pq.client.Del(ctx, pq.getPriorityKey())

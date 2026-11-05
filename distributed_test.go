@@ -20,11 +20,11 @@ func setupTestDistributedQueue(t *testing.T) (*DistributedQueue, func()) {
 
 	// Clear the queue before test
 	ctx := context.Background()
-	require.NoError(t, q.Queue.client.Del(ctx, testQueueKey).Err(), "Failed to clear test queue")
+	require.NoError(t, q.Queue.client.Del(ctx, q.Queue.queueKey).Err(), "Failed to clear test queue")
 
 	cleanup := func() {
 		q.Close() // first: it requeues what the test left pending
-		q.Queue.client.Del(ctx, testQueueKey)
+		q.Queue.client.Del(ctx, q.Queue.queueKey)
 		qs.Close()
 	}
 
@@ -251,9 +251,10 @@ func TestEnqueueOntoBacklogWakesAllIdle(t *testing.T) {
 	}
 	producer := qs.NewDistributedQueue(key)
 	defer producer.Close()
-	defer producer.Queue.client.Del(ctx, key, key+":idle")
+	full := producer.Queue.queueKey
+	defer producer.Queue.client.Del(ctx, full, full+":idle")
 
-	require.NoError(t, producer.Queue.client.RPush(ctx, key, "a", "b", "c", "d").Err()) // no wake
+	require.NoError(t, producer.Queue.client.RPush(ctx, full, "a", "b", "c", "d").Err()) // no wake
 	require.True(t, producer.Enqueue("e"))
 
 	for i, got := range consumers {
@@ -372,7 +373,7 @@ func TestBusyConsumerStaysOutOfIdleSet(t *testing.T) {
 			free := wakes(c2)
 
 			time.Sleep(1500 * time.Millisecond) // c1's nudge runs on the empty queue
-			idle, err := q1.client.SMembers(ctx, key+":idle").Result()
+			idle, err := q1.client.SMembers(ctx, q1.queueKey+":idle").Result()
 			require.NoError(t, err)
 			assert.Equal(t, []string{q2.ackPrefix}, idle, "only the free consumer is idle")
 
@@ -440,7 +441,7 @@ func TestCloseRequeuesUnacked(t *testing.T) {
 			assert.Zero(t, c1.Len()) // idle: a Close that didn't leave first could wake itself
 
 			// Another idle consumer, without the nudge loop that wakes it anyway.
-			watcher := q2.client.Subscribe(ctx, key+":wake:watcher")
+			watcher := q2.client.Subscribe(ctx, q2.queueKey+":wake:watcher")
 			defer watcher.Close()
 			_, err := watcher.Receive(ctx)
 			require.NoError(t, err)
@@ -455,9 +456,9 @@ func TestCloseRequeuesUnacked(t *testing.T) {
 			assert.ErrorIs(t, q2.client.ZScore(ctx, q2.getHeartbeatKey(), q1.ackPrefix).Err(), redis.Nil, "heartbeat dropped")
 
 			if c.name == "priority" {
-				assert.Equal(t, "zset", q2.client.Type(ctx, key).Val())
+				assert.Equal(t, "zset", q2.client.Type(ctx, q2.queueKey).Val())
 				assert.Zero(t, q2.client.HLen(ctx, q2.getPriorityKey()).Val())
-				members := q2.client.ZRangeWithScores(ctx, key, 0, -1).Val()
+				members := q2.client.ZRangeWithScores(ctx, q2.queueKey, 0, -1).Val()
 				require.Len(t, members, 1)
 				assert.EqualValues(t, 3, members[0].Score, "priority kept")
 			}
@@ -652,7 +653,7 @@ func TestPresenceGrace(t *testing.T) {
 			}
 			delKeys(t, c2.client, key)
 			defer delKeys(t, c2.client, key)
-			ch := key + ":wake:" + c1.ackPrefix
+			ch := c1.queueKey + ":wake:" + c1.ackPrefix
 			subs := func() int64 { return c2.client.PubSubNumSub(ctx, ch).Val()[ch] }
 
 			require.True(t, c1.Enqueue("job"))
@@ -682,7 +683,7 @@ func TestPresenceGrace(t *testing.T) {
 				time.Sleep(50 * time.Millisecond)
 			}
 			assert.Less(t, presenceGrace-time.Second, time.Since(went), "the grace counted again from the last drop")
-			assert.EqualValues(t, 1, c2.client.LLen(ctx, key).Val())
+			assert.EqualValues(t, 1, c2.client.LLen(ctx, c2.queueKey).Val())
 		})
 	}
 }

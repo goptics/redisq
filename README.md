@@ -99,6 +99,23 @@ pq.Enqueue("high", 1)
 data, ok := pq.Dequeue() // "high"
 ```
 
+### Keys and namespaces
+
+Every key and channel starts with `redisq:`, so `SCAN redisq:*` finds all of redisq's data. A namespace goes after it:
+
+```go
+qs := redisq.New(url)
+qs.NewQueue("orders")         // redisq:fifo:{orders}, redisq:fifo:{orders}:idle, ...
+qs.NewPriorityQueue("orders") // redisq:prio:{orders}, ... (a separate queue)
+
+qs = redisq.New(url, redisq.WithNamespace("app"))
+qs.NewQueue("orders")         // redisq:app:fifo:{orders}, ...
+```
+
+A queue and its keys share one Redis Cluster hash slot. `{` and `}` are reserved: `New` panics on a namespace containing them, and a constructor on an empty queue key or one containing them.
+
+> **Upgrading from 1.5.x or earlier:** those versions used the queue key as given (`orders`, `orders:idle`, ...). This version does not read those keys, so drain old queues (or move their items) before switching.
+
 ### Distributed queue
 
 ```go

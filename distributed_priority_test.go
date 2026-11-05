@@ -18,11 +18,11 @@ func setupTestDistributedPriorityQueue(t *testing.T) (*DistributedPriorityQueue,
 
 	// Clear the queue before test
 	ctx := context.Background()
-	require.NoError(t, q.Queue.client.Del(ctx, testQueueKey).Err(), "Failed to clear test queue")
+	require.NoError(t, q.Queue.client.Del(ctx, q.Queue.queueKey).Err(), "Failed to clear test queue")
 
 	cleanup := func() {
 		q.Close() // first: it requeues what the test left pending
-		q.Queue.client.Del(ctx, testQueueKey)
+		q.Queue.client.Del(ctx, q.Queue.queueKey)
 		qs.Close()
 	}
 

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** every key and channel is now `redisq:[ns:]fifo:{key}` or `redisq:[ns:]prio:{key}` plus its suffix, so a FIFO and a priority queue of one name no longer collide and a queue's keys share a Redis Cluster slot. Keys written by 1.5.x and earlier are not read: drain those queues before upgrading
+- Queue keys must be non-empty and free of `{` and `}`; a constructor panics otherwise
+
+### Added
+
+- `New` takes options; `WithNamespace(ns)` scopes keys under `redisq:ns:`
+
 ## [1.5.1] - 2026-10-31
 
 ### Added
