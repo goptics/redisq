@@ -315,3 +315,60 @@ func TestPurgeDeletesJobData(t *testing.T) {
 		assert.Equal(t, contract.QueueStats{}, stats(t, in))
 	})
 }
+
+// unwrap keeps a varmq envelope's data and enqueue time, any other JSON item
+// as is, and anything else as a JSON string.
+func TestUnwrap(t *testing.T) {
+	for _, c := range []struct {
+		item, payload string
+		at            int64
+	}{
+		{envelope("a", `{"n":1}`), `{"n":1}`, 1762228800000},
+		{`[1,2]`, `[1,2]`, 0},
+		{`{"a":1}`, `{"a":1}`, 0},
+		{`{"data":null}`, `null`, 0},
+		{`plain bytes`, `"plain bytes"`, 0},
+	} {
+		p, at := unwrap([]byte(c.item))
+		assert.Equal(t, c.payload, string(p), c.item)
+		assert.Equal(t, c.at, at, c.item)
+	}
+}
+
+// Jobs leaves out a completed or failed entry whose record is gone (a trim
+// between the two reads) or doesn't parse.
+func TestJobsSkipsMissingAndBadRecords(t *testing.T) {
+	eachJobsCase(t, func(t *testing.T, q *Queue, in contract.QueueInspector, push func(string, string) bool, pop func() (string, bool)) {
+		ctx := context.Background()
+		require.True(t, push(envelope("ok", "1"), "ok"))
+		a, _ := pop()
+		require.True(t, q.Acknowledge(a))
+		require.NoError(t, q.client.ZAdd(ctx, q.getCompletedKey(), redis.Z{Score: 1, Member: "gone"}, redis.Z{Score: 2, Member: "bad"}).Err())
+		require.NoError(t, q.client.HSet(ctx, q.getJobsKey(), "bad", "not json").Err())
+
+		assert.Equal(t, []string{"ok"}, ids(jobs(t, in, contract.JobCompleted, 0, 10)))
+	})
+}
+
+// Once the client is closed, reads return its error and Acknowledge and
+// Reject return false.
+func TestInspectorClosedClient(t *testing.T) {
+	const key = "test_jobs_closed_client"
+	qs := New(getTestRedisURL())
+	q := qs.NewQueue(key)
+	defer q.Close()
+	delKeys(t, q.client, key)
+	require.True(t, q.Enqueue("x"))
+	_, ok, a := q.DequeueWithAckId()
+	require.True(t, ok)
+	delKeys(t, q.client, key)
+	require.NoError(t, qs.Close())
+
+	_, err := q.QueueStats(t.Context())
+	assert.Error(t, err)
+	_, err = q.Jobs(t.Context(), contract.JobPending, 0, 10)
+	assert.Error(t, err)
+	assert.False(t, q.Acknowledge(a))
+	assert.False(t, q.Reject(a, "x"))
+	q.trim() // logs the error, does not panic
+}
