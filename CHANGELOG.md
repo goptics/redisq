@@ -15,11 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `New` takes options; `WithNamespace(ns)` scopes keys under `redisq:ns:`
-- Job records and stats, as varmq's `spec/redis-storage.md` 1.0.0: `Acknowledge` (now one script) and the new `Reject(ackID, reason)` count the job in `:stats`, keep its Job Record in `:jobs` and `:completed`/`:failed`, and trim by count and age, in one atomic step; every enqueue counts as submitted, except an `EnqueueOnce` repeat
-- `SetCompletedRetention` and `SetFailedRetention`: by default the last 1,000 completed jobs for 24h and the last 10,000 failed jobs for 7 days; 0 keeps none. The sweep also trims once a minute
-- All four queue types implement `contract.QueueInspector` (`QueueID`, `QueueStats`, `Jobs`) from `github.com/goptics/varmq/contract`
-- New keys `<key>:started`, `<key>:attempts`, `<key>:jobs`, `<key>:completed`, `<key>:failed`, `<key>:stats`; pops record start times and requeues count attempts
-- `Purge` deletes all of a queue's jobs and job data: waiting and processing items, deadlines, start times, attempts, records, counters, and a priority queue's sequence and priorities. Consumer state and `EnqueueOnce` ids stay
+- Job records and stats, as varmq's `spec/redis-storage.md` 1.0.0: `Acknowledge` (now one script) and the new `Reject(ackID, reason)` count the job in `:stats`, keep its Job Record in `:jobs` and `:completed`/`:failed`, and trim by count and age, in one atomic step; every enqueue counts as submitted, except an `EnqueueOnce` repeat (#29)
+- `SetCompletedRetention` and `SetFailedRetention`: by default the last 1,000 completed jobs for 24h and the last 10,000 failed jobs for 7 days; 0 keeps none. The sweep also trims once a minute (#29)
+- All four queue types implement `contract.QueueInspector` (`QueueID`, `QueueStats`, `Jobs`) from `github.com/goptics/varmq/contract` (#29)
+- New keys `<key>:started`, `<key>:attempts`, `<key>:jobs`, `<key>:completed`, `<key>:failed`, `<key>:stats`; pops record start times and requeues count attempts (#29)
+- `Purge` deletes all of a queue's jobs and job data: waiting and processing items, deadlines, start times, attempts, records, counters, and a priority queue's sequence and priorities. Consumer state and `EnqueueOnce` ids stay (#29)
 
 ## [1.5.1] - 2026-10-31
 
