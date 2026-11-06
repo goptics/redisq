@@ -119,7 +119,7 @@ A queue and its keys share one Redis Cluster hash slot. `{` and `}` are reserved
 
 ### Instance reports
 
-With varmq, a process can report itself (worker names, status, concurrency, bound queues) to Redis, so a dashboard such as vartop lists live processes without calling them:
+With varmq, a process can report itself (worker names, status, concurrency, processed counts, bound queues) to Redis, so a dashboard such as vartop lists live processes without calling them. A worker's start, stop, pause, resume or concurrency change is reported at once (varmq with `contract/v0.3.0`); load and counts follow the interval:
 
 ```go
 varmq.InstanceID = "orders-api-1" // optional; default hostname. Read once, so set it first
