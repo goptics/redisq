@@ -117,6 +117,18 @@ A queue and its keys share one Redis Cluster hash slot. `{` and `}` are reserved
 
 > **Upgrading from 1.5.x or earlier:** those versions used the queue key as given (`orders`, `orders:idle`, ...). This version does not read those keys, so drain old queues (or move their items) before switching.
 
+### Instance reports
+
+With varmq, a process can report itself (worker names, status, concurrency, processed counts, bound queues) to Redis, so a dashboard such as vartop lists live processes without calling them. A worker's start, stop, pause, resume or concurrency change is reported at once (varmq with `contract/v0.3.0`); load and counts follow the interval:
+
+```go
+varmq.InstanceID = "orders-api-1" // optional; default hostname. Read once, so set it first
+qs := redisq.New(url, redisq.WithNamespace("app"), redisq.WithInstanceReports(5*time.Second))
+defer qs.Close() // stops the reports and removes this process's record
+```
+
+Each report overwrites one field of `redisq:app:{instances}` and its time in `redisq:app:{instances}:beats`, from the Redis clock. A process that stops without `Close` shows as lost after 3 intervals; its record is pruned after 5 minutes, and both keys expire when no process reports. The interval must be from 1s to 60s. Off by default.
+
 ### Distributed queue
 
 ```go

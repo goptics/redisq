@@ -1,8 +1,11 @@
 package redisq
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -371,5 +374,9 @@ func TestInspectorClosedClient(t *testing.T) {
 	assert.Error(t, err)
 	assert.False(t, q.Acknowledge(a))
 	assert.False(t, q.Reject(a, "x"))
-	q.trim() // logs the error, does not panic
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	defer log.SetOutput(os.Stderr)
+	q.trim()
+	assert.Contains(t, logged.String(), "Error trimming job records")
 }

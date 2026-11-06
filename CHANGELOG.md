@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SetCompletedRetention` and `SetFailedRetention`: by default the last 1,000 completed jobs for 24h and the last 10,000 failed jobs for 7 days; 0 keeps none. The sweep also trims once a minute (#29)
 - All four queue types implement `contract.QueueInspector` (`QueueID`, `QueueStats`, `Jobs`) from `github.com/goptics/varmq/contract` (#29)
 - New keys `<key>:started`, `<key>:attempts`, `<key>:jobs`, `<key>:completed`, `<key>:failed`, `<key>:stats`; pops record start times and requeues count attempts (#29)
+- `WithInstanceReports(interval)`: `New` reports this process (from varmq: worker names, status, concurrency, bound Queue IDs) to `redisq:[ns:]{instances}` / `:beats` every 1-60s, as varmq's `spec/redis-storage.md` 1.1.0 section 8; `Close` removes the record. The value `New` returns also implements `contract.InstanceRegistry` (type-assert; `Queues` itself is unchanged) (`ReportInstance`, `RemoveInstance`, `Instances`); `Instances` writes nothing (an ACL user needs `+time +zrange +hgetall +multi +exec`). Needs `github.com/goptics/varmq/contract` v0.2.0
 - `Purge` deletes all of a queue's jobs and job data: waiting and processing items, deadlines, start times, attempts, records, counters, and a priority queue's sequence and priorities. Consumer state and `EnqueueOnce` ids stay (#29)
 
 ## [1.5.1] - 2026-10-31

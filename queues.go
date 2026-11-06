@@ -11,6 +11,10 @@ import (
 type queues struct {
 	client    *redis.Client
 	namespace string
+
+	reportEvery time.Duration // WithInstanceReports; 0 = off
+	stopReports func()
+	reportsDone chan struct{}
 }
 
 // Option configures New. An invalid option makes New panic, as a bad URL does.
@@ -63,6 +67,9 @@ func New(url string, options ...Option) Queues {
 	opts.DialerRetries = 1 // one dial attempt; a URL can't set this
 
 	qs.client = redis.NewClient(opts)
+	if qs.reportEvery > 0 {
+		qs.startReports()
+	}
 	return qs
 }
 
@@ -76,11 +83,15 @@ func (qs *queues) key(kind, queueKey string) string {
 	if queueKey == "" || strings.ContainsAny(queueKey, "{}") { // {} would hash the whole name
 		panic(fmt.Sprintf("redisq: queue key %q must be non-empty and free of '{' and '}'", queueKey))
 	}
-	ns := prefix
-	if qs.namespace != "" {
-		ns += qs.namespace + ":"
+	return qs.prefix() + kind + ":{" + queueKey + "}"
+}
+
+// prefix is redisq: plus the namespace and a colon, if any.
+func (qs *queues) prefix() string {
+	if qs.namespace == "" {
+		return prefix
 	}
-	return ns + kind + ":{" + queueKey + "}"
+	return prefix + qs.namespace + ":"
 }
 
 func (qs *queues) NewQueue(queueKey string) *Queue {
@@ -103,6 +114,12 @@ func (qs *queues) NewDistributedPriorityQueue(queueKey string) *DistributedPrior
 	return newDistributedPriorityQueue(qs.client, qs.key("prio", queueKey))
 }
 
+// Close stops instance reports, removing this process's record, then
+// closes the client.
 func (qs *queues) Close() error {
+	if qs.stopReports != nil {
+		qs.stopReports()
+		<-qs.reportsDone
+	}
 	return qs.client.Close()
 }
