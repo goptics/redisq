@@ -163,11 +163,13 @@ func (q *Queue) Jobs(ctx context.Context, state contract.JobState, offset, limit
 // the item as a JSON string. The bytes are kept as stored, never re-encoded.
 func unwrap(item []byte) (json.RawMessage, int64) {
 	var env struct {
+		Status     json.RawMessage `json:"status"`
 		Data       json.RawMessage `json:"data"`
 		EnqueuedAt json.RawMessage `json:"enqueued_at"`
 	}
-	// Data is nil only when the key is absent: a JSON null still sets it to "null".
-	if bytes.HasPrefix(bytes.TrimSpace(item), []byte("{")) && json.Unmarshal(item, &env) == nil && env.Data != nil {
+	// An envelope has status and data (spec section 3). A field is nil only
+	// when its key is absent: a JSON null still sets it to "null".
+	if bytes.HasPrefix(bytes.TrimSpace(item), []byte("{")) && json.Unmarshal(item, &env) == nil && env.Status != nil && env.Data != nil {
 		var at int64
 		_ = json.Unmarshal(env.EnqueuedAt, &at)
 		return env.Data, at

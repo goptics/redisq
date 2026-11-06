@@ -326,7 +326,8 @@ func TestUnwrap(t *testing.T) {
 		{envelope("a", `{"n":1}`), `{"n":1}`, 1762228800000},
 		{`[1,2]`, `[1,2]`, 0},
 		{`{"a":1}`, `{"a":1}`, 0},
-		{`{"data":null}`, `null`, 0},
+		{`{"status":"Created","data":null}`, `null`, 0},
+		{`{"data":[1,2],"meta":"x"}`, `{"data":[1,2],"meta":"x"}`, 0}, // no status: not an envelope
 		{`plain bytes`, `"plain bytes"`, 0},
 	} {
 		p, at := unwrap([]byte(c.item))
