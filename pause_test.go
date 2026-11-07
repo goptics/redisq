@@ -3,6 +3,7 @@ package redisq
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -312,4 +313,13 @@ func TestPauseRefusalsCounted(t *testing.T) {
 	require.NoError(t, err)
 	assert.Zero(t, n)
 	assert.EqualValues(t, 3, q.PauseRefusals())
+}
+
+// Close stops the pause loop a Pause started.
+func TestPauseLoopStopsOnClose(t *testing.T) {
+	q := pauseClient(t).NewQueue(newID())
+	require.NoError(t, q.Pause()) // starts the loop
+	n := runtime.NumGoroutine()
+	require.NoError(t, q.Close())
+	require.Eventually(t, func() bool { return runtime.NumGoroutine() < n }, time.Second, time.Millisecond)
 }
