@@ -52,6 +52,8 @@ type pauseHooks struct {
 	// reply, which may arrive after one of them, sets the flag only if gen
 	// did not move since its call went out (observe).
 	gen atomic.Uint64
+	// refusals counts pops refused for a pause (PauseRefusals).
+	refusals atomic.Uint64
 }
 
 // Pause stops every consumer of the queue, in every process, taking items
@@ -77,6 +79,21 @@ func (q *Queue) Resume() error {
 	q.pauseHooks.gen.Add(1)
 	q.setPaused(false)
 	return nil
+}
+
+// PauseRefusals counts this object's pops that Redis refused for a pause
+// (varmq's optional QueuePauser method): a pop that came back empty while
+// it did not move was not refused, so varmq can tell a refusal racing a
+// Resume from a failed pop.
+func (q *Queue) PauseRefusals() uint64 {
+	return q.pauseHooks.refusals.Load()
+}
+
+// refused records a pop refused for a pause, read from a call that went
+// out at gen g.
+func (q *Queue) refused(g uint64) {
+	q.pauseHooks.refusals.Add(1)
+	q.observe(g, true)
 }
 
 // Paused reports whether the queue is paused, as this object last saw it.

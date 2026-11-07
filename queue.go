@@ -212,7 +212,7 @@ func (q *Queue) rawPop(pop *redis.Script) (string, bool) {
 
 	v, ok := reply.(string)
 	if !ok { // paused
-		q.observe(g, true)
+		q.refused(g)
 		return "", false
 	}
 
@@ -771,7 +771,7 @@ func (q *Queue) dequeueOne(pop *redis.Script, consumer string, extraKeys ...stri
 
 	v, ok := reply.(string)
 	if !ok { // 0: paused (pausedOne); the guard found nothing held, so r is free
-		q.observe(g, true)
+		q.refused(g)
 		return nil, false, ""
 	}
 
@@ -891,7 +891,7 @@ func (q *Queue) dequeueBatch(pop, popOne *redis.Script, items []any, ackIDs []st
 	}
 
 	if len(reply) > 2 { // {0, {}, 1}: paused (pausedBatch); popLen stays for the Resume
-		q.observe(g, true)
+		q.refused(g)
 		return 0, 0, nil
 	}
 

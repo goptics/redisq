@@ -297,3 +297,19 @@ func TestPauseCancelAndErrors(t *testing.T) {
 	_, ok := q.Dequeue()
 	assert.False(t, ok)
 }
+
+// Each pop Redis refuses for a pause is counted, for varmq to tell it from
+// a failed pop.
+func TestPauseRefusalsCounted(t *testing.T) {
+	q := pauseClient(t).NewQueue(newID())
+	require.True(t, q.Enqueue("x"))
+	require.NoError(t, q.Pause())
+	_, ok := q.Dequeue()
+	assert.False(t, ok)
+	_, ok, _ = q.DequeueWithAckId()
+	assert.False(t, ok)
+	n, _, err := q.DequeueBatchWithAckIds(make([]any, 2), make([]string, 2))
+	require.NoError(t, err)
+	assert.Zero(t, n)
+	assert.EqualValues(t, 3, q.PauseRefusals())
+}
