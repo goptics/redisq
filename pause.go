@@ -47,6 +47,10 @@ type pauseHooks struct {
 	hooks   map[*func(bool)]struct{}
 	kick    chan struct{} // buffer 1: a kick while one waits is the same kick
 	recheck atomic.Bool   // a "paused:" message came: read the key
+	// gen moves on at each Pause, Resume and control message. A pop or sweep
+	// reply, which may arrive after one of them, sets the flag only if gen
+	// did not move since its call went out (observe).
+	gen atomic.Uint64
 }
 
 // Pause stops every consumer of the queue, in every process, taking items
@@ -57,6 +61,7 @@ func (q *Queue) Pause() error {
 	if err := pauseScript.Run(q.ctx, q.client, []string{q.getPausedKey(), q.getControlKey()}).Err(); err != nil {
 		return err
 	}
+	q.pauseHooks.gen.Add(1)
 	q.setPaused(true)
 	return nil
 }
@@ -68,6 +73,7 @@ func (q *Queue) Resume() error {
 	if err := resumeScript.Run(q.ctx, q.client, keys, q.queueKey+":wake:", q.lenCmd()).Err(); err != nil {
 		return err
 	}
+	q.pauseHooks.gen.Add(1)
 	q.setPaused(false)
 	return nil
 }
@@ -95,6 +101,17 @@ func (q *Queue) OnPauseChange(fn func(paused bool)) (cancel func()) {
 		q.pauseHooks.mu.Lock()
 		delete(q.pauseHooks.hooks, h)
 		q.pauseHooks.mu.Unlock()
+	}
+}
+
+// observe applies p, read from Redis by a call that went out at gen g,
+// unless a Pause, Resume or control message came since: then p may be older
+// than what they set.
+// ponytail: a change landing between the check and the set still loses; the
+// next pop or sweep (<= 1 s) corrects it.
+func (q *Queue) observe(g uint64, p bool) {
+	if q.pauseHooks.gen.Load() == g {
+		q.setPaused(p)
 	}
 }
 
@@ -126,7 +143,8 @@ func (q *Queue) pauseLoop() {
 		}
 
 		if q.pauseHooks.recheck.Swap(false) {
-			if n, err := q.client.Exists(q.ctx, q.getPausedKey()).Result(); err == nil {
+			g := q.pauseHooks.gen.Load()
+			if n, err := q.client.Exists(q.ctx, q.getPausedKey()).Result(); err == nil && q.pauseHooks.gen.Load() == g {
 				q.paused.Store(n == 1)
 			}
 		}
@@ -162,8 +180,10 @@ func (q *Queue) control(msg *redis.Message) bool {
 
 	switch {
 	case msg.Payload == "resumed":
+		q.pauseHooks.gen.Add(1)
 		q.setPaused(false)
 	case strings.HasPrefix(msg.Payload, "paused:"):
+		q.pauseHooks.gen.Add(1)
 		q.pauseHooks.recheck.Store(true)
 		q.kickPause()
 	}

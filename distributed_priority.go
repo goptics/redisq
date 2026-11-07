@@ -60,7 +60,7 @@ func (q *DistributedPriorityQueue) Dequeue() (any, bool) {
 
 	if ok {
 		q.idle.Store(false)
-	} else {
+	} else if !q.Paused() { // a paused miss stays out of :idle (spec 6.2)
 		q.markIdle()
 	}
 
@@ -71,7 +71,7 @@ func (q *DistributedPriorityQueue) Dequeue() (any, bool) {
 // the idle set in the same step.
 func (q *DistributedPriorityQueue) DequeueWithAckId() (any, bool, string) {
 	item, ok, ackID := q.dequeueOne(zsetAckPopOne, q.consumerID(), q.getPriorityKey())
-	q.idle.Store(!ok)
+	q.idle.Store(!ok && !q.Paused()) // a paused miss stays out of :idle (spec 6.2)
 	return item, ok, ackID
 }
 
@@ -81,7 +81,7 @@ func (q *DistributedPriorityQueue) DequeueWithAckId() (any, bool, string) {
 func (q *DistributedPriorityQueue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n, remaining int, err error) {
 	n, remaining, err = q.dequeueBatch(zsetAckPop, zsetAckPopOneLen, items, ackIDs, q.consumerID(), q.getPriorityKey())
 	if err == nil {
-		q.idle.Store(remaining == 0 && n < min(len(items), len(ackIDs))) // as the pop's idle rule
+		q.idle.Store(remaining == 0 && n < min(len(items), len(ackIDs)) && !q.Paused()) // as the pop's idle rule
 	}
 	return n, remaining, err
 }

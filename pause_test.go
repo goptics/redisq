@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/goptics/varmq/contract"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -228,4 +229,52 @@ func TestPauseForgedMessageIgnored(t *testing.T) {
 		require.NoError(t, q.client.Publish(q.ctx, q.getControlKey(), "paused:1").Err())
 	}
 	assert.Never(t, q.Paused, 300*time.Millisecond, time.Millisecond)
+}
+
+// holdTick holds the reply of the next sweep script call until release.
+type holdTick struct {
+	hash    string
+	armed   atomic.Bool
+	ran     chan struct{}
+	release chan struct{}
+}
+
+func (h *holdTick) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h *holdTick) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+func (h *holdTick) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		err := next(ctx, cmd)
+		if a := cmd.Args(); len(a) > 1 && a[0] == "evalsha" && a[1] == h.hash && h.armed.CompareAndSwap(true, false) {
+			h.ran <- struct{}{}
+			<-h.release
+		}
+		return err
+	}
+}
+
+// A sweep reply read before a Pause or Resume does not undo it.
+func TestPauseStaleSweepIgnored(t *testing.T) {
+	for _, pause := range []bool{true, false} {
+		q := pauseClient(t).NewQueue(newID())
+		if !pause {
+			require.NoError(t, q.Pause())
+		}
+		h := &holdTick{hash: q.tickScript.Hash(), ran: make(chan struct{}), release: make(chan struct{})}
+		q.client.AddHook(h)
+		h.armed.Store(true)
+		done := make(chan struct{})
+		go func() { q.tick(); close(done) }()
+		<-h.ran // the sweep read the flag; its reply waits
+
+		if pause {
+			require.NoError(t, q.Pause())
+		} else {
+			require.NoError(t, q.Resume())
+		}
+		close(h.release)
+		<-done
+		assert.Equal(t, pause, q.Paused(), "pause=%v", pause)
+	}
 }

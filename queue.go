@@ -192,6 +192,7 @@ return redis.call('ZPOPMIN', KEYS[1])[1] or false`)
 
 // rawPop runs pop and returns its item as stored.
 func (q *Queue) rawPop(pop *redis.Script) (any, bool) {
+	g := q.pauseHooks.gen.Load()
 	reply, err := pop.Run(q.ctx, q.client, []string{q.queueKey, q.getPausedKey()}).Result()
 	if err == redis.Nil {
 		return nil, false
@@ -204,7 +205,7 @@ func (q *Queue) rawPop(pop *redis.Script) (any, bool) {
 
 	v, ok := reply.(string)
 	if !ok { // paused
-		q.setPaused(true)
+		q.observe(g, true)
 		return nil, false
 	}
 
@@ -749,6 +750,7 @@ func (q *Queue) dequeueOne(pop *redis.Script, consumer string, extraKeys ...stri
 
 	r := q.reserve(1, 1)
 	ackID := q.ackIDOf(fmt.Sprintf("%020d", r.start), 1)
+	g := q.pauseHooks.gen.Load()
 	reply, err := pop.Run(q.ctx, q.client, q.popKeys(extraKeys...), q.vt(), ackID, consumer, q.hbt(), q.ackPrefix).Result()
 	if err == redis.Nil {
 		return nil, false, ""
@@ -762,7 +764,7 @@ func (q *Queue) dequeueOne(pop *redis.Script, consumer string, extraKeys ...stri
 
 	v, ok := reply.(string)
 	if !ok { // 0: paused (pausedOne); the guard found nothing held, so r is free
-		q.setPaused(true)
+		q.observe(g, true)
 		return nil, false, ""
 	}
 
@@ -868,6 +870,7 @@ func (q *Queue) dequeueBatch(pop, popOne *redis.Script, items []any, ackIDs []st
 	r := q.reserve(limit, min(limit, max(1, int(q.popLen.Load()))))
 	resv := fmt.Sprintf("%020d", r.start)
 	keys := q.popKeys(extraKeys...)
+	g := q.pauseHooks.gen.Load()
 	var reply []any
 	var err error
 	if r.want == 1 {
@@ -881,7 +884,7 @@ func (q *Queue) dequeueBatch(pop, popOne *redis.Script, items []any, ackIDs []st
 	}
 
 	if len(reply) > 2 { // {0, {}, 1}: paused (pausedBatch); popLen stays for the Resume
-		q.setPaused(true)
+		q.observe(g, true)
 		return 0, 0, nil
 	}
 
@@ -1130,6 +1133,7 @@ func (q *Queue) sweep() {
 func (q *Queue) tick() bool {
 	keys := append(q.requeueKeys(), q.getHeartbeatKey(), q.getHeartbeatKey()+":clock", q.getPresenceKey(), q.getPausedKey())
 	wakePrefix := q.queueKey + ":wake:" // as start and Notification name the channels
+	g := q.pauseHooks.gen.Load()
 	r, err := q.tickScript.Run(q.ctx, q.client, keys, q.ackPrefix, q.hbt(), sweepGap.Seconds(), wakePrefix, presenceGrace.Seconds()).Int64Slice()
 	if errors.Is(err, redis.ErrClosed) {
 		return false // the client was closed without closing this queue
@@ -1145,7 +1149,7 @@ func (q *Queue) tick() bool {
 		log.Printf("queue %s: taken for dead (heartbeat ran out, or pub/sub connection and sweep gone); its unacknowledged items may have been requeued to other consumers", q.queueKey)
 	}
 
-	q.setPaused(r[2] == 1) // before the wake below, so a requeue on a paused queue starts nothing
+	q.observe(g, r[2] == 1)
 	q.requeued(r[0])
 	return true
 }
