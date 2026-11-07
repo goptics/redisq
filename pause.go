@@ -46,6 +46,7 @@ type pauseHooks struct {
 	mu      sync.Mutex
 	hooks   map[*func(bool)]struct{}
 	kick    chan struct{} // buffer 1: a kick while one waits is the same kick
+	loop    sync.Once     // starts pauseLoop on the first kick: no goroutine for a queue never paused
 	recheck atomic.Bool   // a "paused:" message came: read the key
 	// gen moves on at each Pause, Resume and control message. A pop or sweep
 	// reply, which may arrive after one of them, sets the flag only if gen
@@ -123,13 +124,14 @@ func (q *Queue) setPaused(p bool) {
 }
 
 func (q *Queue) kickPause() {
+	q.pauseHooks.loop.Do(func() { go q.pauseLoop() })
 	select {
 	case q.pauseHooks.kick <- struct{}{}:
 	default:
 	}
 }
 
-// pauseLoop, one per Queue object until Close, reads the key after a
+// pauseLoop, one per Queue object from its first kick until Close, reads the key after a
 // "paused:" message and calls the hooks whenever the state differs from
 // what it last told them. Off the pub/sub reader and the sweep, so a slow
 // hook never delays wakes or heartbeats.
@@ -200,10 +202,10 @@ func (q *Queue) lenCmd() string {
 
 // getPausedKey returns the Redis key that pauses the queue while it exists
 func (q *Queue) getPausedKey() string {
-	return q.queueKey + ":paused"
+	return q.pausedKey
 }
 
 // getControlKey returns the pub/sub channel of pause and resume messages
 func (q *Queue) getControlKey() string {
-	return q.queueKey + ":control"
+	return q.controlKey
 }

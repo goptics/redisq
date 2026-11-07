@@ -24,29 +24,31 @@ type Queue struct {
 	cancel   context.CancelFunc
 	// Config is atomic so no lock is held across a network call: Redis applies
 	// each command, pipeline and script on its own.
-	expiration        atomic.Int64                // time.Duration
-	visibilityTimeout atomic.Int64                // time.Duration
-	onRequeue         atomic.Pointer[func(int64)] // called after the sweeper requeues n items
-	ackPrefix         string                      // ack IDs are <ackPrefix>:<reservation>:<index>, unique per Queue object
-	ackSeq            atomic.Uint64               // last reservation number handed out
-	retryPop          atomic.Pointer[reservation] // ack IDs of a pop that failed with an error, reused by the next pop
-	popLen            atomic.Int64                // items the next batch pop expects (see dequeueBatch); maxPop until the first
-	popRun            atomic.Int64                // items batch pops took since the queue was last seen empty
-	isPriority        bool                        // a zset queue, with :prio entries to clear on ack; set before any goroutine starts
-	dedupWindow       atomic.Int64                // time.Duration EnqueueOnce remembers an id for
-	heartbeatTimeout  atomic.Int64                // time.Duration (see SetHeartbeatTimeout)
-	beating           atomic.Bool                 // a pop set this queue's heartbeat since a lapse was last logged
-	tickScript        *redis.Script               // the sweep for this storage (see tickBody)
-	releaseScript     *redis.Script               // what Close runs to requeue this queue's items (see releaseBody)
-	storageKeys       []string                    // keys both take after the deadlines: :seq and :prio for a zset
-	presence          *redis.PubSub               // this object's wake channel subscription (see start)
-	keepCompleted     atomic.Int64                // most completed Job Records kept (see SetCompletedRetention)
-	keepCompletedAge  atomic.Int64                // time.Duration a completed Job Record is kept for
-	keepFailed        atomic.Int64                // most failed Job Records kept (see SetFailedRetention)
-	keepFailedAge     atomic.Int64                // time.Duration a failed Job Record is kept for
-	paused            atomic.Bool                 // the queue pause as this object last saw it (see pause.go)
-	pauseHooks        pauseHooks                  // OnPauseChange callbacks
-	closeOnce         sync.Once
+	expiration            atomic.Int64                // time.Duration
+	visibilityTimeout     atomic.Int64                // time.Duration
+	onRequeue             atomic.Pointer[func(int64)] // called after the sweeper requeues n items
+	ackPrefix             string                      // ack IDs are <ackPrefix>:<reservation>:<index>, unique per Queue object
+	ackSeq                atomic.Uint64               // last reservation number handed out
+	retryPop              atomic.Pointer[reservation] // ack IDs of a pop that failed with an error, reused by the next pop
+	popLen                atomic.Int64                // items the next batch pop expects (see dequeueBatch); maxPop until the first
+	popRun                atomic.Int64                // items batch pops took since the queue was last seen empty
+	isPriority            bool                        // a zset queue, with :prio entries to clear on ack; set before any goroutine starts
+	dedupWindow           atomic.Int64                // time.Duration EnqueueOnce remembers an id for
+	heartbeatTimeout      atomic.Int64                // time.Duration (see SetHeartbeatTimeout)
+	beating               atomic.Bool                 // a pop set this queue's heartbeat since a lapse was last logged
+	tickScript            *redis.Script               // the sweep for this storage (see tickBody)
+	releaseScript         *redis.Script               // what Close runs to requeue this queue's items (see releaseBody)
+	storageKeys           []string                    // keys both take after the deadlines: :seq and :prio for a zset
+	presence              *redis.PubSub               // this object's wake channel subscription (see start)
+	keepCompleted         atomic.Int64                // most completed Job Records kept (see SetCompletedRetention)
+	keepCompletedAge      atomic.Int64                // time.Duration a completed Job Record is kept for
+	keepFailed            atomic.Int64                // most failed Job Records kept (see SetFailedRetention)
+	keepFailedAge         atomic.Int64                // time.Duration a failed Job Record is kept for
+	paused                atomic.Bool                 // the queue pause as this object last saw it (see pause.go)
+	pauseHooks            pauseHooks                  // OnPauseChange callbacks
+	pausedKey, controlKey string                      // <key>:paused and <key>:control, built once
+	rawKeys               []string                    // what Dequeue's scripts take
+	closeOnce             sync.Once
 }
 
 func newQueue(c *redis.Client, queueKey string) *Queue {
@@ -66,7 +68,6 @@ func newQueue(c *redis.Client, queueKey string) *Queue {
 // a restarted process start the grace of one that crashed straight away.
 func (q *Queue) start() {
 	q.presence = q.client.Subscribe(q.ctx, q.queueKey+":wake:"+q.ackPrefix, q.getControlKey())
-	go q.pauseLoop()
 	q.tick()
 	go q.sweep()
 }
@@ -90,6 +91,8 @@ func newQueueBase(c *redis.Client, queueKey string) *Queue {
 		ackPrefix: newID(),
 	}
 	q.pauseHooks.kick = make(chan struct{}, 1)
+	q.pausedKey, q.controlKey = queueKey+":paused", queueKey+":control"
+	q.rawKeys = []string{queueKey, q.pausedKey}
 	q.visibilityTimeout.Store(int64(5 * time.Minute))
 	q.dedupWindow.Store(int64(5 * time.Minute))
 	q.heartbeatTimeout.Store(int64(30 * time.Second))
@@ -177,7 +180,11 @@ func (q *Queue) Dequeue() (any, bool) {
 		log.Println("queue closed, cannot dequeue")
 		return nil, false
 	default:
-		return q.rawPop(listRawPop)
+		s, ok := q.rawPop(listRawPop)
+		if !ok {
+			return nil, false
+		}
+		return []byte(s), true
 	}
 }
 
@@ -191,25 +198,25 @@ return redis.call('ZPOPMIN', KEYS[1])[1] or false`)
 )
 
 // rawPop runs pop and returns its item as stored.
-func (q *Queue) rawPop(pop *redis.Script) (any, bool) {
+func (q *Queue) rawPop(pop *redis.Script) (string, bool) {
 	g := q.pauseHooks.gen.Load()
-	reply, err := pop.Run(q.ctx, q.client, []string{q.queueKey, q.getPausedKey()}).Result()
+	reply, err := pop.Run(q.ctx, q.client, q.rawKeys).Result()
 	if err == redis.Nil {
-		return nil, false
+		return "", false
 	}
 
 	if err != nil {
 		log.Printf("Error dequeuing: %v", err)
-		return nil, false
+		return "", false
 	}
 
 	v, ok := reply.(string)
 	if !ok { // paused
 		q.observe(g, true)
-		return nil, false
+		return "", false
 	}
 
-	return []byte(v), true
+	return v, true
 }
 
 func (q *Queue) toBytes(item any) ([]byte, error) {

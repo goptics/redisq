@@ -89,7 +89,7 @@ func (pq *PriorityQueue) Dequeue() (any, bool) {
 			return nil, false
 		}
 
-		return itemOf(string(v.([]byte))), true
+		return itemOf(v), true
 	}
 }
 
