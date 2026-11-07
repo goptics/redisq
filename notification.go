@@ -33,6 +33,7 @@ type Notification struct {
 	consumer    atomic.Bool
 	idle        atomic.Bool // this consumer's own last look found no work for it
 	subscribers []func(action string)
+	control     func(*redis.Message) bool // handles a control message (see Queue.control)
 	mx          sync.RWMutex
 	started     sync.Once
 	ctx         context.Context
@@ -76,8 +77,9 @@ if n > 0 then redis.call('SREM', KEYS[2], ARGV[2])
 elseif ARGV[3] == '1' then redis.call('SADD', KEYS[2], ARGV[2]) end
 return n`)
 
-// newNotification reads pubsub, the subscription to channel <queueKey>:wake:<id>.
-func newNotification(client *redis.Client, pubsub *redis.PubSub, queueKey, lenCmd, id string) *Notification {
+// newNotification reads pubsub, the subscription to channel <queueKey>:wake:<id>
+// and the queue's control channel, whose messages go to control.
+func newNotification(client *redis.Client, pubsub *redis.PubSub, queueKey, lenCmd, id string, control func(*redis.Message) bool) *Notification {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Notification{
@@ -89,6 +91,7 @@ func newNotification(client *redis.Client, pubsub *redis.PubSub, queueKey, lenCm
 		idleKey:     queueKey + ":idle",
 		wakePrefix:  queueKey + ":wake:",
 		subscribers: make([]func(action string), 0),
+		control:     control,
 		ctx:         ctx,
 		cancel:      cancel,
 	}
@@ -102,7 +105,7 @@ func (n *Notification) Start() {
 	n.started.Do(func() {
 		go func() {
 			for msg := range n.pubsub.Channel() {
-				if msg == nil {
+				if msg == nil || n.control(msg) {
 					continue
 				}
 				n.broadcast(msg.Payload)

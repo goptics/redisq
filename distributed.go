@@ -25,7 +25,7 @@ func newDistributedQueue(client *redis.Client, queueKey string) *DistributedQueu
 	base := newQueue(client, queueKey)
 	q := &DistributedQueue{
 		Queue:        base,
-		Notification: newNotification(client, base.presence, queueKey, "LLEN", base.ackPrefix),
+		Notification: newNotification(client, base.presence, queueKey, "LLEN", base.ackPrefix, base.control),
 	}
 	q.setOnRequeue(q.wake)
 	defer q.Start()

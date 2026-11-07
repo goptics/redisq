@@ -44,6 +44,8 @@ type Queue struct {
 	keepCompletedAge  atomic.Int64                // time.Duration a completed Job Record is kept for
 	keepFailed        atomic.Int64                // most failed Job Records kept (see SetFailedRetention)
 	keepFailedAge     atomic.Int64                // time.Duration a failed Job Record is kept for
+	paused            atomic.Bool                 // the queue pause as this object last saw it (see pause.go)
+	pauseHooks        pauseHooks                  // OnPauseChange callbacks
 	closeOnce         sync.Once
 }
 
@@ -54,8 +56,8 @@ func newQueue(c *redis.Client, queueKey string) *Queue {
 	return q
 }
 
-// start subscribes this queue object to its wake channel and sweeps once
-// now, which requeues the items past their deadline or held by a dead or
+// start subscribes this queue object to its wake channel and the queue's
+// control channel (pause and resume, see pause.go) and sweeps once now, which requeues the items past their deadline or held by a dead or
 // gone owner, and then every second.
 // The subscription says the process is alive: Redis drops it within
 // milliseconds of the process exiting, and other processes' sweeps then
@@ -63,15 +65,17 @@ func newQueue(c *redis.Client, queueKey string) *Queue {
 // it for wakes; a plain queue drains it (see drain). Sweeping at once lets
 // a restarted process start the grace of one that crashed straight away.
 func (q *Queue) start() {
-	q.presence = q.client.Subscribe(q.ctx, q.queueKey+":wake:"+q.ackPrefix)
+	q.presence = q.client.Subscribe(q.ctx, q.queueKey+":wake:"+q.ackPrefix, q.getControlKey())
 	q.tick()
 	go q.sweep()
 }
 
-// drain reads a plain queue's wake channel, where nothing is published, so
+// drain reads a plain queue's subscription: control messages (see
+// Queue.control), and its wake channel, where nothing is published, so
 // go-redis pings the connection and resubscribes after a reconnect.
 func (q *Queue) drain() {
-	for range q.presence.Channel() {
+	for msg := range q.presence.Channel() {
+		q.control(msg)
 	}
 }
 
@@ -171,18 +175,38 @@ func (q *Queue) Dequeue() (any, bool) {
 		log.Println("queue closed, cannot dequeue")
 		return nil, false
 	default:
-		result, err := q.client.LPop(q.ctx, q.queueKey).Bytes()
-		if err == redis.Nil {
-			return nil, false
-		}
-
-		if err != nil {
-			log.Printf("Error dequeuing: %v", err)
-			return nil, false
-		}
-
-		return result, true
+		return q.rawPop(listRawPop)
 	}
+}
+
+// listRawPop and zsetRawPop are Dequeue's pop without acknowledgment: 0 while
+// KEYS[2], :paused, exists, else the item, or false when the queue is empty.
+var (
+	listRawPop = redis.NewScript(`if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
+return redis.call('LPOP', KEYS[1])`)
+	zsetRawPop = redis.NewScript(`if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
+return redis.call('ZPOPMIN', KEYS[1])[1] or false`)
+)
+
+// rawPop runs pop and returns its item as stored.
+func (q *Queue) rawPop(pop *redis.Script) (any, bool) {
+	reply, err := pop.Run(q.ctx, q.client, []string{q.queueKey, q.getPausedKey()}).Result()
+	if err == redis.Nil {
+		return nil, false
+	}
+
+	if err != nil {
+		log.Printf("Error dequeuing: %v", err)
+		return nil, false
+	}
+
+	v, ok := reply.(string)
+	if !ok { // paused
+		q.setPaused(true)
+		return nil, false
+	}
+
+	return []byte(v), true
 }
 
 func (q *Queue) toBytes(item any) ([]byte, error) {
@@ -508,8 +532,8 @@ const maxPop = 1000
 // popHead and popTail wrap the storage-specific part of the ack pop scripts,
 // which leaves the popped items, as stored, in `items`.
 //
-// KEYS: queue, pending hash, deadlines, idle set [, priorities], start
-// times, heartbeats (see popKeys).
+// KEYS: queue, pending hash, deadlines, idle set [, priorities], paused,
+// start times, heartbeats (see popKeys).
 // ARGV: want, visibility timeout (seconds; 0: none), ack ID
 // prefix, reservation (20-digit start), consumer ID (” if the caller is not
 // a distributed consumer), the caller's free slots, heartbeat timeout
@@ -580,7 +604,7 @@ return reply(items)`
 // popScript builds an ack pop script whose body pops into `items`, for
 // storage whose length command is lenCmd.
 func popScript(lenCmd, body string) *redis.Script {
-	return redis.NewScript(strings.ReplaceAll(popHead+body+popTail, "__LEN__", "'"+lenCmd+"'"))
+	return redis.NewScript(strings.ReplaceAll(popHead+pausedBatch+body+popTail, "__LEN__", "'"+lenCmd+"'"))
 }
 
 var (
@@ -646,8 +670,8 @@ end`
 )
 
 var (
-	listAckPopOne = redis.NewScript(popOneHead + listPopOne + popOneTail)
-	zsetAckPopOne = redis.NewScript(popOneHead + zsetPopOne + popOneTail)
+	listAckPopOne = redis.NewScript(popOneHead + pausedOne + listPopOne + popOneTail)
+	zsetAckPopOne = redis.NewScript(popOneHead + pausedOne + zsetPopOne + popOneTail)
 )
 
 // popOneLenHead and popOneLenTail wrap the lean pop a batch call runs when it
@@ -673,7 +697,7 @@ beat()
 return reply({v})`
 
 func popOneLenScript(lenCmd, body string) *redis.Script {
-	return redis.NewScript(strings.ReplaceAll(popOneLenHead+body+popOneLenTail, "__LEN__", "'"+lenCmd+"'"))
+	return redis.NewScript(strings.ReplaceAll(popOneLenHead+pausedBatch+body+popOneLenTail, "__LEN__", "'"+lenCmd+"'"))
 }
 
 var (
@@ -723,7 +747,7 @@ func (q *Queue) dequeueOne(pop *redis.Script, consumer string, extraKeys ...stri
 
 	r := q.reserve(1, 1)
 	ackID := q.ackIDOf(fmt.Sprintf("%020d", r.start), 1)
-	v, err := pop.Run(q.ctx, q.client, q.popKeys(extraKeys...), q.vt(), ackID, consumer, q.hbt(), q.ackPrefix).Text()
+	reply, err := pop.Run(q.ctx, q.client, q.popKeys(extraKeys...), q.vt(), ackID, consumer, q.hbt(), q.ackPrefix).Result()
 	if err == redis.Nil {
 		return nil, false, ""
 	}
@@ -734,14 +758,21 @@ func (q *Queue) dequeueOne(pop *redis.Script, consumer string, extraKeys ...stri
 		return nil, false, ""
 	}
 
+	v, ok := reply.(string)
+	if !ok { // 0: paused (pausedOne); the guard found nothing held, so r is free
+		q.setPaused(true)
+		return nil, false, ""
+	}
+
 	q.beating.Store(q.hbt() > 0)
 	return []byte(v), true, ackID
 }
 
 // popKeys are the keys of the ack pop scripts (see popHead), with extraKeys
-// (a zset's :prio) after the idle set.
+// (a zset's :prio) after the idle set. The last three are read from the end:
+// :paused, :started, :heartbeats.
 func (q *Queue) popKeys(extraKeys ...string) []string {
-	return append(append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey()}, extraKeys...), q.getStartedKey(), q.getHeartbeatKey())
+	return append(append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey()}, extraKeys...), q.getPausedKey(), q.getStartedKey(), q.getHeartbeatKey())
 }
 
 // reserve returns the ack IDs for a pop of up to want items, by a call with
@@ -847,6 +878,11 @@ func (q *Queue) dequeueBatch(pop, popOne *redis.Script, items []any, ackIDs []st
 		return 0, 0, err
 	}
 
+	if len(reply) > 2 { // {0, {}, 1}: paused (pausedBatch); popLen stays for the Resume
+		q.setPaused(true)
+		return 0, 0, nil
+	}
+
 	popped := reply[1].([]any)
 	if len(popped) > 0 {
 		q.beating.Store(q.hbt() > 0)
@@ -934,12 +970,14 @@ end
 `
 )
 
-// tickBody is the sweep. It requeues pending items whose visibility deadline
+// tickBody is the sweep. KEYS end with the heartbeats, their clock, the
+// presence ZSET and :paused. It requeues pending items whose visibility deadline
 // is past Redis's clock, renews heartbeat ARGV[1] by ARGV[2] seconds (drops
 // it when that is 0; only a pop adds one), and requeues the items of owners
 // whose heartbeat ran out or who are gone (below). ARGV[3] is the longest
 // gap, in seconds, between sweeps that counts as normal. It returns {items
-// moved, 1 if ARGV[1]'s heartbeat was missing or had run out, else 0}.
+// moved, 1 if ARGV[1]'s heartbeat was missing or had run out, else 0, 1 if
+// the queue is paused, else 0}.
 //
 // The clock is when any process last swept. A longer gap means Redis, or
 // every process, stalled: a failover, a restart, a pause. No one could beat
@@ -961,7 +999,8 @@ end
 // ponytail: a dead owner, like a Close (releaseBody), costs a read of every
 // pending ID (HKEYS); index pending items by owner if pending runs to millions.
 // The presence count covers 1000 owners per sweep; the rest keep heartbeats.
-const tickBody = `local hb, clock, pres = KEYS[#KEYS - 2], KEYS[#KEYS - 1], KEYS[#KEYS]
+const tickBody = `local hb, clock, pres = KEYS[#KEYS - 3], KEYS[#KEYS - 2], KEYS[#KEYS - 1]
+local paused = redis.call('EXISTS', KEYS[#KEYS])
 local t = redis.call('TIME')
 local now = tonumber(t[1]) + tonumber(t[2]) / 1e6
 local last = tonumber(redis.call('GET', clock))
@@ -1010,8 +1049,8 @@ if last then
 		end
 	end
 end
-if own and own >= now then return {n, 0} end
-return {n, 1}`
+if own and own >= now then return {n, 0, paused} end
+return {n, 1, paused}`
 
 // releaseBody requeues every pending item of owner ARGV[1], taking them in
 // pop order, and then drops its heartbeat and presence.
@@ -1087,7 +1126,7 @@ func (q *Queue) sweep() {
 // tick runs the sweep script once, and returns false once the client is
 // closed.
 func (q *Queue) tick() bool {
-	keys := append(q.requeueKeys(), q.getHeartbeatKey(), q.getHeartbeatKey()+":clock", q.getPresenceKey())
+	keys := append(q.requeueKeys(), q.getHeartbeatKey(), q.getHeartbeatKey()+":clock", q.getPresenceKey(), q.getPausedKey())
 	wakePrefix := q.queueKey + ":wake:" // as start and Notification name the channels
 	r, err := q.tickScript.Run(q.ctx, q.client, keys, q.ackPrefix, q.hbt(), sweepGap.Seconds(), wakePrefix, presenceGrace.Seconds()).Int64Slice()
 	if errors.Is(err, redis.ErrClosed) {
@@ -1104,6 +1143,7 @@ func (q *Queue) tick() bool {
 		log.Printf("queue %s: taken for dead (heartbeat ran out, or pub/sub connection and sweep gone); its unacknowledged items may have been requeued to other consumers", q.queueKey)
 	}
 
+	q.setPaused(r[2] == 1) // before the wake below, so a requeue on a paused queue starts nothing
 	q.requeued(r[0])
 	return true
 }
