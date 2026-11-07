@@ -278,3 +278,22 @@ func TestPauseStaleSweepIgnored(t *testing.T) {
 		assert.Equal(t, pause, q.Paused(), "pause=%v", pause)
 	}
 }
+
+// A hook stops after cancel; storage errors reach the caller.
+func TestPauseCancelAndErrors(t *testing.T) {
+	qs := pauseClient(t)
+	q := qs.NewQueue(newID())
+	var calls atomic.Int32
+	cancel := q.OnPauseChange(func(bool) { calls.Add(1) })
+	require.NoError(t, q.Pause())
+	require.Eventually(t, func() bool { return calls.Load() == 1 }, time.Second, time.Millisecond)
+	cancel()
+	require.NoError(t, q.Resume())
+	assert.Never(t, func() bool { return calls.Load() > 1 }, 100*time.Millisecond, time.Millisecond, "no call after cancel")
+
+	require.NoError(t, qs.client.Close())
+	assert.Error(t, q.Pause())
+	assert.Error(t, q.Resume())
+	_, ok := q.Dequeue()
+	assert.False(t, ok)
+}
