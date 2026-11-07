@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -315,11 +316,18 @@ func TestPauseRefusalsCounted(t *testing.T) {
 	assert.EqualValues(t, 3, q.PauseRefusals())
 }
 
+// pauseLoops counts the running pauseLoop goroutines.
+func pauseLoops() int {
+	buf := make([]byte, 1<<20)
+	return strings.Count(string(buf[:runtime.Stack(buf, true)]), "(*Queue).pauseLoop(")
+}
+
 // Close stops the pause loop a Pause started.
 func TestPauseLoopStopsOnClose(t *testing.T) {
+	before := pauseLoops()
 	q := pauseClient(t).NewQueue(newID())
 	require.NoError(t, q.Pause()) // starts the loop
-	n := runtime.NumGoroutine()
+	require.Eventually(t, func() bool { return pauseLoops() == before+1 }, time.Second, time.Millisecond)
 	require.NoError(t, q.Close())
-	require.Eventually(t, func() bool { return runtime.NumGoroutine() < n }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return pauseLoops() == before }, time.Second, time.Millisecond)
 }
