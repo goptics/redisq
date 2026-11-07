@@ -66,6 +66,7 @@ func newQueue(c *redis.Client, queueKey string) *Queue {
 // a restarted process start the grace of one that crashed straight away.
 func (q *Queue) start() {
 	q.presence = q.client.Subscribe(q.ctx, q.queueKey+":wake:"+q.ackPrefix, q.getControlKey())
+	go q.pauseLoop()
 	q.tick()
 	go q.sweep()
 }
@@ -88,6 +89,7 @@ func newQueueBase(c *redis.Client, queueKey string) *Queue {
 		cancel:    cancel,
 		ackPrefix: newID(),
 	}
+	q.pauseHooks.kick = make(chan struct{}, 1)
 	q.visibilityTimeout.Store(int64(5 * time.Minute))
 	q.dedupWindow.Store(int64(5 * time.Minute))
 	q.heartbeatTimeout.Store(int64(30 * time.Second))

@@ -3,6 +3,7 @@ package redisq
 import (
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -38,10 +39,14 @@ wake(KEYS[3], ARGV[1], redis.call(ARGV[2], KEYS[2]))
 redis.call('PUBLISH', KEYS[4], 'resumed')
 return 1`)
 
-// pauseHooks are a Queue's OnPauseChange callbacks.
+// pauseHooks are a Queue's OnPauseChange callbacks and what drives them:
+// every change of Queue.paused, and every "paused:" message, kicks
+// pauseLoop.
 type pauseHooks struct {
-	mu    sync.Mutex
-	hooks map[*func(bool)]struct{}
+	mu      sync.Mutex
+	hooks   map[*func(bool)]struct{}
+	kick    chan struct{} // buffer 1: a kick while one waits is the same kick
+	recheck atomic.Bool   // a "paused:" message came: read the key
 }
 
 // Pause stops every consumer of the queue, in every process, taking items
@@ -75,6 +80,8 @@ func (q *Queue) Paused() bool {
 
 // OnPauseChange calls fn with the state each time this object sees it change
 // (its own Pause or Resume, a pop or sweep, a control message), until cancel.
+// Calls come from one goroutine of this object, in order, so the last call
+// is the current state; a slow fn delays only later calls.
 func (q *Queue) OnPauseChange(fn func(paused bool)) (cancel func()) {
 	h := &fn
 	q.pauseHooks.mu.Lock()
@@ -91,30 +98,63 @@ func (q *Queue) OnPauseChange(fn func(paused bool)) (cancel func()) {
 	}
 }
 
-// setPaused updates the cache and, on a change, calls the hooks outside the
-// lock with the state as of the call, so the last call a hook gets under a
-// racing Pause and Resume is the final state.
+// setPaused updates the cache and, on a change, has pauseLoop call the hooks.
 func (q *Queue) setPaused(p bool) {
-	if q.paused.Swap(p) == p {
-		return
+	if q.paused.Swap(p) != p {
+		q.kickPause()
 	}
+}
 
-	q.pauseHooks.mu.Lock()
-	fns := make([]func(bool), 0, len(q.pauseHooks.hooks))
-	for h := range q.pauseHooks.hooks {
-		fns = append(fns, *h)
+func (q *Queue) kickPause() {
+	select {
+	case q.pauseHooks.kick <- struct{}{}:
+	default:
 	}
-	q.pauseHooks.mu.Unlock()
+}
 
-	now := q.paused.Load()
-	for _, fn := range fns {
-		fn(now)
+// pauseLoop, one per Queue object until Close, reads the key after a
+// "paused:" message and calls the hooks whenever the state differs from
+// what it last told them. Off the pub/sub reader and the sweep, so a slow
+// hook never delays wakes or heartbeats.
+func (q *Queue) pauseLoop() {
+	told := false
+	for {
+		select {
+		case <-q.ctx.Done():
+			return
+		case <-q.pauseHooks.kick:
+		}
+
+		if q.pauseHooks.recheck.Swap(false) {
+			if n, err := q.client.Exists(q.ctx, q.getPausedKey()).Result(); err == nil {
+				q.paused.Store(n == 1)
+			}
+		}
+
+		now := q.paused.Load()
+		if now == told {
+			continue
+		}
+		told = now
+
+		q.pauseHooks.mu.Lock()
+		fns := make([]func(bool), 0, len(q.pauseHooks.hooks))
+		for h := range q.pauseHooks.hooks {
+			fns = append(fns, *h)
+		}
+		q.pauseHooks.mu.Unlock()
+
+		for _, fn := range fns {
+			fn(now)
+		}
 	}
 }
 
 // control handles a message on the queue's subscription and reports whether
-// it was a control message. Messages are hints (spec 6.8): an unknown one is
-// ignored, and the sweep corrects a wrong one within a second.
+// it was a control message. Messages are hints (spec 6.8), and an unknown
+// one is ignored. "resumed" is taken as is: a wrong one costs one refused
+// pop, which sets the flag back. "paused:" only makes pauseLoop read the
+// key, so forged ones never stop this consumer.
 func (q *Queue) control(msg *redis.Message) bool {
 	if msg.Channel != q.getControlKey() {
 		return false
@@ -124,7 +164,8 @@ func (q *Queue) control(msg *redis.Message) bool {
 	case msg.Payload == "resumed":
 		q.setPaused(false)
 	case strings.HasPrefix(msg.Payload, "paused:"):
-		q.setPaused(true)
+		q.pauseHooks.recheck.Store(true)
+		q.kickPause()
 	}
 	return true
 }

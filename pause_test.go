@@ -156,6 +156,7 @@ func TestPauseSeenByOtherProcesses(t *testing.T) {
 
 	require.NoError(t, a.Pause())
 	require.Eventually(t, b.Paused, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return len(got()) == 1 }, time.Second, time.Millisecond, "hooks run off the reader")
 	later := pauseClient(t).NewQueue(key)
 	assert.True(t, later.Paused(), "a later object reads the key before its first pop")
 
@@ -217,4 +218,14 @@ func TestPauseSweepStillRequeues(t *testing.T) {
 	require.True(t, q.tick())
 	assert.EqualValues(t, 1, requeued.Load())
 	assert.False(t, q.Paused())
+}
+
+// A "paused:" message only makes the object read the key: forged ones,
+// however many, never pause it.
+func TestPauseForgedMessageIgnored(t *testing.T) {
+	q := pauseClient(t).NewQueue(newID())
+	for range 50 {
+		require.NoError(t, q.client.Publish(q.ctx, q.getControlKey(), "paused:1").Err())
+	}
+	assert.Never(t, q.Paused, 300*time.Millisecond, time.Millisecond)
 }
