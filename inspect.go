@@ -24,11 +24,13 @@ func (q *Queue) QueueID() string {
 	return q.queueKey
 }
 
-// QueueStats returns the queue's counts and totals, read in one MULTI.
+// QueueStats returns the queue's counts, totals and pause, read in one
+// MULTI. It reads the pause from Redis, not this object's cache.
 func (q *Queue) QueueStats(ctx context.Context) (contract.QueueStats, error) {
 	var pending *redis.IntCmd
 	var processing, completed, failed *redis.IntCmd
 	var totals *redis.SliceCmd
+	var paused *redis.StringCmd
 	_, err := q.client.TxPipelined(ctx, func(p redis.Pipeliner) error {
 		if q.isPriority {
 			pending = p.ZCard(ctx, q.queueKey)
@@ -39,9 +41,10 @@ func (q *Queue) QueueStats(ctx context.Context) (contract.QueueStats, error) {
 		completed = p.ZCard(ctx, q.getCompletedKey())
 		failed = p.ZCard(ctx, q.getFailedKey())
 		totals = p.HMGet(ctx, q.getStatsKey(), "submitted", "completed", "failed")
+		paused = p.Get(ctx, q.getPausedKey())
 		return nil
 	})
-	if err != nil {
+	if err != nil && err != redis.Nil { // Nil: :paused is absent
 		return contract.QueueStats{}, err
 	}
 
@@ -51,10 +54,15 @@ func (q *Queue) QueueStats(ctx context.Context) (contract.QueueStats, error) {
 			t[i], _ = strconv.ParseUint(s, 10, 64)
 		}
 	}
-	return contract.QueueStats{
+	s := contract.QueueStats{
 		Counts: contract.JobCounts{Pending: pending.Val(), Processing: processing.Val(), Completed: completed.Val(), Failed: failed.Val()},
 		Totals: contract.JobTotals{Submitted: t[0], Completed: t[1], Failed: t[2]},
-	}, nil
+	}
+	if at, err := paused.Result(); err == nil {
+		s.Paused = true
+		s.PausedAt, _ = strconv.ParseInt(at, 10, 64) // not an integer: no paused_at (spec 7.1)
+	}
+	return s, nil
 }
 
 // jobsScript reads one page of a Job State (spec/redis-storage.md 7.2) in one

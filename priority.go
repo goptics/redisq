@@ -84,12 +84,12 @@ func (pq *PriorityQueue) Dequeue() (any, bool) {
 		return nil, false
 	default:
 		// Get and remove the highest priority item (lowest score) in a single operation
-		results, err := pq.client.ZPopMin(pq.ctx, pq.queueKey).Result()
-		if err != nil || len(results) == 0 {
+		v, ok := pq.rawPop(zsetRawPop)
+		if !ok {
 			return nil, false
 		}
 
-		return itemOf(results[0].Member.(string)), true
+		return itemOf(v), true
 	}
 }
 
