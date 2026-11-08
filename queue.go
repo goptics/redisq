@@ -3,6 +3,7 @@ package redisq
 import (
 	"context"
 	crand "crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -18,7 +19,8 @@ import (
 )
 
 // Queue is a FIFO queue shared across processes: acknowledged pops,
-// heartbeats and wakes for idle consumers (Notification).
+// heartbeats, wakes for idle consumers (Notification) and job outcomes
+// (WatchOutcome).
 type Queue struct {
 	*Notification // wakes; built in start, on this object's subscription
 	client        *redis.Client
@@ -52,6 +54,7 @@ type Queue struct {
 	pausedKey, controlKey string                      // <key>:paused and <key>:control, built once
 	rawKeys               []string                    // what Dequeue's scripts take
 	closeOnce             sync.Once
+	outcomes              outcomeWatchers // WatchOutcome watchers (see outcome.go)
 }
 
 func newQueue(c *redis.Client, queueKey string) *Queue {
@@ -67,7 +70,8 @@ func newQueue(c *redis.Client, queueKey string) *Queue {
 // their deadline or held by a dead or gone owner, and then every second.
 // The subscription says the process is alive: Redis drops it within
 // milliseconds of the process exiting, and other processes' sweeps then
-// requeue its items (see tickBody). Sweeping at once lets a restarted process start the grace of one
+// requeue its items (see tickBody). Outcome channels (WatchOutcome) join it
+// too. Sweeping at once lets a restarted process start the grace of one
 // that crashed straight away.
 func (q *Queue) start() {
 	q.presence = q.client.Subscribe(q.ctx, q.queueKey+":wake:"+q.ackPrefix, q.getControlKey())
@@ -79,9 +83,10 @@ func (q *Queue) start() {
 }
 
 // handle routes a message of the queue's subscription that is not a wake:
-// control (see Queue.control). It reports whether it took the message.
+// control (see Queue.control) and job outcomes (see outcome.go). It reports
+// whether it took the message.
 func (q *Queue) handle(msg *redis.Message) bool {
-	return q.control(msg)
+	return q.control(msg) || q.outcome(msg)
 }
 
 func newQueueBase(c *redis.Client, queueKey string) *Queue {
@@ -272,12 +277,20 @@ func (q *Queue) SetDedupWindow(d time.Duration) {
 // The key is set only after the push: Redis keeps a script's earlier writes
 // when a later command fails, so a push that fails (a key of the wrong type)
 // leaves the id free for a retry instead of silently taken.
+//
+// A push also drops the id's (ARGV[#ARGV - 1]) old Job Record: KEYS[#KEYS -
+// 3] :jobs, KEYS[#KEYS - 2] :completed, KEYS[#KEYS - 1] :failed. Else an id
+// reused after the window has WatchOutcome's catch-up report the previous
+// run's outcome and result (spec 6.13). A dedupe hit changes nothing.
 func once(body string) string {
 	return `if redis.call('EXISTS', KEYS[#KEYS]) == 1 then return 0 end
 local r = (function()
 ` + body + `
 end)()
 redis.call('SET', KEYS[#KEYS], '1', 'PX', ARGV[#ARGV])
+redis.call('HDEL', KEYS[#KEYS - 3], ARGV[#ARGV - 1])
+redis.call('ZREM', KEYS[#KEYS - 2], ARGV[#ARGV - 1])
+redis.call('ZREM', KEYS[#KEYS - 1], ARGV[#ARGV - 1])
 return r`
 }
 
@@ -311,11 +324,13 @@ func (q *Queue) EnqueueOnce(item any, id string) bool {
 	return q.enqueueOnceWith(listPushWakeOnce, q.pushKeys(), item, id, q.getWakePrefix())
 }
 
-// enqueueOnceWith is enqueueWith for a script built with once: it
-// adds id's key to keys and the dedupe window to the arguments.
+// enqueueOnceWith is enqueueWith for a script built with once: it adds the
+// record keys and id's key to keys, and id and the dedupe window to the
+// arguments.
 func (q *Queue) enqueueOnceWith(script *redis.Script, keys []string, item any, id string, extra ...any) bool {
 	window := max(1, time.Duration(q.dedupWindow.Load()).Milliseconds())
-	return q.enqueueWith(script, append(keys, q.queueKey+":dedup:"+id), item, append(extra, window)...)
+	keys = append(keys, q.getJobsKey(), q.getCompletedKey(), q.getFailedKey(), q.queueKey+":dedup:"+id)
+	return q.enqueueWith(script, keys, item, append(extra, id, window)...)
 }
 
 // enqueueWith runs script to push item, with ARGV[1] the item bytes, ARGV[2]
@@ -401,19 +416,30 @@ func (q *Queue) PrepareForFutureAck(ackID string, item any) error {
 // counts as completed in :stats, and its Job Record is kept as retention
 // allows (see SetCompletedRetention), in one atomic step. An ack ID that is
 // no longer processing (acknowledged, rejected, requeued or purged) is a
-// success that does nothing.
+// success that does nothing. A job with an envelope id has its outcome
+// published to watchers (see WatchOutcome).
 func (q *Queue) Acknowledge(ackID string) bool {
-	return q.finish(ackID, "completed", "")
+	return q.finish(ackID, "completed", "", nil)
+}
+
+// AcknowledgeResult is Acknowledge that keeps result, the result worker's
+// JSON, in the job's record ("result") and outcome. Invalid JSON returns
+// false and changes nothing. No size limit here (varmq caps it).
+func (q *Queue) AcknowledgeResult(ackID string, result []byte) bool {
+	if !json.Valid(result) {
+		return false
+	}
+	return q.finish(ackID, "completed", "", result)
 }
 
 // Reject marks a processing job failed for good, with reason as its last
 // error: like Acknowledge, but counted as failed and kept under the failed
 // retention (see SetFailedRetention). The job is not requeued.
 func (q *Queue) Reject(ackID string, reason string) bool {
-	return q.finish(ackID, "failed", reason)
+	return q.finish(ackID, "failed", reason, nil)
 }
 
-func (q *Queue) finish(ackID, state, reason string) bool {
+func (q *Queue) finish(ackID, state, reason string, result []byte) bool {
 	if q.ctx.Err() != nil {
 		log.Println("queue closed, cannot acknowledge or reject")
 		return false
@@ -426,11 +452,12 @@ func (q *Queue) finish(ackID, state, reason string) bool {
 		keep, age = q.keepFailed.Load(), q.keepFailedAge.Load()
 	}
 	keys := []string{q.getNackedItemKey(), q.getTimeoutKey(), q.getStartedKey(), q.getAttemptsKey(), q.getStatsKey(), q.getJobsKey(), this, other, q.getPriorityKey()}
-	if err := finishScript.Run(q.ctx, q.client, keys, ackID, state, reason, keep, time.Duration(age).Milliseconds()).Err(); err != nil {
+	r, err := finishScript.Run(q.ctx, q.client, keys, ackID, state, reason, keep, time.Duration(age).Milliseconds(), result, q.donePrefix()).Int()
+	if err != nil {
 		log.Printf("Error finishing item as %s: %v", state, err)
 		return false
 	}
-	return true
+	return r >= 0 // -1: result is not JSON
 }
 
 // SetCompletedRetention sets how many completed Job Records the queue keeps
@@ -488,21 +515,30 @@ end
 //
 // KEYS: nacked, timeouts, started, attempts, stats, jobs, the state's ZSET,
 // the other state's ZSET, prio. ARGV: ack ID, state (completed or failed),
-// reason, most records kept, longest age (ms).
+// reason, most records kept, longest age (ms), result JSON (” for none),
+// outcome channel prefix (<base>:done:).
+//
+// A result that cjson can't decode returns -1 before any write. A completed
+// record gets "result", spliced raw: a cjson round trip turns big integers
+// into doubles. A job with an envelope id has its outcome (contract
+// JobOutcome) published on <base>:done:<id> after the record step, kept or
+// not (spec 6.13).
 //
 // The Job ID is the envelope id, else the ack ID. The record is built by
 // string concatenation around the raw item: numbers go through
 // string.format('%.0f'), strings through cjson.encode. An item that isn't
 // JSON is recorded as a JSON string. cjson.decode takes nan, inf and hex
 // numbers, so a bare number is taken as JSON only when it looks like one.
-var finishScript = redis.NewScript(deadlineFn + envIDFn + trimFn + `local item = redis.call('HGET', KEYS[1], ARGV[1])
+var finishScript = redis.NewScript(deadlineFn + envIDFn + trimFn + `if ARGV[6] ~= '' and not pcall(cjson.decode, ARGV[6]) then return -1 end
+local item = redis.call('HGET', KEYS[1], ARGV[1])
 if not item then return 0 end
 local started = tonumber(redis.call('HGET', KEYS[3], ARGV[1]))
 redis.call('HDEL', KEYS[1], ARGV[1])
 redis.call('ZREM', KEYS[2], ARGV[1])
 redis.call('HDEL', KEYS[3], ARGV[1])
 redis.call('HDEL', KEYS[9], ARGV[1])
-local id, attempts = envid(item), 1
+local env = envid(item)
+local id, attempts = env, 1
 if id ~= '' then
 	attempts = 1 + (tonumber(redis.call('HGET', KEYS[4], id)) or 0)
 	redis.call('HDEL', KEYS[4], id)
@@ -519,6 +555,7 @@ if keep > 0 and age > 0 then
 	local rec = '{"id":' .. cjson.encode(id) .. ',"state":"' .. ARGV[2] .. '","item":' .. item
 	if started then rec = rec .. ',"started_at":' .. string.format('%.0f', started) end
 	rec = rec .. ',"finished_at":' .. string.format('%.0f', now) .. ',"attempts":' .. string.format('%.0f', attempts)
+	if ARGV[2] == 'completed' and ARGV[6] ~= '' then rec = rec .. ',"result":' .. ARGV[6] end
 	if ARGV[2] == 'failed' then
 		rec = rec .. ',"errors":[{"attempt":' .. string.format('%.0f', attempts) .. ',"at":' .. string.format('%.0f', now) .. ',"error":' .. cjson.encode(ARGV[3]) .. '}]'
 	end
@@ -528,6 +565,12 @@ else
 	redis.call('HDEL', KEYS[6], id)
 end
 trim(KEYS[7], KEYS[6], keep, age, now)
+if env ~= '' then
+	local out = '{"id":' .. cjson.encode(env) .. ',"state":"' .. ARGV[2] .. '"'
+	if ARGV[2] == 'failed' then out = out .. ',"error":' .. cjson.encode(ARGV[3]) end
+	if ARGV[2] == 'completed' and ARGV[6] ~= '' then out = out .. ',"result":' .. ARGV[6] end
+	redis.call('PUBLISH', ARGV[7] .. env, out .. '}')
+end
 return 1`)
 
 // trimScript trims both Job States (see trimFn), so an idle queue's records
@@ -1158,6 +1201,7 @@ func (q *Queue) sweep() {
 		if !q.tick() {
 			return
 		}
+		q.sweepOutcomes()
 		if i%60 == 0 { // ponytail: a minute is fine against hour-long ages
 			q.trim()
 		}
@@ -1311,13 +1355,14 @@ func (q *Queue) getPresenceKey() string {
 // or jobs still running here run again elsewhere.
 //
 // It leaves the idle set first, so the wake for the requeued items goes to
-// another consumer.
+// another consumer, and drops outcome watchers without calling them.
 func (q *Queue) Close() error {
 	var err error
 	q.closeOnce.Do(func() {
 		q.leave()
 		q.cancel() // stops the sweep
 		err = q.release()
+		q.outcomes.close()
 		q.Notification.Stop()
 	})
 	return err

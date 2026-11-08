@@ -1,0 +1,223 @@
+package redisq
+
+import (
+	"encoding/json"
+	"log"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/goptics/varmq/contract"
+	"github.com/redis/go-redis/v9"
+)
+
+// Job outcome signal (spec/redis-storage.md 1.6.0, 6.13). finishScript
+// publishes a finished job's contract.JobOutcome on <base>:done:<job id>.
+// WatchOutcome subscribes that channel on the queue object's one pub/sub
+// connection, first watcher of an id only, and reads the Job Record right
+// after, and again each sweep, for a job that ended before the subscribe
+// or whose message was lost (a reconnect).
+
+var (
+	_ contract.OutcomeWatcher        = (*Queue)(nil)
+	_ contract.OutcomeWatcher        = (*PriorityQueue)(nil)
+	_ contract.ResultAcknowledgeable = (*Queue)(nil)
+	_ contract.ResultAcknowledgeable = (*PriorityQueue)(nil)
+)
+
+// maxCatchUp caps the watched ids one sweep reads.
+const maxCatchUp = 500
+
+// Watch states.
+const (
+	watchWaiting int32 = iota
+	watchCalled
+	watchCancelled
+)
+
+type outcomeWatch struct {
+	fn    func(contract.JobOutcome)
+	state atomic.Int32 // watchWaiting, then watchCalled or watchCancelled
+}
+
+// outcomeWatchers are a Queue's watchers by job id. mu is held across
+// Subscribe and Unsubscribe, which only write to the connection, so an
+// id's subscription always matches whether it has watchers.
+type outcomeWatchers struct {
+	mu     sync.Mutex
+	byID   map[string]map[*outcomeWatch]struct{}
+	closed bool
+}
+
+// donePrefix is the outcome channel prefix, <base>:done:.
+func (q *Queue) donePrefix() string {
+	return q.queueKey + ":done:"
+}
+
+// WatchOutcome calls fn once, from its own goroutine, when job id completes
+// or fails in any process; a job whose record is still kept is reported
+// even if it ended before the call. After fn the watch ends by itself, and
+// the id's channel is unsubscribed once it has no watchers. cancel stops an
+// early watch; fn is not called after cancel returns, except a call already
+// running. An empty id, or a closed queue, watches nothing. Close drops
+// watchers without calling fn.
+func (q *Queue) WatchOutcome(id string, fn func(contract.JobOutcome)) (cancel func()) {
+	w := &outcomeWatch{fn: fn}
+	o := &q.outcomes
+	o.mu.Lock()
+	if id == "" || o.closed || q.ctx.Err() != nil {
+		o.mu.Unlock()
+		return func() {}
+	}
+	if o.byID == nil {
+		o.byID = map[string]map[*outcomeWatch]struct{}{}
+	}
+	set := o.byID[id]
+	if set == nil {
+		set = map[*outcomeWatch]struct{}{}
+		o.byID[id] = set
+		if err := q.presence.Subscribe(q.ctx, q.donePrefix()+id); err != nil && q.ctx.Err() == nil {
+			log.Printf("Error subscribing to job %s outcome: %v", id, err) // the sweep catches up
+		}
+	}
+	set[w] = struct{}{}
+	o.mu.Unlock()
+
+	go q.catchUp([]string{id})
+
+	return func() {
+		if w.state.CompareAndSwap(watchWaiting, watchCancelled) {
+			q.unwatch(id, w)
+		}
+	}
+}
+
+// unwatch drops w, and the id's subscription with its last watcher.
+func (q *Queue) unwatch(id string, w *outcomeWatch) {
+	o := &q.outcomes
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	set := o.byID[id]
+	if set == nil {
+		return
+	}
+	delete(set, w)
+	if len(set) == 0 {
+		delete(o.byID, id)
+		q.unsubscribeOutcome(id)
+	}
+}
+
+// unsubscribeOutcome drops id's channel; o.mu is held.
+func (q *Queue) unsubscribeOutcome(id string) {
+	if err := q.presence.Unsubscribe(q.ctx, q.donePrefix()+id); err != nil && q.ctx.Err() == nil {
+		log.Printf("Error unsubscribing from job %s outcome: %v", id, err)
+	}
+}
+
+// deliver ends every watch of id with out: each fn runs once, on its own
+// goroutine, so a slow fn holds up neither the pub/sub reader nor the sweep.
+func (q *Queue) deliver(id string, out contract.JobOutcome) {
+	o := &q.outcomes
+	o.mu.Lock()
+	set := o.byID[id]
+	if set != nil {
+		delete(o.byID, id)
+		q.unsubscribeOutcome(id)
+	}
+	o.mu.Unlock()
+
+	for w := range set {
+		go func() {
+			if w.state.CompareAndSwap(watchWaiting, watchCalled) {
+				w.fn(out)
+			}
+		}()
+	}
+}
+
+// close drops every watcher without calling it.
+func (o *outcomeWatchers) close() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.closed = true
+	for _, set := range o.byID {
+		for w := range set {
+			w.state.CompareAndSwap(watchWaiting, watchCancelled)
+		}
+	}
+	o.byID = nil
+}
+
+// outcome handles a message on an outcome channel and reports whether it
+// was one. A payload that isn't a JobOutcome is dropped; the sweep reads
+// the record instead.
+func (q *Queue) outcome(msg *redis.Message) bool {
+	id, ok := strings.CutPrefix(msg.Channel, q.donePrefix())
+	if !ok {
+		return false
+	}
+	var out contract.JobOutcome
+	if json.Unmarshal([]byte(msg.Payload), &out) == nil {
+		out.ID = id
+		q.deliver(id, out)
+	}
+	return true
+}
+
+// sweepOutcomes reads the records of up to maxCatchUp watched ids (map
+// order, so a larger set rotates) and delivers the ended ones.
+func (q *Queue) sweepOutcomes() {
+	o := &q.outcomes
+	o.mu.Lock()
+	ids := make([]string, 0, min(len(o.byID), maxCatchUp))
+	for id := range o.byID {
+		if len(ids) == maxCatchUp {
+			break
+		}
+		ids = append(ids, id)
+	}
+	o.mu.Unlock()
+
+	if len(ids) > 0 {
+		q.catchUp(ids)
+	}
+}
+
+// catchUp delivers the ids whose Job Record says they ended.
+func (q *Queue) catchUp(ids []string) {
+	recs, err := q.client.HMGet(q.ctx, q.getJobsKey(), ids...).Result()
+	if err != nil {
+		if q.ctx.Err() == nil {
+			log.Printf("Error reading job outcomes: %v", err)
+		}
+		return
+	}
+	for i, r := range recs {
+		s, ok := r.(string)
+		if !ok {
+			continue
+		}
+		if out, ok := outcomeOf(ids[i], s); ok {
+			q.deliver(ids[i], out)
+		}
+	}
+}
+
+// outcomeOf turns Job Record rec of job id into its outcome: the state, the
+// last error's text, the result as stored.
+func outcomeOf(id, rec string) (contract.JobOutcome, bool) {
+	var r struct {
+		State  contract.JobState   `json:"state"`
+		Errors []contract.JobError `json:"errors"`
+		Result json.RawMessage     `json:"result"`
+	}
+	if json.Unmarshal([]byte(rec), &r) != nil || (r.State != contract.JobCompleted && r.State != contract.JobFailed) {
+		return contract.JobOutcome{}, false
+	}
+	out := contract.JobOutcome{ID: id, State: r.State, Result: r.Result}
+	if n := len(r.Errors); n > 0 {
+		out.Error = r.Errors[n-1].Error
+	}
+	return out, true
+}

@@ -34,7 +34,7 @@ type Notification struct {
 	consumer    atomic.Bool
 	idle        atomic.Bool // this consumer's own last look found no work for it
 	subscribers []func(action string)
-	control     func(*redis.Message) bool // handles a control message (see Queue.handle)
+	control     func(*redis.Message) bool // handles a control or outcome message (see Queue.handle)
 	mx          sync.RWMutex
 	started     sync.Once
 	ctx         context.Context
@@ -79,8 +79,8 @@ elseif ARGV[3] == '1' then redis.call('SADD', KEYS[2], ARGV[2]) end
 return n`)
 
 // newNotification reads pubsub, the subscription to channel <queueKey>:wake:<id>,
-// and the queue's control channel, whose messages go to control (see
-// Queue.handle).
+// the queue's control channel and outcome channels, whose messages go to
+// control (see Queue.handle).
 func newNotification(client *redis.Client, pubsub *redis.PubSub, queueKey, lenCmd, id string, control func(*redis.Message) bool) *Notification {
 	ctx, cancel := context.WithCancel(context.Background())
 
