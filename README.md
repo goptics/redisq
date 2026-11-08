@@ -198,8 +198,9 @@ queue.QueueStats(ctx) // counts per Job State now, totals since the counters beg
 queue.Jobs(ctx, contract.JobFailed, 0, 50) // newest first; pending in hand-out order
 ```
 
-All four queue types implement `contract.QueueInspector` (`github.com/goptics/varmq/contract`), which varmq's
-`Handler` serves as `GET /queues` and `GET /queues/{id}/jobs`. The layout is varmq's
+Both queue types (and the deprecated `Distributed*` aliases) implement `contract.QueueInspector`
+(`github.com/goptics/varmq/contract`), which varmq's `Handler` serves as `GET /queues` and
+`GET /queues/{id}/jobs`. The layout is varmq's
 [`spec/redis-storage.md`](https://github.com/goptics/varmq/blob/main/spec/redis-storage.md) 1.0.0. Retention is set
 per queue object, so give every instance of a queue the same values. Records hold a copy of each payload, so
 retention bounds Redis memory. `Purge` deletes all of a queue's jobs, records and counters.
@@ -210,19 +211,19 @@ A producer waits on a job that any process runs. Jobs are varmq envelopes (`{"id
 
 ```go
 cancel := q.WatchOutcome("job-0b7e9c2a", func(o contract.JobOutcome) {
-	fmt.Println(o.State, o.Error, string(o.Result)) // "completed" or "failed"
+	fmt.Println(o.State, o.Error, string(o.Result)) // "completed", "failed" or "cancelled"
 })
 defer cancel() // early stop only; after fn the watch ends by itself
 
 q.AcknowledgeResult(ackID, []byte(`{"total":42}`)) // Acknowledge + result JSON; invalid JSON: false, no change
 ```
 
-`Acknowledge`, `AcknowledgeResult` and `Reject` publish the outcome on `<key>:done:<job id>` in the same script,
-kept record or not. A watch subscribes that channel on the queue object's one pub/sub connection, reads the
-Job Record right after, and again each sweep (1 s), so a job that ended before the watch, or a message lost in a
-reconnect, is still reported while its record is kept. `AcknowledgeResult` stores the result raw as the record's
-`result`, big integers intact. `Close` drops watchers without calling them
-(a delivery already under way may still call its fn).
+`Acknowledge`, `AcknowledgeResult`, `Reject` and `AcknowledgeCancelled`, and a pop that drops a cancelled job (see
+cancel below), publish the outcome on `<key>:done:<job id>` in the same script, kept record or not. A watch
+subscribes that channel on the queue object's one pub/sub connection, reads the Job Record right after, and again
+each sweep (1 s), so a job that ended before the watch, or a message lost in a reconnect, is still reported while
+its record is kept. `AcknowledgeResult` stores the result raw as the record's `result`, big integers intact.
+`Close` drops watchers without calling them (a delivery already under way may still call its fn).
 
 ### Batch dequeue
 
