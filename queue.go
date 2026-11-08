@@ -52,7 +52,7 @@ type Queue struct {
 	paused                atomic.Bool                 // the queue pause as this object last saw it (see pause.go)
 	pauseHooks            pauseHooks                  // OnPauseChange callbacks
 	pausedKey, controlKey string                      // <key>:paused and <key>:control, built once
-	cancelHooks           cancelHooks                 // OnCancel callbacks (see cancel.go)
+	cancelHooks           hookSet[string]             // OnCancel callbacks (see cancel.go)
 	rawKeys               []string                    // what Dequeue's scripts take
 	closeOnce             sync.Once
 	outcomes              outcomeWatchers // WatchOutcome watchers (see outcome.go)
@@ -100,7 +100,6 @@ func newQueueBase(c *redis.Client, queueKey string) *Queue {
 		ackPrefix: newID(),
 	}
 	q.pauseHooks.kick = make(chan struct{}, 1)
-	q.cancelHooks.kick = make(chan struct{}, 1)
 	q.pausedKey, q.controlKey = queueKey+":paused", queueKey+":control"
 	q.rawKeys = []string{queueKey, q.pausedKey, q.getCancelledKey(), q.getJobsKey(), q.getCompletedKey(), q.getFailedKey(), q.getAttemptsKey()}
 	q.visibilityTimeout.Store(int64(5 * time.Minute))

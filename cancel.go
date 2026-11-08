@@ -3,7 +3,6 @@ package redisq
 import (
 	"errors"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/goptics/varmq/contract"
@@ -84,89 +83,23 @@ func (q *Queue) AcknowledgeCancelled(ackID, reason string) bool {
 	return q.finish(ackID, string(contract.JobCancelled), reason, nil)
 }
 
-// cancelHooks are a Queue's OnCancel callbacks and the cancel requests
-// waiting for them, run by cancelLoop.
-type cancelHooks struct {
-	mu      sync.Mutex
-	hooks   map[*func(string)]struct{}
-	pending []string      // job ids not yet passed to the hooks, oldest first
-	kick    chan struct{} // buffer 1
-	loop    sync.Once     // starts cancelLoop on the first request with a hook
-}
-
 // OnCancel calls fn with the job ID of each cancel request on the queue
-// (from any process, this one included), until stop. A call already taken
-// for a request may still run once after stop returns. Calls come from one
-// goroutine of this object, in order, off the pub/sub reader, so a slow fn
-// delays only later calls. A request whose message was lost (a reconnect)
-// is not repeated.
+// (from any process, this one included), until stop. Each call runs on its
+// own goroutine, off the pub/sub reader, in no set order; one already
+// started may still run after stop returns. A request whose message was
+// lost (a reconnect) is not repeated.
 func (q *Queue) OnCancel(fn func(jobID string)) (stop func()) {
-	h := &fn
-	c := &q.cancelHooks
-	c.mu.Lock()
-	if c.hooks == nil {
-		c.hooks = map[*func(string)]struct{}{}
-	}
-	c.hooks[h] = struct{}{}
-	c.mu.Unlock()
-
-	return func() {
-		c.mu.Lock()
-		delete(c.hooks, h)
-		c.mu.Unlock()
-	}
+	return q.cancelHooks.add(fn)
 }
 
-// cancelRequested queues job id for the OnCancel callbacks; called from the
-// pub/sub reader. Without callbacks it is dropped.
+// cancelRequested passes job id to the OnCancel callbacks; called from the
+// pub/sub reader.
 func (q *Queue) cancelRequested(id string) {
-	c := &q.cancelHooks
-	c.mu.Lock()
-	if id == "" || len(c.hooks) == 0 {
-		c.mu.Unlock()
+	if id == "" {
 		return
 	}
-	c.pending = append(c.pending, id)
-	c.mu.Unlock()
-
-	c.loop.Do(func() { go q.cancelLoop() })
-	select {
-	case c.kick <- struct{}{}:
-	default:
-	}
-}
-
-// cancelLoop, one per Queue object from its first cancel request until
-// Close, passes each pending id to the callbacks registered at that moment.
-// A hook taken for an id may run once more after its stop returns.
-func (q *Queue) cancelLoop() {
-	c := &q.cancelHooks
-	for {
-		select {
-		case <-q.ctx.Done():
-			return
-		case <-c.kick:
-		}
-
-		for q.ctx.Err() == nil {
-			c.mu.Lock()
-			if len(c.pending) == 0 {
-				c.mu.Unlock()
-				break
-			}
-			id := c.pending[0]
-			c.pending[0] = ""
-			c.pending = c.pending[1:]
-			fns := make([]func(string), 0, len(c.hooks))
-			for h := range c.hooks {
-				fns = append(fns, *h)
-			}
-			c.mu.Unlock()
-
-			for _, fn := range fns {
-				fn(id)
-			}
-		}
+	for _, fn := range q.cancelHooks.snapshot() {
+		go fn(id)
 	}
 }
 
