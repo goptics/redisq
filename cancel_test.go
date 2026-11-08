@@ -150,6 +150,55 @@ func TestCancelWaitingJob(t *testing.T) {
 	}
 }
 
+// A marked workflow item (envelope wf) is handed out by every pop, FIFO and
+// priority, and keeps its mark: the pre-run check ends it (spec 6.12).
+func TestCancelWorkflowItemHandedOut(t *testing.T) {
+	const id = "wf:w1:t1"
+	wfItem := `{"id":"` + id + `","status":"Created","data":1,"wf":"w1","task":"t1"}`
+	pops := map[string]func(t *testing.T, q *Queue) []string{ // returns the ids handed out
+		"raw": func(t *testing.T, q *Queue) []string {
+			v, ok := rawPopOf(q)
+			require.True(t, ok)
+			return []string{envID(t, v)}
+		},
+		"single": func(t *testing.T, q *Queue) []string {
+			v, ok, _ := ackPopOf(q)
+			require.True(t, ok)
+			return []string{envID(t, v)}
+		},
+		"batch one": func(t *testing.T, q *Queue) []string { // the lean batch script
+			items, ids := make([]any, 1), make([]string, 1)
+			n, _, err := batchPopOf(q, items, ids)
+			require.NoError(t, err)
+			require.Equal(t, 1, n)
+			return []string{envID(t, items[0])}
+		},
+		"batch": func(t *testing.T, q *Queue) []string { // the full batch script
+			q.popLen.Store(2)
+			items, ids := make([]any, 2), make([]string, 2)
+			n, _, err := batchPopOf(q, items, ids)
+			require.NoError(t, err)
+			require.Equal(t, 2, n)
+			return []string{envID(t, items[0]), envID(t, items[1])}
+		},
+	}
+	for name, pop := range pops {
+		t.Run(name, func(t *testing.T) {
+			eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+				ctx := t.Context()
+				require.True(t, c.push(wfItem, 1))
+				require.True(t, c.push(envelope("b", `1`), 2))
+				require.NoError(t, c.prod.CancelJob(id))
+
+				assert.Equal(t, id, pop(t, c.cons)[0])
+				assert.True(t, marked(t, c.cons, id), "mark kept")
+				assert.False(t, c.cons.client.HExists(ctx, c.cons.getJobsKey(), id).Val(), "no record")
+				assert.Zero(t, c.cons.client.ZCard(ctx, c.cons.getFailedKey()).Val(), "nothing failed")
+			})
+		})
+	}
+}
+
 // A batch pop drops marked items and pops more in their place, keeping
 // order and each handed-out item's priority under its own ack ID.
 func TestCancelBatchRefills(t *testing.T) {
