@@ -1997,6 +1997,37 @@ func TestCancelExpiredMark(t *testing.T) {
 	})
 }
 
+// A pop that drops marked items trims :failed to the failed retention at
+// once, not at the next minute's sweep trim.
+func TestCancelDropTrimsFailed(t *testing.T) {
+	pops := map[string]func(q *Queue){
+		"raw":    func(q *Queue) { rawPopOf(q) },
+		"single": func(q *Queue) { ackPopOf(q) },
+		"batch": func(q *Queue) { // want 2: the full batch script
+			q.popLen.Store(2)
+			batchPopOf(q, make([]any, 2), make([]string, 2))
+		},
+	}
+	for name, pop := range pops {
+		t.Run(name, func(t *testing.T) {
+			eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+				ctx := t.Context()
+				c.cons.SetFailedRetention(2, time.Hour)
+				for i := range 5 {
+					id := fmt.Sprintf("c%d", i)
+					require.True(t, c.push(envelope(id, `1`), 1))
+					require.NoError(t, c.prod.CancelJob(id))
+				}
+				require.True(t, c.push(envelope("live", `1`), 1))
+
+				pop(c.cons)
+				assert.EqualValues(t, 2, c.cons.client.ZCard(ctx, c.cons.getFailedKey()).Val())
+				assert.EqualValues(t, 2, c.cons.client.HLen(ctx, c.cons.getJobsKey()).Val())
+			})
+		})
+	}
+}
+
 // One script call drops at most maxPop marked items; the script that ran
 // out of budget leaves the rest and keeps the consumer out of :idle, and
 // every pop call runs it again.
