@@ -2891,6 +2891,15 @@ func TestWorkflowDAGAcrossQueues(t *testing.T) {
 	rec := e.b.client.HGet(ctx, e.b.getJobsKey(), "wf:dag:b").Val()
 	assert.Contains(t, rec, `"result":"b"`)
 
+	// A late copy of an ended task settles and changes nothing.
+	require.True(t, e.a.Enqueue(wfEnvelope("dag", "a", false, "1")))
+	late, ok := wfPop(t, e.a)
+	require.True(t, ok)
+	pushed, ok = e.a.FinishTask(late.ack, contract.TaskEnd{Workflow: "dag", Task: "a", Outcome: contract.OutcomeFailed, Reason: "late"})
+	require.True(t, ok)
+	assert.Empty(t, pushed)
+	assert.Equal(t, r, e.record("dag"))
+
 	ttl := e.a.client.PTTL(ctx, e.store.key("dag")).Val()
 	assert.Greater(t, ttl, 6*24*time.Hour, "ended: expires after the retention")
 	_, err = e.store.Record(ctx, "nope")
@@ -3031,6 +3040,26 @@ func TestWorkflowCancel(t *testing.T) {
 	}
 }
 
+// A Cancel after an unabsorbed failure keeps that failure's compensation,
+// even with undo off.
+func TestWorkflowCancelAfterFailure(t *testing.T) {
+	e := newWFTest(t)
+	ctx := t.Context()
+	require.NoError(t, e.store.Submit(ctx, wfPlan("cf", false, false,
+		tk{name: "a", q: e.a, undo: e.c}, tk{name: "b", q: e.b}, tk{name: "c", q: e.c})))
+	for _, q := range []*Queue{e.a, e.b.Queue} {
+		p, ok := wfPop(t, q)
+		require.True(t, ok)
+		require.True(t, e.finish(p, failing("b")))
+	}
+	no := false
+	require.NoError(t, e.store.Cancel(ctx, "cf", &no))
+	assert.Equal(t, []string{"a:undo"}, e.drain(completeAll), "c stopped unrun, then a undone")
+	r := e.record("cf")
+	assert.Equal(t, contract.WorkflowCompensated, r.State)
+	assert.Equal(t, contract.JobCancelled, r.Tasks[2].State)
+}
+
 // A FinishTask whose reply was lost, re-sent, changes nothing and names
 // every push-target queue; a consumer that crashed before finishing has
 // its item requeued and run elsewhere. Either way b is pushed and runs once.
@@ -3160,7 +3189,8 @@ func TestWorkflowListing(t *testing.T) {
 	require.NoError(t, e.a.client.Del(ctx, e.store.key("w5")).Err())
 	assert.Equal(t, []string{"w4", "w2"}, ids("", 0, 2))
 	e.store.trimIndex(ctx)
-	assert.Zero(t, e.a.client.ZCard(ctx, e.store.indexKey()).Val(), "all older than the retention")
+	assert.Equal(t, []string{"w4", "w3", "w2", "w1"}, e.a.client.ZRevRange(ctx, e.store.indexKey(), 0, -1).Val(),
+		"all older than the retention; only w5, whose hash is gone, leaves")
 }
 
 // Submit refuses a plan with no task, a bad ID or name, a queue of another
@@ -3282,6 +3312,7 @@ func TestCancelGateWorkflowItem(t *testing.T) {
 		"wf:w:h":      `{"id":"wf:w:h","wf":"w","task":"h","WF":""}`,        // Go reads WF: a plain job there
 		"wf:w:i":      `{"id":"wf:w:i","wf":"w","task":"i","tas\u212a":""}`, // Kelvin sign k: Go folds it
 		"wf:w:j":      `{"id":"wf:w:j","wf":"w","task":"j","ID":"x"}`,       // Go reads ID
+		"wf:w:k":      `{"id":"wf:w:k","wf":"w","task":"k","undo":null}`,    // null undo: Go reads false, valid
 	}
 	for id, v := range items {
 		require.NoError(t, q.CancelJob(id))
@@ -3291,7 +3322,7 @@ func TestCancelGateWorkflowItem(t *testing.T) {
 	for p, ok := wfPop(t, q); ok; p, ok = wfPop(t, q) {
 		got = append(got, envID(t, p.raw))
 	}
-	assert.ElementsMatch(t, []string{"wf:w:a", "wf:w:a:undo"}, got)
+	assert.ElementsMatch(t, []string{"wf:w:a", "wf:w:a:undo", "wf:w:k"}, got)
 	assert.True(t, marked(t, q, "wf:w:a"), "a handed-out workflow item keeps its mark")
 	assert.False(t, marked(t, q, "wf:w:b"))
 }

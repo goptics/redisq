@@ -672,10 +672,12 @@ func (q *Queue) FinishTask(ackID string, e contract.TaskEnd) ([]string, bool) {
 	case contract.OutcomeCompleted:
 		reason = ""
 		switch {
-		case e.Undo || !json.Valid(result):
+		case e.Undo:
 			result = nil
 		case len(result) > limit:
 			e.Outcome, state, reason, result = contract.OutcomeFailed, "failed", contract.ErrResultTooLarge.Error(), nil
+		case !json.Valid(result):
+			result = nil
 		}
 	case contract.OutcomeFailed, contract.OutcomeCancelled:
 		state, result = "failed", nil
@@ -953,6 +955,9 @@ func (s *workflowStore) WorkflowKeys(ctx context.Context, state contract.Workflo
 		}
 
 		for i, z := range zs {
+			if state != "" && start+int64(i)-int64(limit) >= maxWorkflowsScan {
+				return page(out, offset, want), nil
+			}
 			k := contract.WorkflowKey{ID: z.Member.(string), CreatedAt: int64(z.Score)}
 			if len(out) >= want && (want == 0 || k.CreatedAt != out[len(out)-1].CreatedAt) {
 				return page(out, offset, want), nil
@@ -980,11 +985,33 @@ func page(keys []contract.WorkflowKey, offset, want int) []contract.WorkflowKey 
 	return keys[min(offset, len(keys)):min(want, len(keys))]
 }
 
-// trimIndex drops index entries older than the retention (spec 7.3, Trim):
-// their hashes expire by themselves.
+// trimIndex drops index entries older than the retention whose hash is
+// gone (spec 7.3, Trim), up to 1000 per call. The spec trims by score
+// alone, but the score is created_at and the hash expires a retention
+// after finished_at: a workflow running past the retention would drop out
+// of listings while Record still finds it.
 func (s *workflowStore) trimIndex(ctx context.Context) {
-	cut := time.Now().Add(-s.retention).UnixMilli()
-	if err := s.client.ZRemRangeByScore(ctx, s.indexKey(), "-inf", strconv.FormatInt(cut, 10)).Err(); err != nil && ctx.Err() == nil {
+	cut := strconv.FormatInt(time.Now().Add(-s.retention).UnixMilli(), 10)
+	old, err := s.client.ZRangeByScore(ctx, s.indexKey(), &redis.ZRangeBy{Min: "-inf", Max: cut, Count: 1000}).Result()
+	if err == nil && len(old) > 0 {
+		pipe := s.client.Pipeline()
+		live := make([]*redis.IntCmd, len(old))
+		for i, id := range old {
+			live[i] = pipe.Exists(ctx, s.key(id))
+		}
+		if _, err = pipe.Exec(ctx); err == nil {
+			var gone []any
+			for i, id := range old {
+				if live[i].Val() == 0 {
+					gone = append(gone, id)
+				}
+			}
+			if len(gone) > 0 {
+				err = s.client.ZRem(ctx, s.indexKey(), gone...).Err()
+			}
+		}
+	}
+	if err != nil && ctx.Err() == nil {
 		log.Printf("Error trimming workflow index: %v", err)
 	}
 }
@@ -1053,7 +1080,9 @@ return {1}`)
 // workflow goes on (spec 6.6): its dependents follow their policy, and what
 // that releases is pushed after the delete. The script finds the workflow
 // items itself; a queue that holds some takes a second call, with their
-// workflows' queues in KEYS.
+// workflows' queues in KEYS. Each call decodes every queued and processing
+// item inside Redis, so purging millions of items blocks Redis for that
+// long (a plain DEL did not).
 func (q *Queue) Purge() {
 	if err := q.purge(); err != nil {
 		log.Printf("Error purging queue %s: %v", q.queueKey, err)

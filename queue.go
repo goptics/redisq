@@ -572,8 +572,8 @@ func (q *Queue) SetFailedRetention(most int, age time.Duration) {
 //
 // It also defines wftag(e, id) (spec 3): whether envelope e, with id, holds
 // workflow fields a Submit could write: wf a workflow ID, task a task name,
-// undo absent or a boolean, and id wf:<wf>:<task> (":undo" appended for
-// undo true). Mirrors varmq's taskTag.matches; anything else is a plain job
+// undo absent, null (Go reads it as false) or a boolean, and id
+// wf:<wf>:<task> (":undo" appended for undo true). Mirrors varmq's taskTag.matches; anything else is a plain job
 // and no wf: key is built from it. Go's encoding/json matches keys without
 // case (and folds "ſ" to s, "K" to k), cjson does not: an envelope with
 // any such variant of id, wf, task or undo (wffold) reads differently in
@@ -596,7 +596,7 @@ local function wftag(e, id)
 		local f = wffold(k)
 		if (f == 'id' or f == 'wf' or f == 'task' or f == 'undo') and k ~= f then return false end
 	end
-	if e.undo ~= nil and type(e.undo) ~= 'boolean' then return false end
+	if e.undo ~= nil and e.undo ~= cjson.null and type(e.undo) ~= 'boolean' then return false end
 	if not wfname(e.wf, 128) or e.wf == 'index' or not wfname(e.task, 64) then return false end
 	return id == 'wf:' .. e.wf .. ':' .. e.task .. (e.undo == true and ':undo' or '')
 end
