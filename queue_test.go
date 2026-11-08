@@ -1525,25 +1525,26 @@ func mustJSON(t *testing.T, v any) []byte {
 }
 
 // A cancelled waiting job is never handed out, by any pop: dropped with
-// record and outcome cancelled, and the pop goes on with the next item.
+// record and outcome cancelled, and the pop goes on with the next item,
+// under that item's own priority.
 func TestCancelWaitingJob(t *testing.T) {
-	pops := map[string]func(t *testing.T, q *Queue) []string{ // returns the ids handed out
-		"raw": func(t *testing.T, q *Queue) []string {
+	pops := map[string]func(t *testing.T, q *Queue) (ids []string, ackID string){ // the ids handed out
+		"raw": func(t *testing.T, q *Queue) ([]string, string) {
 			v, ok := rawPopOf(q)
 			require.True(t, ok)
-			return []string{envID(t, v)}
+			return []string{envID(t, v)}, ""
 		},
-		"single": func(t *testing.T, q *Queue) []string {
-			v, ok, _ := ackPopOf(q)
+		"single": func(t *testing.T, q *Queue) ([]string, string) {
+			v, ok, ackID := ackPopOf(q)
 			require.True(t, ok)
-			return []string{envID(t, v)}
+			return []string{envID(t, v)}, ackID
 		},
-		"batch one": func(t *testing.T, q *Queue) []string { // the lean batch script
+		"batch one": func(t *testing.T, q *Queue) ([]string, string) { // the lean batch script
 			items, ids := make([]any, 1), make([]string, 1)
 			n, _, err := batchPopOf(q, items, ids)
 			require.NoError(t, err)
 			require.Equal(t, 1, n)
-			return []string{envID(t, items[0])}
+			return []string{envID(t, items[0])}, ids[0]
 		},
 	}
 	for name, pop := range pops {
@@ -1551,16 +1552,20 @@ func TestCancelWaitingJob(t *testing.T) {
 			eachCancelCase(t, func(t *testing.T, c cancelQueues) {
 				got, _ := watch(c.prod, "a")
 				require.True(t, c.push(envelope("a", `1`), 1))
-				require.True(t, c.push(envelope("b", `1`), 1))
+				require.True(t, c.push(envelope("b", `1`), 5))
 				require.NoError(t, c.prod.CancelJob("a"))
 
-				assert.Equal(t, []string{"b"}, pop(t, c.cons))
+				ids, ackID := pop(t, c.cons)
+				assert.Equal(t, []string{"b"}, ids)
 				assertDropped(t, c.cons, "a")
 				assert.Equal(t, contract.JobOutcome{ID: "a", State: contract.JobCancelled, Error: "cancelled"}, outcomeWithin(t, got, time.Second))
 				assert.Zero(t, c.cons.Len())
 				assert.LessOrEqual(t, c.cons.GetNackedItemsCount(), 1, "only b")
 				if c.cons.isPriority {
 					assert.LessOrEqual(t, c.cons.client.HLen(t.Context(), c.cons.getPriorityKey()).Val(), int64(1))
+					if ackID != "" {
+						assert.Equal(t, "5", c.cons.client.HGet(t.Context(), c.cons.getPriorityKey(), ackID).Val(), "b's priority, not a's")
+					}
 				}
 			})
 		})
