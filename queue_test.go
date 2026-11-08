@@ -1820,6 +1820,28 @@ func TestCancelStaleMessageDropped(t *testing.T) {
 	})
 }
 
+// A stop that returns while the live check is under way calls nothing.
+func TestCancelStopDuringLiveCheck(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		require.NoError(t, cancelLiveScript.Load(t.Context(), c.cons.client).Err()) // so the check is an EVALSHA
+		h := &holdTick{hash: cancelLiveScript.Hash(), ran: make(chan struct{}), release: make(chan struct{})}
+		c.cons.client.AddHook(h)
+		var calls atomic.Int32
+		stop := c.cons.OnCancel(func(string) { calls.Add(1) })
+		h.armed.Store(true)
+
+		require.NoError(t, c.prod.CancelJob("j"))
+		select {
+		case <-h.ran: // the check replied live; the reply waits
+		case <-time.After(time.Second):
+			t.Fatal("no live check")
+		}
+		stop()
+		close(h.release)
+		assert.Never(t, func() bool { return calls.Load() > 0 }, 300*time.Millisecond, 10*time.Millisecond, "fn after stop")
+	})
+}
+
 // A job that ends another way despite its mark drops the mark.
 func TestCancelFinishClearsMark(t *testing.T) {
 	eachCancelCase(t, func(t *testing.T, c cancelQueues) {

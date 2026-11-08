@@ -105,9 +105,9 @@ return 0`)
 // re-add drops it, so a message that arrives after its job ended (stale)
 // reaches no callback, nor the job's next run under a reused id (narrows
 // the window; it does not close it). A failed check calls them anyway.
+// Callbacks are read after the check, so a stop during it holds.
 func (q *Queue) cancelRequested(id string) {
-	hooks := q.cancelHooks.snapshot()
-	if id == "" || len(hooks) == 0 {
+	if id == "" || len(q.cancelHooks.snapshot()) == 0 {
 		return
 	}
 	go func() {
@@ -120,7 +120,7 @@ func (q *Queue) cancelRequested(id string) {
 		} else if live == 0 {
 			return
 		}
-		for _, fn := range hooks {
+		for _, fn := range q.cancelHooks.snapshot() {
 			go fn(id)
 		}
 	}()
