@@ -263,8 +263,78 @@ func (q *Queue) toBytes(item any) ([]byte, error) {
 	return data, nil
 }
 
+// cjsonMaxDepth is the nesting Redis's Lua cjson decodes at most.
+const cjsonMaxDepth = 1000
+
+// luaDecodable reports false for JSON that Go's encoding/json reads but
+// Redis's Lua cjson can't: nested deeper than cjsonMaxDepth, or with a lone
+// UTF-16 surrogate escape (\ud800 not followed by a low one, or a low one
+// alone). The pop's cancel gate can't read such an item's id, so a cancel
+// would miss it while varmq still runs it. One pass, no allocation; only a
+// suspect item is checked with json.Valid, so text that isn't JSON passes.
+func luaDecodable(b []byte) bool {
+	depth, str := 0, false
+	for i := 0; i < len(b); i++ {
+		switch c := b[i]; {
+		case str && c == '"':
+			str = false
+		case str && c == '\\':
+			i++
+			if i >= len(b) || b[i] != 'u' {
+				continue
+			}
+			r := hex4(b, i+1)
+			if r < 0xD800 || r > 0xDFFF {
+				i += 4
+				continue
+			}
+			if r > 0xDBFF || i+10 >= len(b) || b[i+5] != '\\' || b[i+6] != 'u' {
+				return !json.Valid(b)
+			}
+			if lo := hex4(b, i+7); lo < 0xDC00 || lo > 0xDFFF {
+				return !json.Valid(b)
+			}
+			i += 10
+		case str:
+		case c == '"':
+			str = true
+		case c == '{' || c == '[':
+			if depth++; depth > cjsonMaxDepth {
+				return !json.Valid(b)
+			}
+		case c == '}' || c == ']':
+			depth--
+		}
+	}
+	return true
+}
+
+// hex4 is the value of the 4 hex digits at b[i:], or -1.
+func hex4(b []byte, i int) int {
+	if i+4 > len(b) {
+		return -1
+	}
+	n := 0
+	for _, c := range b[i : i+4] {
+		switch {
+		case '0' <= c && c <= '9':
+			c -= '0'
+		case 'a' <= c && c <= 'f':
+			c -= 'a' - 10
+		case 'A' <= c && c <= 'F':
+			c -= 'A' - 10
+		default:
+			return -1
+		}
+		n = n<<4 | int(c)
+	}
+	return n
+}
+
 // Enqueue pushes item and wakes idle consumers, up to one per waiting item,
-// in one round trip.
+// in one round trip. It refuses (false) JSON that Redis's Lua cjson can't
+// decode though Go can: nested deeper than 1000, or with a lone UTF-16
+// surrogate escape such as \ud800 (see luaDecodable).
 func (q *Queue) Enqueue(item any) bool {
 	return q.enqueueWith(listPushWake, q.pushKeys(), item, q.wakePrefix)
 }
@@ -370,6 +440,10 @@ func (q *Queue) enqueueWith(script *redis.Script, keys []string, item any, extra
 	data, err := q.toBytes(item)
 	if err != nil {
 		log.Printf("Error converting item to bytes: %v", err)
+		return false
+	}
+	if !luaDecodable(data) {
+		log.Println("Error enqueueing item: JSON Redis Lua can't decode (nested over 1000, or a lone surrogate escape)")
 		return false
 	}
 

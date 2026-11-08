@@ -1617,6 +1617,70 @@ func TestCancelUnparsableHandedOut(t *testing.T) {
 	})
 }
 
+// luaDecodable matches Redis's Lua cjson on JSON Go reads; text that isn't
+// JSON passes.
+func TestLuaDecodable(t *testing.T) {
+	deep := func(n int) string { // nested n deep, the envelope included
+		return `{"id":"d","data":` + strings.Repeat("[", n-1) + strings.Repeat("]", n-1) + `}`
+	}
+	cases := []struct {
+		name, in string
+		want     bool
+	}{
+		{"plain", envelope("a", `1`), true},
+		{"pair", `{"id":"a","data":"😀"}`, true},
+		{"upper pair", `{"data":"😀"}`, true},
+		{"escaped backslash", `{"data":"\\ud800"}`, true},
+		{"bmp", `{"data":"é￿\"\n"}`, true},
+		{"depth 1000", deep(1000), true},
+		{"brackets in a string", `{"data":"` + strings.Repeat("[", 1001) + `"}`, true},
+		{"lone high", `{"id":"a","data":"\ud800"}`, false},
+		{"lone high, top level", `"\udbff"`, false},
+		{"high, then text", `{"data":"\ud800x"}`, false},
+		{"high, then bmp", `{"data":"\ud800A"}`, false},
+		{"high, high", `["\ud800\ud800"]`, false},
+		{"lone low", `{"data":"\udc00"}`, false},
+		{"upper lone low", `{"data":"\uDFFF"}`, false},
+		{"depth 1001", deep(1001), false},
+		{"text", "raw bytes", true},
+		{"text, deep", strings.Repeat("[", 1001), true},
+		{"text, lone escape", `say "\ud800`, true},
+	}
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+	decode := redis.NewScript(`return pcall(cjson.decode, ARGV[1]) and 1 or 0`)
+	for _, c := range cases {
+		assert.Equal(t, c.want, luaDecodable([]byte(c.in)), c.name)
+		if json.Valid([]byte(c.in)) {
+			n, err := decode.Run(t.Context(), q.client, nil, c.in).Int()
+			require.NoError(t, err)
+			assert.Equal(t, c.want, n == 1, "%s: cjson decodes it", c.name)
+		}
+	}
+}
+
+// Enqueue and EnqueueOnce refuse JSON Redis Lua can't decode; at the depth
+// limit the pop's cancel gate still reads the id.
+func TestEnqueueRefusesLuaUndecodable(t *testing.T) {
+	nest := func(id string, n int) string {
+		return `{"id":"` + id + `","data":` + strings.Repeat("[", n-1) + strings.Repeat("]", n-1) + `}`
+	}
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		ctx := t.Context()
+		for _, v := range []string{`{"id":"s","data":"\ud800"}`, nest("s", 1001)} {
+			assert.False(t, c.push(v, 1))
+			assert.False(t, c.pushOnce(v, "s"))
+		}
+		assert.Zero(t, c.prod.client.Exists(ctx, c.prod.queueKey, c.prod.queueKey+":dedup:s").Val(), "nothing stored")
+
+		require.True(t, c.push(nest("k", 1000), 1))
+		require.NoError(t, c.prod.CancelJob("k"))
+		_, ok, _ := ackPopOf(c.cons)
+		assert.False(t, ok, "the gate read its id")
+		assert.Equal(t, "cancelled", record(t, c.cons, "k")["state"])
+	})
+}
+
 // A pop that drops the last waiting item finds the queue empty.
 func TestCancelOnlyItem(t *testing.T) {
 	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
