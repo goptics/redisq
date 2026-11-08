@@ -169,9 +169,10 @@ func (q *Queue) kickPause() {
 	}
 }
 
-// pauseLoop, one per Queue object from its first kick until Close, reads
-// the key after a "paused:" message and calls the hooks whenever the state
-// differs from what it last told them. Off the pub/sub reader and the
+// pauseLoop, one per Queue object from its first kick until Close (or the
+// sweep finds the client closed), reads the key after a "paused:" message
+// and calls the hooks whenever the state differs from what it last told
+// them. Off the pub/sub reader and the
 // sweep, so a slow hook never delays wakes or heartbeats.
 func (q *Queue) pauseLoop() {
 	told := false

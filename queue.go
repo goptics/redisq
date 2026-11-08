@@ -1391,7 +1391,8 @@ func (q *Queue) sweep() {
 		case <-tick.C:
 		}
 
-		if !q.tick() {
+		if !q.tick() { // client closed: queue is dead
+			q.cancel()              // stops the pause loop
 			q.Notification.cancel() // else a producer's nudge loop never sees ErrClosed
 			return
 		}
