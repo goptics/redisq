@@ -112,7 +112,7 @@ func main() {
 
 		wctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
-		rec, err := wf.Wait(wctx)
+		rec, err := wf.WaitContext(wctx)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "wait:", err)
 			os.Exit(1)
