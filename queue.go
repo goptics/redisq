@@ -280,8 +280,9 @@ func (q *Queue) pushKeys() []string {
 // or a late re-send can store the item again: with the client timeouts New sets
 // up to 7 sends of a script (3 re-sends as EVALSHA, then up to 4 as EVAL after
 // a NOSCRIPT), each after a read timeout, a backoff, a pool wait, a dial and
-// a connection's setup, about 4 minutes at worst. 0 or less turns EnqueueOnce into Enqueue. Each id
-// costs about 100 bytes of Redis memory for the window.
+// a connection's setup, about 4 minutes at worst. 0 or less turns the dedupe
+// off: EnqueueOnce always pushes, and still drops the id's old record and
+// cancel mark. Each id costs about 100 bytes of Redis memory for the window.
 func (q *Queue) SetDedupWindow(d time.Duration) {
 	q.dedupWindow.Store(int64(d))
 }
@@ -290,6 +291,7 @@ func (q *Queue) SetDedupWindow(d time.Duration) {
 // KEYS[#KEYS] is the id's key and ARGV[#ARGV] the dedupe window in ms. A key
 // already there means a push of the id (an earlier call, or a copy of this
 // one that go-redis re-sent) ran within the window, and nothing is pushed.
+// A window of 0 skips the check and the key: every call pushes.
 // The key is set only after the push: Redis keeps a script's earlier writes
 // when a later command fails, so a push that fails (a key of the wrong type)
 // leaves the id free for a retry instead of silently taken.
@@ -301,11 +303,12 @@ func (q *Queue) SetDedupWindow(d time.Duration) {
 // :cancelled, so the new job isn't dropped (spec 6.14). A dedupe hit changes
 // nothing.
 func once(body string) string {
-	return `if redis.call('EXISTS', KEYS[#KEYS]) == 1 then return 0 end
+	return `local win = tonumber(ARGV[#ARGV])
+if win > 0 and redis.call('EXISTS', KEYS[#KEYS]) == 1 then return 0 end
 local r = (function()
 ` + body + `
 end)()
-redis.call('SET', KEYS[#KEYS], '1', 'PX', ARGV[#ARGV])
+if win > 0 then redis.call('SET', KEYS[#KEYS], '1', 'PX', ARGV[#ARGV]) end
 redis.call('HDEL', KEYS[#KEYS - 3], ARGV[#ARGV - 1])
 redis.call('ZREM', KEYS[#KEYS - 2], ARGV[#ARGV - 1])
 redis.call('ZREM', KEYS[#KEYS - 1], ARGV[#ARGV - 1])
@@ -335,9 +338,10 @@ var (
 // go-redis's re-send of a push whose reply was lost, then stores the item
 // once. The id is remembered for the whole window, even if its item is
 // handled, removed or purged sooner. An empty id is a plain Enqueue. A
-// repeat wakes no one.
+// repeat wakes no one. With no window it always pushes, but still drops the
+// id's old record and cancel mark (see once).
 func (q *Queue) EnqueueOnce(item any, id string) bool {
-	if id == "" || q.dedupWindow.Load() <= 0 {
+	if id == "" {
 		return q.Enqueue(item)
 	}
 	return q.enqueueOnceWith(listPushWakeOnce, q.pushKeys(), item, id, q.wakePrefix)
@@ -345,9 +349,12 @@ func (q *Queue) EnqueueOnce(item any, id string) bool {
 
 // enqueueOnceWith is enqueueWith for a script built with once: it adds the
 // cancel mark, record and id's keys to keys, and id and the dedupe window
-// to the arguments.
+// to the arguments. A window under 1ms counts as 1ms; none as 0.
 func (q *Queue) enqueueOnceWith(script *redis.Script, keys []string, item any, id string, extra ...any) bool {
-	window := max(1, time.Duration(q.dedupWindow.Load()).Milliseconds())
+	window := int64(0)
+	if d := time.Duration(q.dedupWindow.Load()); d > 0 {
+		window = max(1, d.Milliseconds())
+	}
 	keys = append(keys, q.getCancelledKey(), q.getJobsKey(), q.getCompletedKey(), q.getFailedKey(), q.queueKey+":dedup:"+id)
 	return q.enqueueWith(script, keys, item, append(extra, id, window)...)
 }

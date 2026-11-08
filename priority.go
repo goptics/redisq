@@ -83,7 +83,7 @@ func (pq *PriorityQueue) Enqueue(item any, priority int) bool {
 // EnqueueOnce is Enqueue for a job with an id (see Queue.EnqueueOnce). A
 // repeat wakes no one.
 func (pq *PriorityQueue) EnqueueOnce(item any, priority int, id string) bool {
-	if id == "" || pq.dedupWindow.Load() <= 0 {
+	if id == "" {
 		return pq.Enqueue(item, priority)
 	}
 	return pq.enqueueOnceWith(zsetPushWakeOnce, pq.pushKeys(), item, id, priority, pq.wakePrefix)

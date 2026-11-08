@@ -1804,6 +1804,31 @@ func TestCancelReAddAndPurge(t *testing.T) {
 	})
 }
 
+// With the dedupe off, a pushing EnqueueOnce still drops the id's cancel
+// mark and old record (spec 6.13, 6.14 Re-add).
+func TestEnqueueOnceNoWindowReAdd(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		c.prod.SetDedupWindow(0)
+		require.NoError(t, c.prod.CancelJob("m"))
+		require.True(t, c.pushOnce(envelope("m", `1`), "m"))
+		assert.False(t, marked(t, c.cons, "m"), "the re-add drops the mark")
+		v, ok, ackID := ackPopOf(c.cons)
+		require.True(t, ok, "the re-added job is not dropped")
+		assert.Equal(t, "m", envID(t, v))
+		require.True(t, c.cons.Acknowledge(ackID))
+
+		require.True(t, c.pushOnce(envelope("m", `2`), "m")) // re-add of a completed id
+		assert.False(t, c.cons.client.HExists(t.Context(), c.cons.getJobsKey(), "m").Val(), "old record gone")
+		got, _ := watch(c.prod, "m")
+		c.prod.catchUp([]string{"m"})
+		require.NoError(t, c.prod.CancelJob("m"), "the waiting job is not ErrJobEnded")
+		_, ok, _ = ackPopOf(c.cons)
+		assert.False(t, ok, "dropped")
+		assert.Equal(t, contract.JobOutcome{ID: "m", State: contract.JobCancelled, Error: "cancelled"},
+			outcomeWithin(t, got, time.Second), "the old run's outcome is not reported")
+	})
+}
+
 // An expired mark counts as none: the pop hands the item out and removes
 // the mark. CancelJob and the sweep prune expired marks.
 func TestCancelExpiredMark(t *testing.T) {
