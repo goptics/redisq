@@ -9,11 +9,14 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -3279,3 +3282,53 @@ func TestCancelGateWorkflowItem(t *testing.T) {
 	assert.False(t, marked(t, q, "wf:w:b"))
 }
 
+// Two varmq worker processes, each serving part of the queues, and a
+// producer process run one workflow end to end (examples/workflow).
+func TestWorkflowTwoProcesses(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds examples/workflow")
+	}
+	bin := filepath.Join(t.TempDir(), "workflow")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = filepath.Join("examples", "workflow")
+	out, err := build.CombinedOutput()
+	require.NoError(t, err, string(out))
+
+	env := append(os.Environ(), "REDIS_URL="+getTestRedisURL(), "REDIS_NS="+newID())
+	var logs [2]bytes.Buffer
+	var workers []*exec.Cmd
+	stop := func() {
+		for _, w := range workers {
+			_ = w.Process.Signal(syscall.SIGTERM)
+			_ = w.Wait()
+		}
+		workers = nil
+	}
+	defer stop()
+	for i, queues := range []string{"upload,thumb", "email,unsend"} {
+		w := exec.Command(bin, "worker", queues)
+		w.Env, w.Stdout, w.Stderr = env, &logs[i], &logs[i]
+		require.NoError(t, w.Start())
+		workers = append(workers, w)
+	}
+
+	submit := exec.Command(bin, "submit")
+	submit.Env = env
+	res, err := submit.Output()
+	require.NoError(t, err, string(res))
+	var rec contract.WorkflowRecord
+	require.NoError(t, json.Unmarshal(res, &rec), string(res))
+	assert.Equal(t, contract.WorkflowCompleted, rec.State)
+	require.Len(t, rec.Tasks, 4)
+	for _, tr := range rec.Tasks {
+		assert.Equal(t, contract.JobCompleted, tr.State, tr.Name)
+	}
+	assert.Equal(t, contract.JobWaiting, rec.Tasks[3].Undo.State, "completed: the undo never ran")
+	assert.Positive(t, rec.Tasks[1].ResultSize)
+
+	stop()
+	assert.Contains(t, logs[0].String(), "upload photo.png")
+	assert.Contains(t, logs[0].String(), "thumb 512")
+	assert.Contains(t, logs[1].String(), "email to ann@example.com with s3://bucket/photo.png@64px", "results cross processes")
+	assert.NotContains(t, logs[1].String(), "undo")
+}
