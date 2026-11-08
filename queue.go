@@ -334,7 +334,8 @@ func hex4(b []byte, i int) int {
 // Enqueue pushes item and wakes idle consumers, up to one per waiting item,
 // in one round trip. It refuses (false) JSON that Redis's Lua cjson can't
 // decode though Go can: nested deeper than 1000, or with a lone UTF-16
-// surrogate escape such as \ud800 (see luaDecodable).
+// surrogate escape such as \ud800 (see luaDecodable). One rule for every
+// item, with an envelope id or not.
 func (q *Queue) Enqueue(item any) bool {
 	return q.enqueueWith(listPushWake, q.pushKeys(), item, q.wakePrefix)
 }
