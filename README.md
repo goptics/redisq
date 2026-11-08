@@ -261,6 +261,11 @@ job, _ := q.Add("https://example.com", 1)
 n, err := job.Result() // waits until any process finished it
 ```
 
+Cancel a job from any process with `CancelJob(id)`. A waiting job is dropped by the pop that would hand it out:
+record and outcome `cancelled`, never run. A running one is announced on `<key>:control`; varmq cancels its
+worker's context and finishes it with `AcknowledgeCancelled`. A job that already ended returns
+`contract.ErrJobEnded`. The mark lives in `<key>:cancelled` for 24h; with no marks a pop costs one `EXISTS` more.
+
 See [`examples/varmq`](examples/varmq) for a provider/consumer setup.
 
 ## How It Works
