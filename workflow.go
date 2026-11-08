@@ -1156,9 +1156,11 @@ func (s *workflowStore) trimIndex(ctx context.Context) {
 // in the order read, and pushes what that releases. Returns {1}.
 //
 // KEYS[#KEYS] is a key unique to this call (<base>:purge:<nonce>): the
-// applying run sets it, and a re-send of the same script (go-redis, after a
-// lost reply) finds it and returns {1}, so it never deletes and cancels
-// what the first run pushed. Only items holding '"wf"' or a backslash
+// applying run sets it (10 min) when it ends workflow items, and a re-send
+// of the same script (go-redis, after a lost reply) finds it and returns
+// {1}, so it never deletes and cancels what the first run pushed. A purge
+// without workflow items writes none: its re-send is a second DEL, as
+// before. Only items holding '"wf"' or a backslash
 // (an escaped key) are decoded.
 var wfPurgeScript = redis.NewScript(wfPrelude + envIDFn + bareFn + `if redis.call('EXISTS', KEYS[#KEYS]) == 1 then return {1} end
 local D, N = tonumber(ARGV[1]), tonumber(ARGV[2])
@@ -1196,7 +1198,7 @@ if miss then
 	for _, id in ipairs(found) do r[#r + 1] = id end
 	return r
 end
-redis.call('SET', KEYS[#KEYS], '1', 'PX', 600000)
+if #tagged > 0 then redis.call('SET', KEYS[#KEYS], '1', 'PX', 600000) end
 local del = {}
 for i = 1, D do del[i] = KEYS[i] end
 redis.call('DEL', unpack(del))
