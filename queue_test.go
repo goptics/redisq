@@ -3439,3 +3439,45 @@ func TestWorkflowGuards(t *testing.T) {
 	assert.False(t, ok)
 	q.Purge() // logs the error
 }
+
+// Purge of a queue holding items of more workflows than Lua can unpack at
+// once; listing through more same-millisecond entries than one chunk; a
+// too-deep item.
+func TestWorkflowScale(t *testing.T) {
+	e := newWFTest(t)
+	ctx := t.Context()
+
+	pipe := e.a.client.Pipeline()
+	for i := range 9000 {
+		pipe.RPush(ctx, e.a.queueKey, wfEnvelope(fmt.Sprintf("gone%d", i), "a", false, "1"))
+	}
+	_, err := pipe.Exec(ctx)
+	require.NoError(t, err)
+	require.NoError(t, e.a.purge())
+	assert.Zero(t, e.a.client.LLen(ctx, e.a.queueKey).Val())
+
+	pipe = e.a.client.Pipeline()
+	var want []string
+	for i := range 450 {
+		id := fmt.Sprintf("t%03d", i)
+		want = append(want, id)
+		pipe.HSet(ctx, e.store.key(id), "meta", `{"state":"running","created_at":5,"tasks":[]}`)
+		pipe.ZAdd(ctx, e.store.indexKey(), redis.Z{Score: 5, Member: id})
+	}
+	_, err = pipe.Exec(ctx)
+	require.NoError(t, err)
+	keys, err := e.store.WorkflowKeys(ctx, "", 0, 1000)
+	require.NoError(t, err)
+	var got []string
+	for _, k := range keys {
+		got = append(got, k.ID)
+	}
+	assert.Equal(t, want, got, "every tie once, by ID")
+	keys, err = e.store.WorkflowKeys(ctx, contract.WorkflowRunning, 440, 5)
+	require.NoError(t, err)
+	assert.Len(t, keys, 5)
+
+	p := wfPlan("deep", false, false, tk{name: "a", q: e.a, data: strings.Repeat("[", 950) + strings.Repeat("]", 950)})
+	assert.ErrorContains(t, e.store.Submit(ctx, p), "nested deeper")
+	assert.Equal(t, 951, jsonDepth([]byte(`{"s":"[{\"]","d":`+strings.Repeat("[", 950)+strings.Repeat("]", 950)+`}`)))
+}

@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/goptics/varmq/contract"
@@ -51,6 +52,7 @@ type workflowStore struct {
 	prefix      string // redisq:[<ns>:]
 	resultLimit int
 	retention   time.Duration
+	trimFrom    atomic.Int64 // trimIndex's offset past old entries still live
 }
 
 // WithWorkflowResultLimit caps a workflow task's result at n bytes (default
@@ -450,21 +452,49 @@ for _, x in ipairs(cjson.decode(m).tasks) do
 end
 return out`)
 
-// wfTargets reads the push-target queues of workflow hash key: their keys
-// (queueKeys each) and one kind letter (f, p) per queue, for wfqueues.
+// wfTarget is one push-target queue: base key and kind (fifo, prio).
+type wfTarget struct{ base, kind string }
+
+// wfTargets reads the push-target queues of each workflow hash in keys, in
+// one round trip (a pipeline of wfTargetsScript), distinct across them, in
+// order. A gone hash adds none.
 // ponytail: one read per call; cache by (id, meta hash) if it shows up.
-func wfTargets(ctx context.Context, c *redis.Client, key string) ([]string, string, error) {
-	r, err := wfTargetsScript.Run(ctx, c, []string{key}).StringSlice()
-	if err != nil {
-		return nil, "", err
+func wfTargets(ctx context.Context, c *redis.Client, keys ...string) ([]wfTarget, error) {
+	pipe := c.Pipeline()
+	cmds := make([]*redis.Cmd, len(keys))
+	for i, k := range keys {
+		cmds[i] = wfTargetsScript.Eval(ctx, pipe, []string{k}) // EVAL: no NOSCRIPT retry in a pipeline
 	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nil, err
+	}
+	var out []wfTarget
+	seen := map[string]bool{}
+	for _, cmd := range cmds {
+		r, err := cmd.StringSlice()
+		if err != nil {
+			return nil, err
+		}
+		for i := 0; i+1 < len(r); i += 2 {
+			if !seen[r[i]] {
+				seen[r[i]] = true
+				out = append(out, wfTarget{r[i], r[i+1]})
+			}
+		}
+	}
+	return out, nil
+}
+
+// targetKeys are ts's keys (queueKeys each) and one kind letter (f, p) per
+// queue, for wfqueues.
+func targetKeys(ts []wfTarget) ([]string, string) {
 	var keys []string
-	kinds := make([]byte, 0, len(r)/2)
-	for i := 0; i+1 < len(r); i += 2 {
-		keys = append(keys, queueKeys(r[i], r[i+1])...)
-		kinds = append(kinds, r[i+1][0])
+	kinds := make([]byte, 0, len(ts))
+	for _, t := range ts {
+		keys = append(keys, queueKeys(t.base, t.kind)...)
+		kinds = append(kinds, t.kind[0])
 	}
-	return keys, string(kinds), nil
+	return keys, string(kinds)
 }
 
 // errReread: a workflow script found a queue it needs missing from KEYS
@@ -541,7 +571,35 @@ func (s *workflowStore) planQueue(name, queueID string, q, item any) (*Queue, []
 	if !ok || !json.Valid(b) || len(b) == 0 || b[0] != '{' {
 		return nil, nil, fmt.Errorf("varmq: task %q: item is not a JSON envelope", name)
 	}
+	if jsonDepth(b) > maxItemDepth {
+		return nil, nil, fmt.Errorf("varmq: task %q: item nested deeper than %d", name, maxItemDepth)
+	}
 	return rq, b, nil
+}
+
+// maxItemDepth caps an item's nesting: scripts cjson.decode t:, which holds
+// an undo item two levels down, and cjson stops at 1000.
+const maxItemDepth = 900
+
+// jsonDepth is the deepest object/array nesting of valid JSON b.
+func jsonDepth(b []byte) int {
+	depth, deepest, str, esc := 0, 0, false, false
+	for _, c := range b {
+		switch {
+		case esc:
+			esc = false
+		case str:
+			esc, str = c == '\\', c != '"'
+		case c == '"':
+			str = true
+		case c == '{' || c == '[':
+			depth++
+			deepest = max(deepest, depth)
+		case c == '}' || c == ']':
+			depth--
+		}
+	}
+	return deepest
 }
 
 // Submit stores plan p and pushes its roots (spec 6.9). A stored ID is
@@ -698,10 +756,11 @@ func (q *Queue) FinishTask(ackID string, e contract.TaskEnd) ([]string, bool) {
 	wfKey := q.wf.key(e.Workflow)
 	var pushed []string
 	err := reread(func() error {
-		targets, kinds, err := wfTargets(q.ctx, q.client, wfKey)
+		ts, err := wfTargets(q.ctx, q.client, wfKey)
 		if err != nil {
 			return err
 		}
+		targets, kinds := targetKeys(ts)
 		r, err := wfFinishScript.Run(q.ctx, q.client, slices.Concat(settle, []string{wfKey}, targets),
 			append(args, kinds, e.Task, undo, string(e.Outcome), ret.Milliseconds(), q.queueKey)...).Slice()
 		if err != nil {
@@ -751,10 +810,11 @@ func (s *workflowStore) Cancel(ctx context.Context, id string, undo *bool) error
 	}
 	key := s.key(id)
 	return reread(func() error {
-		targets, kinds, err := wfTargets(ctx, s.client, key)
+		ts, err := wfTargets(ctx, s.client, key)
 		if err != nil {
 			return err
 		}
+		targets, kinds := targetKeys(ts)
 		r, err := wfCancelScript.Run(ctx, s.client, append([]string{key}, targets...), kinds, u, s.retention.Milliseconds()).Int64Slice()
 		switch {
 		case err != nil:
@@ -931,17 +991,22 @@ func (s *workflowStore) Workflows(ctx context.Context, state contract.WorkflowSt
 const listChunk = 200
 
 // WorkflowKeys is Workflows without the records (spec 7.3, Keys). It pages
-// wf:index from the client: ZREVRANGE a chunk, then its meta, so no
-// listing blocks Redis. A state filter reads at most 10000 + limit entries.
-// Entries past offset+limit with the last one's created_at are read too, so
-// ties sort by ID as varmq merges them.
+// wf:index from the client: a chunk by score cursor (ZREVRANGEBYSCORE from
+// the last score read, skipping the ties already read), then its meta, so
+// no listing blocks Redis and a Submit or trim between chunks shifts
+// nothing. A state filter reads at most 10000 + limit entries. Entries past
+// offset+limit with the last one's created_at are read too, so ties sort by
+// ID as varmq merges them.
 func (s *workflowStore) WorkflowKeys(ctx context.Context, state contract.WorkflowState, offset, limit int) ([]contract.WorkflowKey, error) {
 	offset, limit = max(offset, 0), max(limit, 0)
 	limit = min(limit, math.MaxInt-offset)
 	want := offset + limit
 	var out []contract.WorkflowKey
-	for start := int64(0); ; start += listChunk {
-		zs, err := s.client.ZRevRangeWithScores(ctx, s.indexKey(), start, start+listChunk-1).Result()
+	seen := map[string]bool{}
+	top, ties, scanned := "+inf", int64(0), 0
+	for {
+		zs, err := s.client.ZRevRangeByScoreWithScores(ctx, s.indexKey(),
+			&redis.ZRangeBy{Max: top, Min: "-inf", Offset: ties, Count: listChunk}).Result()
 		if err != nil {
 			return nil, err
 		}
@@ -955,10 +1020,15 @@ func (s *workflowStore) WorkflowKeys(ctx context.Context, state contract.Workflo
 		}
 
 		for i, z := range zs {
-			if state != "" && start+int64(i)-int64(limit) >= maxWorkflowsScan {
+			if state != "" && scanned-limit >= maxWorkflowsScan {
 				return page(out, offset, want), nil
 			}
+			scanned++
 			k := contract.WorkflowKey{ID: z.Member.(string), CreatedAt: int64(z.Score)}
+			if seen[k.ID] {
+				continue
+			}
+			seen[k.ID] = true
 			if len(out) >= want && (want == 0 || k.CreatedAt != out[len(out)-1].CreatedAt) {
 				return page(out, offset, want), nil
 			}
@@ -970,9 +1040,19 @@ func (s *workflowStore) WorkflowKeys(ctx context.Context, state contract.Workflo
 				out = append(out, k)
 			}
 		}
-		scanned := start + int64(len(zs))
-		if len(zs) < listChunk || state != "" && scanned-int64(limit) >= maxWorkflowsScan {
+		if len(zs) < listChunk {
 			return page(out, offset, want), nil
+		}
+		last := zs[len(zs)-1].Score
+		n := int64(0)
+		for i := len(zs) - 1; i >= 0 && zs[i].Score == last; i-- {
+			n++
+		}
+		next := strconv.FormatFloat(last, 'f', -1, 64)
+		if next == top {
+			ties += n
+		} else {
+			top, ties = next, n
 		}
 	}
 }
@@ -985,31 +1065,43 @@ func page(keys []contract.WorkflowKey, offset, want int) []contract.WorkflowKey 
 	return keys[min(offset, len(keys)):min(want, len(keys))]
 }
 
+// wfTrimScript drops index entry ARGV[i] (KEYS[1] the index) when its
+// hash KEYS[i + 1] is gone and its score is still at or below ARGV[#ARGV],
+// in one step, so a re-submit of the ID in between keeps its entry.
+var wfTrimScript = redis.NewScript(`local cut, n = tonumber(ARGV[#ARGV]), 0
+for i = 1, #ARGV - 1 do
+	local sc = tonumber(redis.call('ZSCORE', KEYS[1], ARGV[i]))
+	if sc and sc <= cut and redis.call('EXISTS', KEYS[i + 1]) == 0 then
+		redis.call('ZREM', KEYS[1], ARGV[i])
+		n = n + 1
+	end
+end
+return n`)
+
 // trimIndex drops index entries older than the retention whose hash is
-// gone (spec 7.3, Trim), up to 1000 per call. The spec trims by score
-// alone, but the score is created_at and the hash expires a retention
-// after finished_at: a workflow running past the retention would drop out
-// of listings while Record still finds it.
+// gone (spec 7.3, Trim), checking up to 1000 per call. The spec trims by
+// score alone, but the score is created_at and the hash expires a
+// retention after finished_at: a workflow running past the retention would
+// drop out of listings while Record still finds it. Old entries still live
+// are stepped over (trimFrom), so they don't stall the trim.
 func (s *workflowStore) trimIndex(ctx context.Context) {
 	cut := strconv.FormatInt(time.Now().Add(-s.retention).UnixMilli(), 10)
-	old, err := s.client.ZRangeByScore(ctx, s.indexKey(), &redis.ZRangeBy{Min: "-inf", Max: cut, Count: 1000}).Result()
-	if err == nil && len(old) > 0 {
-		pipe := s.client.Pipeline()
-		live := make([]*redis.IntCmd, len(old))
-		for i, id := range old {
-			live[i] = pipe.Exists(ctx, s.key(id))
+	from := s.trimFrom.Load()
+	old, err := s.client.ZRangeByScore(ctx, s.indexKey(), &redis.ZRangeBy{Min: "-inf", Max: cut, Offset: from, Count: 1000}).Result()
+	if err == nil {
+		keys, args := []string{s.indexKey()}, make([]any, 0, len(old)+1)
+		for _, id := range old {
+			keys, args = append(keys, s.key(id)), append(args, id)
 		}
-		if _, err = pipe.Exec(ctx); err == nil {
-			var gone []any
-			for i, id := range old {
-				if live[i].Val() == 0 {
-					gone = append(gone, id)
-				}
-			}
-			if len(gone) > 0 {
-				err = s.client.ZRem(ctx, s.indexKey(), gone...).Err()
-			}
+		var n int64
+		if len(old) > 0 {
+			n, err = wfTrimScript.Run(ctx, s.client, keys, append(args, cut)...).Int64()
 		}
+		live := from + int64(len(old)) - n
+		if len(old) < 1000 {
+			live = 0 // reached the end: start over next time
+		}
+		s.trimFrom.Store(live)
 	}
 	if err != nil && ctx.Err() == nil {
 		log.Printf("Error trimming workflow index: %v", err)
@@ -1055,7 +1147,11 @@ for j = 1, N do
 		Ws[ARGV[5 + j]] = W
 	end
 end
-if miss then return {2, unpack(found)} end
+if miss then
+	local r = {2}
+	for _, id in ipairs(found) do r[#r + 1] = id end
+	return r
+end
 local del = {}
 for i = 1, D do del[i] = KEYS[i] end
 redis.call('DEL', unpack(del))
@@ -1098,20 +1194,20 @@ func (q *Queue) purge() error {
 	var ids []string
 	// One try more than wfTries: the first only finds the workflows.
 	for range wfTries + 1 {
-		keys, qkeys, kinds := slices.Clone(del), []string(nil), ""
-		for _, id := range ids {
-			keys = append(keys, q.wf.key(id))
-			t, k, err := wfTargets(q.ctx, q.client, q.wf.key(id))
-			if err != nil {
-				return err
-			}
-			qkeys, kinds = append(qkeys, t...), kinds+k
+		hashes := make([]string, len(ids))
+		for i, id := range ids {
+			hashes[i] = q.wf.key(id)
 		}
+		ts, err := wfTargets(q.ctx, q.client, hashes...)
+		if err != nil {
+			return err
+		}
+		qkeys, kinds := targetKeys(ts)
 		args := []any{len(del), len(ids), kinds, q.kind(), ret.Milliseconds()}
 		for _, id := range ids {
 			args = append(args, id)
 		}
-		r, err := wfPurgeScript.Run(q.ctx, q.client, append(keys, qkeys...), args...).Slice()
+		r, err := wfPurgeScript.Run(q.ctx, q.client, slices.Concat(del, hashes, qkeys), args...).Slice()
 		if err != nil {
 			return err
 		}
