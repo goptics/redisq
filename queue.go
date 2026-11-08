@@ -629,7 +629,7 @@ end
 // KEYS: nacked, timeouts, started, attempts, stats, jobs, the state's ZSET,
 // the other state's ZSET, prio, cancelled. ARGV: ack ID, state (completed,
 // failed or cancelled), reason, most records kept, longest age (ms), result
-// JSON (” for none), outcome channel prefix (<base>:done:). :stats counts
+// JSON ("" for none), outcome channel prefix (<base>:done:). :stats counts
 // completed, else failed.
 //
 // Every finish drops the Job ID's cancel mark: the job ended.
@@ -1558,7 +1558,8 @@ func (q *Queue) getPresenceKey() string {
 // or jobs still running here run again elsewhere.
 //
 // It leaves the idle set first, so the wake for the requeued items goes to
-// another consumer, and drops outcome watchers without calling them.
+// another consumer, and drops outcome watchers without calling them (a
+// delivery already under way may still call its fn after Close returns).
 func (q *Queue) Close() error {
 	var err error
 	q.closeOnce.Do(func() {

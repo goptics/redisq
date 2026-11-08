@@ -221,7 +221,8 @@ q.AcknowledgeResult(ackID, []byte(`{"total":42}`)) // Acknowledge + result JSON;
 kept record or not. A watch subscribes that channel on the queue object's one pub/sub connection, reads the
 Job Record right after, and again each sweep (1 s), so a job that ended before the watch, or a message lost in a
 reconnect, is still reported while its record is kept. `AcknowledgeResult` stores the result raw as the record's
-`result`, big integers intact. `Close` drops watchers without calling them.
+`result`, big integers intact. `Close` drops watchers without calling them
+(a delivery already under way may still call its fn).
 
 ### Batch dequeue
 

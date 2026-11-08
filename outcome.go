@@ -54,7 +54,8 @@ func (q *Queue) donePrefix() string {
 // the id's channel is unsubscribed once it has no watchers. cancel stops an
 // early watch; fn is not called after cancel returns, except a call already
 // running. An empty id, or a closed queue, watches nothing. Close drops
-// watchers without calling fn.
+// watchers without calling fn, except a delivery already under way: its fn
+// may still run after Close returns.
 func (q *Queue) WatchOutcome(id string, fn func(contract.JobOutcome)) (cancel func()) {
 	w := &outcomeWatch{fn: fn}
 	o := &q.outcomes
@@ -111,6 +112,8 @@ func (q *Queue) unsubscribeOutcome(id string) {
 
 // deliver ends every watch of id with out: each fn runs once, on its own
 // goroutine, so a slow fn holds up neither the pub/sub reader nor the sweep.
+// The set leaves byID before the goroutines start, so a Close in between
+// can't stop them: fn may run after Close returns.
 func (q *Queue) deliver(id string, out contract.JobOutcome) {
 	o := &q.outcomes
 	o.mu.Lock()

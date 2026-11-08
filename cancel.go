@@ -129,7 +129,7 @@ func (q *Queue) cancelRequested(id string) {
 // recordFn defines, after asJSONFn, record(id, state, item, started, now,
 // attempts, err, res), a Job Record, and outcome(id, state, err, res), a
 // JobOutcome, for finishScript and dropped(). started and err may be nil
-// (no started_at; no errors, no error). res is ” or ',"result":' and the
+// (no started_at; no errors, no error). res is "" or ',"result":' and the
 // result JSON, spliced raw: a cjson round trip turns big integers into
 // doubles. Built by concatenation: numbers through string.format('%.0f'),
 // strings through cjson.encode, the item through asjson.
