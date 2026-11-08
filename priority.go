@@ -1,7 +1,6 @@
 package redisq
 
 import (
-	"log"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -92,20 +91,7 @@ func (pq *PriorityQueue) EnqueueOnce(item any, priority int, id string) bool {
 // Dequeue removes and returns the highest priority item from the queue
 // (lowest score). A consumer that finds the queue empty joins the idle set.
 func (pq *PriorityQueue) Dequeue() (any, bool) {
-	select {
-	case <-pq.ctx.Done():
-		log.Println("queue closed, cannot dequeue")
-		return nil, false
-	default:
-		// Get and remove the highest priority item (lowest score) in a single
-		// operation; the script strips the sequence prefix
-		v, ok := pq.rawPop(zsetRawPop)
-		if !ok {
-			return nil, false
-		}
-
-		return []byte(v), true
-	}
+	return pq.rawPop(zsetRawPop) // the script strips the sequence prefix
 }
 
 func (pq *PriorityQueue) Remove(item any) bool {

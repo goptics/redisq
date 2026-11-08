@@ -183,17 +183,7 @@ func (q *Queue) hbt() float64 {
 // For reliable processing with acknowledgment, use DequeueWithAck instead
 // A consumer that finds the queue empty joins the idle set.
 func (q *Queue) Dequeue() (any, bool) {
-	select {
-	case <-q.ctx.Done():
-		log.Println("queue closed, cannot dequeue")
-		return nil, false
-	default:
-		s, ok := q.rawPop(listRawPop)
-		if !ok {
-			return nil, false
-		}
-		return []byte(s), true
-	}
+	return q.rawPop(listRawPop)
 }
 
 // listRawPop and zsetRawPop are Dequeue's pop without acknowledgment: 0 while
@@ -219,10 +209,14 @@ func spent(reply any) bool {
 	return ok && n < 0
 }
 
-// rawPop runs pop and returns its item as stored. A consumer whose pop
-// finds the queue empty joins the idle set; a paused miss stays out (spec
-// 6.2).
-func (q *Queue) rawPop(pop *redis.Script) (string, bool) {
+// rawPop is Dequeue with pop: the item as stored, as []byte. A consumer
+// whose pop finds the queue empty joins the idle set; a paused miss stays
+// out (spec 6.2).
+func (q *Queue) rawPop(pop *redis.Script) (any, bool) {
+	if q.ctx.Err() != nil {
+		log.Println("queue closed, cannot dequeue")
+		return nil, false
+	}
 	g := q.pauseHooks.gen.Load()
 	reply, err := pop.Run(q.ctx, q.client, q.rawKeys, q.cancelArgs()...).Result()
 	for err == nil && spent(reply) {
@@ -232,22 +226,22 @@ func (q *Queue) rawPop(pop *redis.Script) (string, bool) {
 		if !q.Paused() {
 			q.markIdle()
 		}
-		return "", false
+		return nil, false
 	}
 
 	if err != nil {
 		log.Printf("Error dequeuing: %v", err)
-		return "", false
+		return nil, false
 	}
 
 	v, ok := reply.(string)
 	if !ok { // paused
 		q.refused(g)
-		return "", false
+		return nil, false
 	}
 
 	q.idle.Store(false)
-	return v, true
+	return []byte(v), true
 }
 
 func (q *Queue) toBytes(item any) ([]byte, error) {
