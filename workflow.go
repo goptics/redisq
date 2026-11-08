@@ -178,10 +178,15 @@ local function wfqueues(k, kinds)
 	end
 	return Q, ids
 end
+local function wfdecode(v)
+	local ok, x = pcall(cjson.decode, v or '')
+	if ok and type(x) == 'table' then return x end
+end
 local function wfload(key, ret)
 	local m = redis.call('HGET', key, 'meta')
 	if not m then return nil end
-	local W = {key = key, meta = cjson.decode(m), t = {}, tj = {}, s = {}, n = {}, u = {}, ret = ret}
+	local W = {key = key, meta = wfdecode(m), t = {}, tj = {}, s = {}, n = {}, u = {}, ret = ret}
+	if not W.meta or type(W.meta.tasks) ~= 'table' then return nil, true end
 	local order = W.meta.tasks
 	for i = 1, #order, 250 do
 		local f = {}
@@ -192,11 +197,15 @@ local function wfload(key, ret)
 		local r = redis.call('HMGET', key, unpack(f))
 		for j = 0, #f / 4 - 1 do
 			local x = order[i + j]
-			W.tj[x] = r[4 * j + 1]
-			W.t[x] = cjson.decode(r[4 * j + 1])
+			local t, u = wfdecode(r[4 * j + 1]), r[4 * j + 4]
+			if not t or type(t.queue) ~= 'string' or type(t.deps) ~= 'table' or type(t.dependents) ~= 'table' then return nil, true end
+			W.tj[x], W.t[x] = r[4 * j + 1], t
 			W.s[x] = r[4 * j + 2]
 			W.n[x] = tonumber(r[4 * j + 3])
-			if r[4 * j + 4] then W.u[x] = cjson.decode(r[4 * j + 4]) end
+			if u then
+				W.u[x] = wfdecode(u)
+				if not W.u[x] then return nil, true end
+			end
 		end
 	end
 	return W
@@ -434,7 +443,9 @@ const wfPrelude = wakeFn + deadlineFn + wfFn
 
 // wfTargetsScript returns the push-target queues of workflow KEYS[1] (spec
 // 6.10): every task's and undo's queue, once each, in task order, as {base
-// key, kind} pairs. Empty when the hash is gone. Read only.
+// key, kind} pairs. Empty when the hash is gone; a field cjson can't decode
+// adds none (the workflow scripts then take the workflow as unreadable).
+// Read only.
 var wfTargetsScript = redis.NewScript(`local m = redis.call('HGET', KEYS[1], 'meta')
 if not m then return {} end
 local seen, out = {}, {}
@@ -445,21 +456,25 @@ local function add(q, k)
 		out[#out + 1] = k
 	end
 end
-for _, x in ipairs(cjson.decode(m).tasks) do
-	local t = cjson.decode(redis.call('HGET', KEYS[1], 't:' .. x))
-	add(t.queue, t.kind)
-	if type(t.undo) == 'table' then add(t.undo.queue, t.undo.kind) end
+local ok, meta = pcall(cjson.decode, m)
+if not ok or type(meta) ~= 'table' or type(meta.tasks) ~= 'table' then return {} end
+for _, x in ipairs(meta.tasks) do
+	local okt, t = pcall(cjson.decode, redis.call('HGET', KEYS[1], 't:' .. x) or '')
+	if okt and type(t) == 'table' and type(t.queue) == 'string' and type(t.kind) == 'string' then
+		add(t.queue, t.kind)
+		if type(t.undo) == 'table' and type(t.undo.queue) == 'string' and type(t.undo.kind) == 'string' then add(t.undo.queue, t.undo.kind) end
+	end
 end
 return out`)
 
 // wfTarget is one push-target queue: base key and kind (fifo, prio).
 type wfTarget struct{ base, kind string }
 
-// wfTargets reads the push-target queues of each workflow hash in keys, in
-// one round trip (a pipeline of wfTargetsScript), distinct across them, in
-// order. A gone hash adds none.
+// wfTargetsEach reads the push-target queues of each workflow hash in
+// keys, in one round trip (a pipeline of wfTargetsScript). A gone hash has
+// none.
 // ponytail: one read per call; cache by (id, meta hash) if it shows up.
-func wfTargets(ctx context.Context, c *redis.Client, keys ...string) ([]wfTarget, error) {
+func wfTargetsEach(ctx context.Context, c *redis.Client, keys ...string) ([][]wfTarget, error) {
 	pipe := c.Pipeline()
 	cmds := make([]*redis.Cmd, len(keys))
 	for i, k := range keys {
@@ -468,21 +483,40 @@ func wfTargets(ctx context.Context, c *redis.Client, keys ...string) ([]wfTarget
 	if _, err := pipe.Exec(ctx); err != nil {
 		return nil, err
 	}
-	var out []wfTarget
-	seen := map[string]bool{}
-	for _, cmd := range cmds {
+	out := make([][]wfTarget, len(cmds))
+	for i, cmd := range cmds {
 		r, err := cmd.StringSlice()
 		if err != nil {
 			return nil, err
 		}
-		for i := 0; i+1 < len(r); i += 2 {
-			if !seen[r[i]] {
-				seen[r[i]] = true
-				out = append(out, wfTarget{r[i], r[i+1]})
-			}
+		for j := 0; j+1 < len(r); j += 2 {
+			out[i] = append(out[i], wfTarget{r[j], r[j+1]})
 		}
 	}
 	return out, nil
+}
+
+// wfTargets is wfTargetsEach merged: each queue once, in order.
+func wfTargets(ctx context.Context, c *redis.Client, keys ...string) ([]wfTarget, error) {
+	each, err := wfTargetsEach(ctx, c, keys...)
+	if err != nil {
+		return nil, err
+	}
+	return mergeTargets(each...), nil
+}
+
+func mergeTargets(each ...[]wfTarget) []wfTarget {
+	var out []wfTarget
+	seen := map[string]bool{}
+	for _, ts := range each {
+		for _, t := range ts {
+			if !seen[t.base] {
+				seen[t.base] = true
+				out = append(out, t)
+			}
+		}
+	}
+	return out
 }
 
 // targetKeys are ts's keys (queueKeys each) and one kind letter (f, p) per
@@ -538,16 +572,25 @@ type undoDef struct {
 // plan hash, fail_fast and undo_on_cancel (true, false), task names (JSON
 // array), field count F, F field/value pairs, then per root push its queue
 // base key, priority and envelope. 1 stored or same plan, 0 another plan
-// holds the ID.
+// holds the ID, 2 an item (or t: with its undo item) cjson can't decode
+// (nesting over 1000, a lone surrogate escape): stored, it would break
+// every later script of the workflow. Nothing is written then.
 var wfSubmitScript = redis.NewScript(wfPrelude + `local Q = wfqueues(3, ARGV[1])
 if redis.call('EXISTS', KEYS[1]) == 1 then
 	local ok, m = pcall(cjson.decode, redis.call('HGET', KEYS[1], 'meta') or '')
 	return (ok and type(m) == 'table' and m.hash == ARGV[3]) and 1 or 0
 end
+local f = 8 + 2 * tonumber(ARGV[7])
+for i = 8, f - 1, 2 do
+	local p = string.sub(ARGV[i], 1, 2)
+	if (p == 't:' or p == 'i:') and not wfdecode(ARGV[i + 1]) then return 2 end
+end
+for i = f + 2, #ARGV, 3 do
+	if not wfdecode(ARGV[i]) then return 2 end
+end
 local now = nowms()
 redis.call('HSET', KEYS[1], 'meta', '{"state":"running","created_at":' .. now .. ',"fail_fast":' .. ARGV[4] ..
 	',"undo_on_cancel":' .. ARGV[5] .. ',"cancelled":false,"failed":false,"hash":' .. cjson.encode(ARGV[3]) .. ',"tasks":' .. ARGV[6] .. '}')
-local f = 8 + 2 * tonumber(ARGV[7])
 for i = 8, f - 1, 2 do redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1]) end
 for i = f, #ARGV, 3 do wfpush(Q[ARGV[i]], ARGV[i + 1], ARGV[i + 2]) end
 redis.call('ZADD', KEYS[2], now, ARGV[2])
@@ -571,35 +614,7 @@ func (s *workflowStore) planQueue(name, queueID string, q, item any) (*Queue, []
 	if !ok || !json.Valid(b) || len(b) == 0 || b[0] != '{' {
 		return nil, nil, fmt.Errorf("varmq: task %q: item is not a JSON envelope", name)
 	}
-	if jsonDepth(b) > maxItemDepth {
-		return nil, nil, fmt.Errorf("varmq: task %q: item nested deeper than %d", name, maxItemDepth)
-	}
 	return rq, b, nil
-}
-
-// maxItemDepth caps an item's nesting: scripts cjson.decode t:, which holds
-// an undo item two levels down, and cjson stops at 1000.
-const maxItemDepth = 900
-
-// jsonDepth is the deepest object/array nesting of valid JSON b.
-func jsonDepth(b []byte) int {
-	depth, deepest, str, esc := 0, 0, false, false
-	for _, c := range b {
-		switch {
-		case esc:
-			esc = false
-		case str:
-			esc, str = c == '\\', c != '"'
-		case c == '"':
-			str = true
-		case c == '{' || c == '[':
-			depth++
-			deepest = max(deepest, depth)
-		case c == '}' || c == ']':
-			depth--
-		}
-	}
-	return deepest
 }
 
 // Submit stores plan p and pushes its roots (spec 6.9). A stored ID is
@@ -674,8 +689,11 @@ func (s *workflowStore) Submit(ctx context.Context, p contract.WorkflowPlan) err
 	if err != nil {
 		return err
 	}
-	if n == 0 {
+	switch n {
+	case 0:
 		return fmt.Errorf("%w: %s", contract.ErrWorkflowExists, p.ID)
+	case 2:
+		return fmt.Errorf("varmq: workflow %s: an item Redis's cjson can't decode (nesting over 1000 or a lone surrogate escape)", p.ID)
 	}
 	return nil
 }
@@ -691,16 +709,22 @@ func nonNil(v []string) []string {
 // wfFinishScript is FinishTask (spec 6.10). KEYS: settleFn's ten, the
 // workflow hash, the push-target queues. ARGV: settleFn's seven, the
 // target kinds, task, undo (1, 0), outcome, retention (ms), this queue's
-// base key. Returns {1, pushed queue IDs...}, or {2}: reread (nothing
+// base key, workflow ID. The workflow step runs only when the settled item
+// is that task's (or undo's) own: its envelope tag names the end's
+// workflow, task and undo, and t: names this queue. A gone or unreadable
+// workflow settles the item alone. Returns {1, pushed queue IDs...}, or {2}: reread (nothing
 // changed).
 var wfFinishScript = redis.NewScript(wfPrelude + settleFn + `local Q, ids = wfqueues(12, ARGV[8])
-if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 0 then return {1, unpack(ids)} end
+local item = redis.call('HGET', KEYS[1], ARGV[1])
+if not item then return {1, unpack(ids)} end
 local W = wfload(KEYS[11], ARGV[12])
 if W and not wfcovers(W, Q) then return {2} end
 if ARGV[6] ~= '' and not pcall(cjson.decode, ARGV[6]) then ARGV[6] = '' end
 settlejob()
 if not W then return {1} end
 local undo, t = ARGV[10] == '1', W.t[ARGV[9]]
+local id, e = envid(item)
+if not wftag(e, id) or e.wf ~= ARGV[14] or e.task ~= ARGV[9] or (e.undo == true) ~= undo then return {1} end
 if not t or (undo and (type(t.undo) ~= 'table' or t.undo.queue ~= ARGV[13])) or (not undo and t.queue ~= ARGV[13]) then return {1} end
 local fx = wffinish(W, ARGV[9], ARGV[11], ARGV[3], ARGV[6], undo)
 return {1, unpack(wfapply(W, fx, Q, {}, {}))}`)
@@ -762,7 +786,7 @@ func (q *Queue) FinishTask(ackID string, e contract.TaskEnd) ([]string, bool) {
 		}
 		targets, kinds := targetKeys(ts)
 		r, err := wfFinishScript.Run(q.ctx, q.client, slices.Concat(settle, []string{wfKey}, targets),
-			append(args, kinds, e.Task, undo, string(e.Outcome), ret.Milliseconds(), q.queueKey)...).Slice()
+			append(args, kinds, e.Task, undo, string(e.Outcome), ret.Milliseconds(), q.queueKey, e.Workflow)...).Slice()
 		if err != nil {
 			return err
 		}
@@ -786,7 +810,8 @@ func (q *Queue) FinishTask(ackID string, e contract.TaskEnd) ([]string, bool) {
 // queues. ARGV: target kinds, undo (empty: the workflow's; 1, 0), retention
 // (ms). {0}: not found; {2}: reread; {1}: done.
 var wfCancelScript = redis.NewScript(wfPrelude + `local Q = wfqueues(2, ARGV[1])
-local W = wfload(KEYS[1], ARGV[3])
+local W, bad = wfload(KEYS[1], ARGV[3])
+if bad then return {3} end
 if not W then return {0} end
 if not wfcovers(W, Q) then return {2} end
 local undo = W.meta.undo_on_cancel == true
@@ -823,6 +848,8 @@ func (s *workflowStore) Cancel(ctx context.Context, id string, undo *bool) error
 			return s.notFound(id)
 		case r[0] == 2:
 			return errReread
+		case r[0] == 3:
+			return fmt.Errorf("redisq: workflow %s is unreadable (a field cjson can't decode)", id)
 		}
 		return nil
 	})
@@ -1192,17 +1219,38 @@ func (q *Queue) purge() error {
 	}
 	ret := q.wf.retention
 	var ids []string
+	// Push targets per workflow ID, kept across tries: t: never changes, so
+	// only new IDs are read. ponytail: an ID that expired and was submitted
+	// again on other queues between tries fails the Purge (logged).
+	known := map[string][]wfTarget{}
 	// One try more than wfTries: the first only finds the workflows.
 	for range wfTries + 1 {
+		var fresh []string
 		hashes := make([]string, len(ids))
 		for i, id := range ids {
 			hashes[i] = q.wf.key(id)
+			if len(known[id]) == 0 { // new, or its hash was gone: it may exist now
+				fresh = append(fresh, id)
+			}
 		}
-		ts, err := wfTargets(q.ctx, q.client, hashes...)
-		if err != nil {
-			return err
+		if len(fresh) > 0 {
+			keys := make([]string, len(fresh))
+			for i, id := range fresh {
+				keys[i] = q.wf.key(id)
+			}
+			each, err := wfTargetsEach(q.ctx, q.client, keys...)
+			if err != nil {
+				return err
+			}
+			for i, id := range fresh {
+				known[id] = each[i]
+			}
 		}
-		qkeys, kinds := targetKeys(ts)
+		each := make([][]wfTarget, len(ids))
+		for i, id := range ids {
+			each[i] = known[id]
+		}
+		qkeys, kinds := targetKeys(mergeTargets(each...))
 		args := []any{len(del), len(ids), kinds, q.kind(), ret.Milliseconds()}
 		for _, id := range ids {
 			args = append(args, id)

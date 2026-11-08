@@ -203,7 +203,9 @@ Both queue types (and the deprecated `Distributed*` aliases) implement `contract
 `GET /queues/{id}/jobs`. The layout is varmq's
 [`spec/redis-storage.md`](https://github.com/goptics/varmq/blob/main/spec/redis-storage.md) 1.0.0. Retention is set
 per queue object, so give every instance of a queue the same values. Records hold a copy of each payload, so
-retention bounds Redis memory. `Purge` deletes all of a queue's jobs, records and counters.
+retention bounds Redis memory. `Purge` deletes all of a queue's jobs, records and counters; a purged workflow task
+ends `cancelled`, so its workflow goes on. Purge decodes every queued and processing item inside Redis to find
+workflow tasks, so a queue of millions blocks Redis while it runs.
 
 ### Job outcomes
 
@@ -264,12 +266,33 @@ n, err := job.Result() // waits until any process finished it
 ```
 
 Cancel a job from any process with `CancelJob(id)`. A waiting job is dropped by the pop that would hand it out:
-record and outcome `cancelled`, never run. A running one is announced on `<key>:control`; varmq cancels its
+record and outcome `cancelled`, never run. A waiting workflow task is the exception: it is handed out and runs unless
+its workflow is cancelled, so cancel it with the workflow. A running one is announced on `<key>:control`; varmq cancels its
 worker's context and finishes it with `AcknowledgeCancelled`. A job that already ended returns
 `contract.ErrJobEnded`. Each mark lives 24h in the sorted set `<key>:cancelled` (score: its expiry); with no marks a pop costs one
 `EXISTS` more. Any id can be marked, so authorize and rate-limit untrusted callers of `CancelJob`.
 
 See [`examples/varmq`](examples/varmq) for a provider/consumer setup.
+
+### Workflows
+
+A varmq workflow is a DAG of jobs across queues. Every redisq queue can carry its tasks, and `WorkflowStore()` on any
+queue is the store of its Redis and namespace:
+
+```go
+upload, thumb := qs.NewQueue("upload"), qs.NewPriorityQueue("thumb")
+
+wf := varmq.NewWorkflow(upload.WorkflowStore(), varmq.WithWorkflowID("upload-1"))
+up := wf.Add("upload", varmq.NewResultQueue[string, string](upload), "photo.png")
+wf.Add("thumb", varmq.NewResultPriorityQueue[int, string](thumb), 64).After(up)
+err := wf.Submit(ctx) // workers in any process run it; wf.WaitContext(ctx) for the end
+```
+
+A task finishes in one script that settles its job and pushes the tasks it releases, so a crash never leaves a
+workflow between the two. The layout is varmq's `spec/redis-storage.md` 1.5.0 (`redisq:[ns:]wf:<id>`,
+`redisq:[ns:]wf:index`). `WithWorkflowResultLimit` (default 64 KiB) and `WithWorkflowRetention` (default 7 days) set
+the store. Every consumer of a queue that carries workflow tasks must run this version. Anyone who can push to a
+task's queue can push a copy of that task, so treat push access as trusted. See [`examples/workflow`](examples/workflow).
 
 ## How It Works
 
@@ -353,7 +376,8 @@ once.
   connection (count them against Redis's `maxclients`); about once a second per key it also counts subscribers
   (`PUBSUB NUMSUB`) for the consumers holding jobs. Each pop that hands out jobs also
   writes the heartbeat. A dead consumer or a `Close` reads every pending ack ID once.
-- **One Redis server.** `New` uses a single-node client; Redis Cluster isn't supported.
+- **One Redis server.** `New` uses a single-node client; Redis Cluster isn't supported. Workflow keys carry no
+  hashtag, so a workflow's queues must share one Redis anyway.
 
 ## Delivery Guarantees
 
