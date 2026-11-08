@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/goptics/varmq/contract"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -92,7 +93,7 @@ func assertDropped(t *testing.T, q *Queue, id string) {
 	assert.JSONEq(t, envelope(id, `1`), string(mustJSON(t, r["item"])))
 	_, err := q.client.ZScore(ctx, q.getFailedKey(), id).Result()
 	assert.NoError(t, err, "indexed in :failed")
-	assert.False(t, q.client.SIsMember(ctx, q.getCancelledKey(), id).Val(), "mark gone")
+	assert.False(t, marked(t, q, id), "mark gone")
 	s := stats(t, q)
 	assert.Zero(t, s.Totals.Completed)
 	assert.Zero(t, s.Totals.Failed)
@@ -170,7 +171,7 @@ func TestCancelBatchRefills(t *testing.T) {
 		assert.Equal(t, []string{"b", "d", "e"}, got)
 		assertDropped(t, c.cons, "a")
 		assertDropped(t, c.cons, "c")
-		assert.Zero(t, c.cons.client.Exists(t.Context(), c.cons.getCancelledKey()).Val(), "last SREM drops the set")
+		assert.Zero(t, c.cons.client.Exists(t.Context(), c.cons.getCancelledKey()).Val(), "last ZREM drops the key")
 		assert.Equal(t, 3, c.cons.GetNackedItemsCount())
 
 		if c.cons.isPriority {
@@ -231,12 +232,15 @@ func TestCancelEndedAndUnknown(t *testing.T) {
 		_, ok, _ := ackPopOf(c.cons)
 		require.False(t, ok)
 		assert.ErrorIs(t, c.prod.CancelJob("gone"), contract.ErrJobEnded)
-		assert.False(t, c.cons.client.SIsMember(ctx, c.cons.getCancelledKey(), "gone").Val(), "an ended job is not marked")
+		assert.False(t, marked(t, c.cons, "gone"), "an ended job is not marked")
 
 		require.NoError(t, c.prod.CancelJob("nobody"))
-		assert.True(t, c.cons.client.SIsMember(ctx, c.cons.getCancelledKey(), "nobody").Val())
+		assert.True(t, marked(t, c.cons, "nobody"))
+		exp := c.cons.client.ZScore(ctx, c.cons.getCancelledKey(), "nobody").Val()
+		now := float64(c.cons.client.Time(ctx).Val().UnixMilli())
+		assert.InDelta(t, now+float64(cancelTTL.Milliseconds()), exp, 5000, "score: expiry in ms")
 		ttl := c.cons.client.PTTL(ctx, c.cons.getCancelledKey()).Val()
-		assert.Greater(t, ttl, 23*time.Hour)
+		assert.Greater(t, ttl, 23*time.Hour, "backstop TTL")
 
 		assert.Error(t, c.prod.CancelJob(""))
 	})
@@ -276,7 +280,7 @@ func TestCancelRunningJob(t *testing.T) {
 		_, err := c.cons.client.ZScore(ctx, c.cons.getFailedKey(), "r").Result()
 		assert.NoError(t, err, "indexed in :failed")
 		assert.Zero(t, c.cons.GetNackedItemsCount())
-		assert.False(t, c.cons.client.SIsMember(ctx, c.cons.getCancelledKey(), "r").Val())
+		assert.False(t, marked(t, c.cons, "r"))
 		assert.EqualValues(t, 1, stats(t, c.cons).Totals.Failed, "counted as Reject")
 		assert.ErrorIs(t, c.prod.CancelJob("r"), contract.ErrJobEnded)
 
@@ -303,7 +307,7 @@ func TestCancelFinishClearsMark(t *testing.T) {
 			ackID := popAck(t, c.cons)
 			require.NoError(t, c.prod.CancelJob("m"))
 			require.True(t, finish(ackID))
-			assert.False(t, c.cons.client.SIsMember(ctx, c.cons.getCancelledKey(), "m").Val())
+			assert.False(t, marked(t, c.cons, "m"))
 			require.NoError(t, c.cons.client.HDel(ctx, c.cons.getJobsKey(), "m").Err()) // next round can mark it
 		}
 	})
@@ -330,7 +334,7 @@ func TestCancelReAddAndPurge(t *testing.T) {
 		ctx := t.Context()
 		require.NoError(t, c.prod.CancelJob("n"))
 		require.True(t, c.pushOnce(envelope("n", `1`), "n"))
-		assert.False(t, c.cons.client.SIsMember(ctx, c.cons.getCancelledKey(), "n").Val())
+		assert.False(t, marked(t, c.cons, "n"))
 		v, ok, _ := ackPopOf(c.cons)
 		require.True(t, ok)
 		assert.Equal(t, "n", envID(t, v))
@@ -339,11 +343,49 @@ func TestCancelReAddAndPurge(t *testing.T) {
 		require.True(t, c.pushOnce(envelope("p", `1`), "p"))
 		require.NoError(t, c.prod.CancelJob("p"))
 		require.True(t, c.pushOnce(envelope("p", `2`), "p")) // dedupe hit: mark stays
-		assert.True(t, c.cons.client.SIsMember(ctx, c.cons.getCancelledKey(), "p").Val())
+		assert.True(t, marked(t, c.cons, "p"))
 
 		c.prod.Purge()
 		assert.Zero(t, c.cons.client.Exists(ctx, c.cons.getCancelledKey()).Val())
 	})
+}
+
+// An expired mark counts as none: the pop hands the item out and removes
+// the mark. CancelJob and the sweep prune expired marks.
+func TestCancelExpiredMark(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		ctx := t.Context()
+		key := c.cons.getCancelledKey()
+		past := float64(c.cons.client.Time(ctx).Val().UnixMilli() - 1000)
+		require.NoError(t, c.cons.client.ZAdd(ctx, key, redis.Z{Score: past, Member: "e"}).Err())
+		require.True(t, c.push(envelope("e", `1`), 1))
+		v, ok, _ := ackPopOf(c.cons)
+		require.True(t, ok)
+		assert.Equal(t, "e", envID(t, v))
+		assert.False(t, c.cons.client.HExists(ctx, c.cons.getJobsKey(), "e").Val(), "no cancelled record")
+		assert.Zero(t, c.cons.client.Exists(ctx, key).Val(), "the pop removed the expired mark")
+
+		require.NoError(t, c.cons.client.ZAdd(ctx, key, redis.Z{Score: past, Member: "old"}).Err())
+		require.NoError(t, c.prod.CancelJob("new"))
+		assert.Equal(t, []string{"new"}, c.cons.client.ZRange(ctx, key, 0, -1).Val(), "CancelJob prunes")
+
+		require.NoError(t, c.cons.client.ZAdd(ctx, key, redis.Z{Score: past, Member: "old"}).Err())
+		assert.Eventually(t, func() bool {
+			return c.cons.client.ZScore(ctx, key, "old").Err() == redis.Nil
+		}, 3*time.Second, 50*time.Millisecond, "the sweep prunes")
+		assert.True(t, marked(t, c.cons, "new"), "a live mark stays")
+	})
+}
+
+// marked reports whether q's cancel marks hold id.
+func marked(t *testing.T, q *Queue, id string) bool {
+	t.Helper()
+	err := q.client.ZScore(t.Context(), q.getCancelledKey(), id).Err()
+	if err == redis.Nil {
+		return false
+	}
+	require.NoError(t, err)
+	return true
 }
 
 // envID is the envelope id of popped item v.

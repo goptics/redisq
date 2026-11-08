@@ -109,7 +109,7 @@ func TestPauseGuardBeforeGate(t *testing.T) {
 	// One batch call, run twice with the same reservation, a Pause between.
 	resv := fmt.Sprintf("%020d", q.ackSeq.Add(1))
 	run := func() []any {
-		r, err := listAckPop.Run(q.ctx, q.client, q.popKeys(), 2, q.vt(), q.ackPrefix, resv, "", 2, q.hbt(), q.ackPrefix).Slice()
+		r, err := listAckPop.Run(q.ctx, q.client, q.popKeys(), append([]any{2, q.vt(), q.ackPrefix, resv, "", 2}, append(q.cancelArgs(), q.hbt(), q.ackPrefix)...)...).Slice()
 		require.NoError(t, err)
 		return r
 	}
@@ -124,7 +124,7 @@ func TestPauseGuardBeforeGate(t *testing.T) {
 	ackID := q.ackIDOf(fmt.Sprintf("%020d", q.ackSeq.Add(1)), 1)
 	require.NoError(t, q.Resume())
 	one := func() any {
-		v, err := listAckPopOne.Run(q.ctx, q.client, q.popKeys(), q.vt(), ackID, "", q.hbt(), q.ackPrefix).Result()
+		v, err := listAckPopOne.Run(q.ctx, q.client, q.popKeys(), append([]any{q.vt(), ackID, ""}, append(q.cancelArgs(), q.hbt(), q.ackPrefix)...)...).Result()
 		require.NoError(t, err)
 		return v
 	}

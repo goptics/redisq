@@ -10,7 +10,8 @@ import (
 )
 
 // Job cancel (spec/redis-storage.md 1.7.0, 6.14). CancelJob marks a Job ID
-// in <base>:cancelled and announces it on <base>:control. Pops drop a marked
+// in ZSET <base>:cancelled (score: when the mark expires, ms) and announces
+// it on <base>:control. Pops drop a marked
 // waiting job (cancelFn) with record and outcome cancelled; consumers learn
 // of a running one (OnCancel) and finish it with AcknowledgeCancelled. Any
 // finish or re-add drops the mark. Cooperative: storage never stops a
@@ -25,8 +26,8 @@ var (
 	_ contract.CancelAcknowledgeable = (*PriorityQueue)(nil)
 )
 
-// cancelTTL is how long a cancel mark lasts; each CancelJob renews it for
-// the whole set.
+// cancelTTL is how long a cancel mark lasts. Each mark has its own expiry
+// (its score); the key's PEXPIRE is only a backstop.
 const cancelTTL = 24 * time.Hour
 
 // cancelPrefix starts a cancel message on <base>:control.
@@ -36,14 +37,16 @@ var errEmptyJobID = errors.New("redisq: empty job id")
 
 // cancelJobScript is CancelJob. KEYS: jobs, cancelled, control. ARGV: job
 // id, mark TTL (ms). Returns 0, changing nothing, when the job's record
-// shows it ended; else marks it, renews the set's TTL, announces it, and
-// returns 1.
-var cancelJobScript = redis.NewScript(`local rec = redis.call('HGET', KEYS[1], ARGV[1])
+// shows it ended; else prunes expired marks, marks it until now + TTL
+// (Redis's clock), sets the key's backstop TTL, announces it, and returns 1.
+var cancelJobScript = redis.NewScript(deadlineFn + `local rec = redis.call('HGET', KEYS[1], ARGV[1])
 if rec then
 	local ok, r = pcall(cjson.decode, rec)
 	if ok and type(r) == 'table' and (r.state == 'completed' or r.state == 'failed' or r.state == 'cancelled') then return 0 end
 end
-redis.call('SADD', KEYS[2], ARGV[1])
+local now = tonumber(nowms())
+redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', string.format('%.0f', now))
+redis.call('ZADD', KEYS[2], string.format('%.0f', now + tonumber(ARGV[2])), ARGV[1])
 redis.call('PEXPIRE', KEYS[2], ARGV[2])
 redis.call('PUBLISH', KEYS[3], 'cancel:' .. ARGV[1])
 return 1`)
@@ -171,8 +174,9 @@ func (q *Queue) cancelLoop() {
 // channel prefix follows.
 //
 // cancelling() reports whether any job is marked, so a pop without marks
-// costs one EXISTS. dropped(v) drops item v if its envelope id is marked (an
-// item without one is never dropped): it clears the mark and the attempts
+// costs one EXISTS. dropped(v) drops item v if its envelope id has a mark
+// that has not expired (an item without an id is never dropped; an expired
+// mark is removed and counts as none): it clears the mark and the attempts
 // count, writes a record with state cancelled (no started_at, no errors),
 // indexed in :failed under the failed retention, publishes outcome
 // cancelled, and returns true. It counts nothing in :stats. The item is a
@@ -182,10 +186,14 @@ func cancelFn(k, a string) string {
 local function cancelling() return redis.call('EXISTS', KEYS[ck]) == 1 end
 local function dropped(v)
 	local id = envid(v)
-	if id == '' or redis.call('SREM', KEYS[ck], id) == 0 then return false end
+	if id == '' then return false end
+	local exp = redis.call('ZSCORE', KEYS[ck], id)
+	if not exp then return false end
+	redis.call('ZREM', KEYS[ck], id)
+	local now = tonumber(nowms())
+	if tonumber(exp) <= now then return false end
 	local attempts = 1 + (tonumber(redis.call('HGET', KEYS[ck + 4], id)) or 0)
 	redis.call('HDEL', KEYS[ck + 4], id)
-	local now = tonumber(nowms())
 	local keep, age = tonumber(ARGV[ca]), tonumber(ARGV[ca + 1])
 	redis.call('ZREM', KEYS[ck + 2], id)
 	if keep > 0 and age > 0 then

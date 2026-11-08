@@ -969,8 +969,7 @@ func TestScriptsUnderVerbatimReplication(t *testing.T) {
 			require.NoError(t, q.client.ZAdd(ctx, hb, redis.Z{Score: 1, Member: "dead"}, redis.Z{Score: now + 60, Member: "gone"}).Err())
 			require.NoError(t, q.client.ZAdd(ctx, pres, redis.Z{Score: now - 60, Member: "gone"}).Err())
 			require.NoError(t, q.client.HSet(ctx, q.getNackedItemKey(), "dead:1:0001", "x", "gone:1:0001", "z", q.ackPrefix+":1:0001", "y").Err())
-			keys := append(q.requeueKeys(), hb, hb+":clock", pres, q.getPausedKey())
-			require.NoError(t, q.tickScript.Run(ctx, q.client, keys, q.ackPrefix, q.hbt(), sweepGap.Seconds(), q.queueKey+":wake:", presenceGrace.Seconds()).Err())
+			require.NoError(t, q.tickScript.Run(ctx, q.client, q.tickKeys(), q.ackPrefix, q.hbt(), sweepGap.Seconds(), q.queueKey+":wake:", presenceGrace.Seconds()).Err())
 			require.NoError(t, q.release())
 			// The queue's own sweep may have moved the clock on in between;
 			// its next one counts then.

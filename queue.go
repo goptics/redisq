@@ -301,7 +301,7 @@ redis.call('SET', KEYS[#KEYS], '1', 'PX', ARGV[#ARGV])
 redis.call('HDEL', KEYS[#KEYS - 3], ARGV[#ARGV - 1])
 redis.call('ZREM', KEYS[#KEYS - 2], ARGV[#ARGV - 1])
 redis.call('ZREM', KEYS[#KEYS - 1], ARGV[#ARGV - 1])
-redis.call('SREM', KEYS[#KEYS - 4], ARGV[#ARGV - 1])
+redis.call('ZREM', KEYS[#KEYS - 4], ARGV[#ARGV - 1])
 return r`
 }
 
@@ -563,7 +563,7 @@ if id ~= '' then
 else
 	id = ARGV[1]
 end
-redis.call('SREM', KEYS[10], id)
+redis.call('ZREM', KEYS[10], id)
 redis.call('HINCRBY', KEYS[5], ARGV[8], 1)
 local now = tonumber(nowms())
 local keep, age = tonumber(ARGV[4]), tonumber(ARGV[5])
@@ -1149,7 +1149,8 @@ end
 )
 
 // tickBody is the sweep. KEYS end with the heartbeats, their clock, the
-// presence ZSET and :paused. It requeues pending items whose visibility deadline
+// presence ZSET, :paused and :cancelled (see tickKeys). It prunes expired
+// cancel marks (spec 6.14), requeues pending items whose visibility deadline
 // is past Redis's clock, renews heartbeat ARGV[1] by ARGV[2] seconds (drops
 // it when that is 0; only a pop adds one), and requeues the items of owners
 // whose heartbeat ran out or who are gone (below). ARGV[3] is the longest
@@ -1177,10 +1178,11 @@ end
 // ponytail: a dead owner, like a Close (releaseBody), costs a read of every
 // pending ID (HKEYS); index pending items by owner if pending runs to millions.
 // The presence count covers 1000 owners per sweep; the rest keep heartbeats.
-const tickBody = `local hb, clock, pres = KEYS[#KEYS - 3], KEYS[#KEYS - 2], KEYS[#KEYS - 1]
-local paused = redis.call('EXISTS', KEYS[#KEYS])
+const tickBody = `local hb, clock, pres = KEYS[#KEYS - 4], KEYS[#KEYS - 3], KEYS[#KEYS - 2]
+local paused = redis.call('EXISTS', KEYS[#KEYS - 1])
 local t = redis.call('TIME')
 local now = tonumber(t[1]) + tonumber(t[2]) / 1e6
+redis.call('ZREMRANGEBYSCORE', KEYS[#KEYS], '-inf', string.format('%.0f', now * 1000))
 local last = tonumber(redis.call('GET', clock))
 if last and now - last > tonumber(ARGV[3]) then
 	for _, m in ipairs(redis.call('ZRANGE', hb, 0, -1)) do redis.call('ZINCRBY', hb, now - last, m) end
@@ -1305,7 +1307,7 @@ func (q *Queue) sweep() {
 // tick runs the sweep script once, and returns false once the client is
 // closed.
 func (q *Queue) tick() bool {
-	keys := append(q.requeueKeys(), q.getHeartbeatKey(), q.getHeartbeatKey()+":clock", q.getPresenceKey(), q.getPausedKey())
+	keys := q.tickKeys()
 	wakePrefix := q.getWakePrefix()
 	g := q.pauseHooks.gen.Load()
 	r, err := q.tickScript.Run(q.ctx, q.client, keys, q.ackPrefix, q.hbt(), sweepGap.Seconds(), wakePrefix, presenceGrace.Seconds()).Int64Slice()
@@ -1326,6 +1328,11 @@ func (q *Queue) tick() bool {
 	q.observe(g, r[2] == 1)
 	q.requeued(r[0])
 	return true
+}
+
+// tickKeys are the sweep script's keys (see tickBody).
+func (q *Queue) tickKeys() []string {
+	return append(q.requeueKeys(), q.getHeartbeatKey(), q.getHeartbeatKey()+":clock", q.getPresenceKey(), q.getPausedKey(), q.getCancelledKey())
 }
 
 // requeued calls onRequeue after n items went back to the queue.
