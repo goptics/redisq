@@ -344,6 +344,43 @@ func TestCancelRunningJob(t *testing.T) {
 	})
 }
 
+// A cancel message reaches OnCancel only while its job's mark is live: a
+// stale one (mark gone or expired) is dropped.
+func TestCancelStaleMessageDropped(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		ctx := t.Context()
+		var mu sync.Mutex
+		var seen []string
+		stop := c.cons.OnCancel(func(id string) {
+			mu.Lock()
+			seen = append(seen, id)
+			mu.Unlock()
+		})
+		defer stop()
+		calls := func() []string { mu.Lock(); defer mu.Unlock(); return append([]string(nil), seen...) }
+		publish := func(id string) {
+			require.NoError(t, c.prod.client.Publish(ctx, c.prod.getControlKey(), cancelPrefix+id).Err())
+		}
+		now := c.cons.client.Time(ctx).Val().UnixMilli()
+		mark := func(id string, exp int64) {
+			require.NoError(t, c.cons.client.ZAdd(ctx, c.cons.getCancelledKey(), redis.Z{Score: float64(exp), Member: id}).Err())
+		}
+
+		mark("x", now+time.Hour.Milliseconds())
+		publish("x") // first, so the subscription is known live
+		require.Eventually(t, func() bool { return len(calls()) == 1 }, time.Second, 5*time.Millisecond)
+
+		mark("old", now-1)
+		publish("none")
+		publish("old")
+		mark("y", now+time.Hour.Milliseconds())
+		publish("y")
+		require.Eventually(t, func() bool { return len(calls()) == 2 }, time.Second, 5*time.Millisecond)
+		assert.Never(t, func() bool { return len(calls()) > 2 }, 200*time.Millisecond, 10*time.Millisecond, "stale: no call")
+		assert.Equal(t, []string{"x", "y"}, calls())
+	})
+}
+
 // A job that ends another way despite its mark drops the mark.
 func TestCancelFinishClearsMark(t *testing.T) {
 	eachCancelCase(t, func(t *testing.T, c cancelQueues) {

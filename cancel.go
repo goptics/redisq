@@ -2,6 +2,7 @@ package redisq
 
 import (
 	"errors"
+	"log"
 	"strconv"
 	"time"
 
@@ -89,20 +90,42 @@ func (q *Queue) AcknowledgeCancelled(ackID, reason string) bool {
 // (from any process, this one included), until stop. Each call runs on its
 // own goroutine, off the pub/sub reader, in no set order; one already
 // started may still run after stop returns. A request whose message was
-// lost (a reconnect) is not repeated.
+// lost (a reconnect) is not repeated; one whose mark is gone by the time it
+// arrives (the job finished or was re-added) is dropped.
 func (q *Queue) OnCancel(fn func(jobID string)) (stop func()) {
 	return q.cancelHooks.add(fn)
 }
 
+// cancelLiveScript reports 1 when job ARGV[1] has a cancel mark in
+// KEYS[1], :cancelled, that has not expired (Redis's clock, as the pops).
+var cancelLiveScript = redis.NewScript(deadlineFn + `local exp = redis.call('ZSCORE', KEYS[1], ARGV[1])
+if exp and tonumber(exp) > tonumber(nowms()) then return 1 end
+return 0`)
+
 // cancelRequested passes job id to the OnCancel callbacks; called from the
-// pub/sub reader.
+// pub/sub reader. Off the reader, it first checks id's mark: a finish or
+// re-add drops it, so a message that arrives after its job ended (stale)
+// reaches no callback, nor the job's next run under a reused id (narrows
+// the window; it does not close it). A failed check calls them anyway.
 func (q *Queue) cancelRequested(id string) {
-	if id == "" {
+	hooks := q.cancelHooks.snapshot()
+	if id == "" || len(hooks) == 0 {
 		return
 	}
-	for _, fn := range q.cancelHooks.snapshot() {
-		go fn(id)
-	}
+	go func() {
+		live, err := cancelLiveScript.Run(q.ctx, q.client, []string{q.getCancelledKey()}, id).Int()
+		if err != nil {
+			if q.ctx.Err() != nil {
+				return
+			}
+			log.Printf("Error checking cancel mark of %s: %v", id, err)
+		} else if live == 0 {
+			return
+		}
+		for _, fn := range hooks {
+			go fn(id)
+		}
+	}()
 }
 
 // recordFn defines, after asJSONFn, record(id, state, item, started, now,
