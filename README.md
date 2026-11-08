@@ -251,11 +251,15 @@ for {
 redisq implements varmq's queue interfaces, outcome watching included:
 
 ```go
-rq := qs.NewPriorityQueue("jobs")
-dq := varmq.NewDistributedPriorityQueue[[]string](rq)
-defer dq.Close()
+// consumer process
+w := varmq.NewResultWorker(func(j varmq.Job[string]) (int, error) { return len(j.Data()), nil })
+w.WithPriorityQueue(qs.NewPriorityQueue("jobs"))
 
-dq.Add([]string{"https://example.com"}, 1)
+// producer process
+q := varmq.NewPriorityQueue[string](qs.NewPriorityQueue("jobs"))
+job, _ := q.Add("https://example.com", 1)
+o, err := job.Outcome(ctx)          // ends when any process finished it
+n, err := varmq.DecodeResult[int](o) // the worker's result
 ```
 
 See [`examples/varmq`](examples/varmq) for a provider/consumer setup.
