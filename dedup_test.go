@@ -147,10 +147,25 @@ func TestEnqueueOnceWindow(t *testing.T) {
 			assert.True(t, push("a", "w"))
 			assert.Equal(t, 3, size())
 
+			ctx := context.Background()
+			pttl := func(id string) time.Duration { return q.client.PTTL(ctx, q.queueKey+":dedup:"+id).Val() }
+			q.SetDedupWindow(time.Minute)
+			assert.True(t, push("a", "k"))
+			before := pttl("k")
+			require.Positive(t, before)
 			q.SetDedupWindow(0)
+			assert.True(t, push("a", "k"), "no window: a remembered id pushes")
+			assert.Equal(t, 5, size())
+			assert.LessOrEqual(t, pttl("k"), before, "nor refreshes the id")
+
 			assert.True(t, push("a", "z"))
 			assert.True(t, push("a", "z"))
-			assert.Equal(t, 5, size(), "no window: no dedupe")
+			assert.Equal(t, 7, size(), "no window: no dedupe")
+			q.SetDedupWindow(-time.Second)
+			assert.True(t, push("a", "n"))
+			assert.True(t, push("a", "n"))
+			assert.Equal(t, 9, size(), "a negative window: no dedupe")
+			assert.Zero(t, q.client.Exists(ctx, q.queueKey+":dedup:z", q.queueKey+":dedup:n").Val(), "no id key")
 		})
 	}
 }

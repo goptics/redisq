@@ -1645,6 +1645,10 @@ func TestLuaDecodable(t *testing.T) {
 		{"text", "raw bytes", true},
 		{"text, deep", strings.Repeat("[", 1001), true},
 		{"text, lone escape", `say "\ud800`, true},
+		{"wide, shallow", `[` + strings.Repeat(`{"a":[1]},`, 2000) + `{}]`, true},
+		{"min pair", `"\ud800\udc00"`, true},
+		{"max pair", `"\udbff\udfff"`, true},
+		{"escaped quote, brackets in a string", `{"data":"\"` + strings.Repeat("[", 1001) + `"}`, true},
 		{"text, bad hex", `"\uzz00"`, true},
 		{"text, cut escape", `"\u12`, true},
 	}
@@ -1680,6 +1684,7 @@ func TestEnqueueRefusesLuaUndecodable(t *testing.T) {
 		_, ok, _ := ackPopOf(c.cons)
 		assert.False(t, ok, "the gate read its id")
 		assert.Equal(t, "cancelled", record(t, c.cons, "k")["state"])
+		assert.True(t, c.push(`{"id":"w","data":[`+strings.Repeat(`{"a":[1]},`, 2000)+`{}]}`, 1), "wide, shallow")
 	})
 }
 
@@ -1925,6 +1930,7 @@ func TestEnqueueOnceNoWindowReAdd(t *testing.T) {
 		require.True(t, c.cons.Acknowledge(ackID))
 
 		require.True(t, c.pushOnce(envelope("m", `2`), "m")) // re-add of a completed id
+		assert.Zero(t, c.prod.client.Exists(t.Context(), c.prod.queueKey+":dedup:m").Val(), "no id key")
 		assert.False(t, c.cons.client.HExists(t.Context(), c.cons.getJobsKey(), "m").Val(), "old record gone")
 		got, _ := watch(c.prod, "m")
 		c.prod.catchUp([]string{"m"})
@@ -2250,6 +2256,11 @@ func TestWatchOutcomeSweepCatchUp(t *testing.T) {
 		o := outcomeWithin(t, got, time.Second)
 		assert.Equal(t, `7`, string(o.Result))
 		watchGone(t, prod, "j6")
+
+		addWatch(prod, "j6b", func(o contract.JobOutcome) { got <- o }) // left to the 1s sweep loop
+		rec = `{"id":"j6b","state":"failed","item":1,"finished_at":1,"attempts":1}`
+		require.NoError(t, cons.client.HSet(t.Context(), cons.getJobsKey(), "j6b", rec).Err())
+		assert.Equal(t, contract.JobOutcome{ID: "j6b", State: contract.JobFailed}, outcomeWithin(t, got, 3*time.Second))
 	})
 }
 
