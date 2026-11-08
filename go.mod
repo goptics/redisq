@@ -3,7 +3,7 @@ module github.com/goptics/redisq
 go 1.26.0
 
 require (
-	github.com/goptics/varmq/contract v0.4.1-0.20261108070952-7e587c6e8070
+	github.com/goptics/varmq/contract v0.4.1-0.20261108085122-83c03661f868
 	github.com/ory/dockertest/v3 v3.12.0
 	github.com/redis/go-redis/v9 v9.23.0
 	github.com/stretchr/testify v1.12.1
@@ -40,5 +40,3 @@ require (
 	golang.org/x/sys v0.48.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
-
-replace github.com/goptics/varmq/contract => ../../../../varmq/.claude/worktrees/unified-queues/contract
