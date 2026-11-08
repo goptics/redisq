@@ -1628,16 +1628,16 @@ func TestLuaDecodable(t *testing.T) {
 		want     bool
 	}{
 		{"plain", envelope("a", `1`), true},
-		{"pair", `{"id":"a","data":"😀"}`, true},
-		{"upper pair", `{"data":"😀"}`, true},
+		{"pair", `{"id":"a","data":"\ud83d\ude00"}`, true},
+		{"upper pair", `{"data":"\uD83D\uDE00"}`, true},
 		{"escaped backslash", `{"data":"\\ud800"}`, true},
-		{"bmp", `{"data":"é￿\"\n"}`, true},
+		{"bmp", `{"data":"\u00e9\uffff\"\n"}`, true},
 		{"depth 1000", deep(1000), true},
 		{"brackets in a string", `{"data":"` + strings.Repeat("[", 1001) + `"}`, true},
 		{"lone high", `{"id":"a","data":"\ud800"}`, false},
 		{"lone high, top level", `"\udbff"`, false},
 		{"high, then text", `{"data":"\ud800x"}`, false},
-		{"high, then bmp", `{"data":"\ud800A"}`, false},
+		{"high, then bmp", `{"data":"\ud800\u0041"}`, false},
 		{"high, high", `["\ud800\ud800"]`, false},
 		{"lone low", `{"data":"\udc00"}`, false},
 		{"upper lone low", `{"data":"\uDFFF"}`, false},
@@ -1645,6 +1645,8 @@ func TestLuaDecodable(t *testing.T) {
 		{"text", "raw bytes", true},
 		{"text, deep", strings.Repeat("[", 1001), true},
 		{"text, lone escape", `say "\ud800`, true},
+		{"text, bad hex", `"\uzz00"`, true},
+		{"text, cut escape", `"\u12`, true},
 	}
 	q, cleanup := setupTestQueue(t)
 	defer cleanup()
