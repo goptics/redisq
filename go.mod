@@ -3,7 +3,7 @@ module github.com/goptics/redisq
 go 1.26.0
 
 require (
-	github.com/goptics/varmq/contract v0.4.1-0.20261108085122-83c03661f868
+	github.com/goptics/varmq/contract v0.4.1-0.20261108093111-86f2d4b8dc98
 	github.com/ory/dockertest/v3 v3.12.0
 	github.com/redis/go-redis/v9 v9.23.0
 	github.com/stretchr/testify v1.12.1
