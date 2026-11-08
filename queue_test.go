@@ -3380,3 +3380,62 @@ func TestWorkflowTwoProcesses(t *testing.T) {
 	assert.Contains(t, logs[1].String(), "email to ann@example.com with s3://bucket/photo.png@64px", "results cross processes")
 	assert.NotContains(t, logs[1].String(), "undo")
 }
+
+// Guards: bad options, bad IDs, unknown outcomes, closed queues, queues
+// without a store, and errors from a closed client.
+func TestWorkflowGuards(t *testing.T) {
+	assert.Panics(t, func() { New(getTestRedisURL(), WithWorkflowResultLimit(0)) })
+	assert.Panics(t, func() { New(getTestRedisURL(), WithWorkflowRetention(0)) })
+
+	e := newWFTest(t)
+	ctx := t.Context()
+	for _, id := range []string{"", "index", "a:b"} {
+		assert.ErrorIs(t, e.store.Cancel(ctx, id, nil), contract.ErrWorkflowNotFound)
+		_, err := e.store.Record(ctx, id)
+		assert.ErrorIs(t, err, contract.ErrWorkflowNotFound)
+		_, err = e.store.Runnable(ctx, id, "a", false)
+		assert.ErrorIs(t, err, contract.ErrWorkflowNotFound)
+	}
+	yes := true
+	require.NoError(t, e.store.Submit(ctx, wfPlan("g", false, false, tk{name: "a", q: e.a, undo: e.c})))
+	require.NoError(t, e.store.Cancel(ctx, "g", &yes))
+	assert.True(t, e.record("g").UndoOnCancel, "Cancel's undo overrides the plan's")
+	run, err := e.store.Runnable(ctx, "g", "bad name!", false)
+	assert.NoError(t, err)
+	assert.False(t, run)
+
+	a, ok := wfPop(t, e.a)
+	require.True(t, ok)
+	_, ok = e.a.FinishTask(a.ack, contract.TaskEnd{Workflow: "g", Task: "a", Outcome: "odd"})
+	assert.False(t, ok, "unknown outcome")
+
+	// A queue without a store: plain finishes and purge, no scope.
+	bare := newQueueBase(e.a.client, e.a.queueKey)
+	assert.Empty(t, bare.ScopeID())
+	_, ok = bare.FinishTask(a.ack, contract.TaskEnd{Workflow: "g", Task: "a", Outcome: contract.OutcomeCompleted})
+	assert.True(t, ok)
+	bare.Purge()
+	assert.Zero(t, e.a.client.Exists(ctx, e.a.getStatsKey()).Val())
+
+	// Closed queue and closed client.
+	closed := e.qs.NewQueue("z")
+	require.NoError(t, closed.Close())
+	_, ok = closed.FinishTask("x", contract.TaskEnd{Workflow: "g", Task: "a", Outcome: contract.OutcomeCompleted})
+	assert.False(t, ok)
+	qs := New(getTestRedisURL(), WithNamespace(newID()))
+	q := qs.NewQueue("a")
+	defer q.Close()
+	store := qs.(*queues).wf
+	require.NoError(t, qs.Close())
+	assert.Error(t, store.Submit(ctx, wfPlan("g", false, false, tk{name: "a", q: q})))
+	assert.Error(t, store.Cancel(ctx, "g", nil))
+	_, err = store.Record(ctx, "g")
+	assert.Error(t, err)
+	_, err = store.Runnable(ctx, "g", "a", false)
+	assert.Error(t, err)
+	_, err = store.Workflows(ctx, "", 0, 10)
+	assert.Error(t, err)
+	_, ok = q.FinishTask("x", contract.TaskEnd{Workflow: "g", Task: "a", Outcome: contract.OutcomeCompleted})
+	assert.False(t, ok)
+	q.Purge() // logs the error
+}
