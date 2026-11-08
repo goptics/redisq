@@ -1,7 +1,6 @@
 package redisq
 
 import (
-
 	"github.com/redis/go-redis/v9"
 )
 

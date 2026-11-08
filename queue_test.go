@@ -1878,7 +1878,8 @@ func TestCancelCheckErrorCallsHook(t *testing.T) {
 		defer stop()
 
 		require.NoError(t, c.prod.client.Set(ctx, c.prod.getCancelledKey(), "x", 0).Err()) // ZSCORE: WRONGTYPE
-		require.Eventually(t, func() bool { // again until the subscription is live
+		// publish again until the subscription is live
+		require.Eventually(t, func() bool {
 			require.NoError(t, c.prod.client.Publish(ctx, c.prod.getControlKey(), cancelPrefix+"e").Err())
 			mu.Lock()
 			defer mu.Unlock()
