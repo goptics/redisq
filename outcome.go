@@ -28,25 +28,19 @@ var (
 // maxCatchUp caps the watched ids one sweep reads.
 const maxCatchUp = 500
 
-// Watch states.
-const (
-	watchWaiting int32 = iota
-	watchCalled
-	watchCancelled
-)
-
 type outcomeWatch struct {
-	fn    func(contract.JobOutcome)
-	state atomic.Int32 // watchWaiting, then watchCalled or watchCancelled
+	fn   func(contract.JobOutcome)
+	done atomic.Bool // called or cancelled
 }
 
 // outcomeWatchers are a Queue's watchers by job id. mu is held across
 // Subscribe and Unsubscribe, which only write to the connection, so an
-// id's subscription always matches whether it has watchers.
+// id's subscription always matches whether it has watchers. Close cancels
+// q.ctx before it drops them, so a watch that finds q.ctx live under mu is
+// dropped by Close.
 type outcomeWatchers struct {
-	mu     sync.Mutex
-	byID   map[string]map[*outcomeWatch]struct{}
-	closed bool
+	mu   sync.Mutex
+	byID map[string]map[*outcomeWatch]struct{}
 }
 
 // donePrefix is the outcome channel prefix, <base>:done:.
@@ -65,7 +59,7 @@ func (q *Queue) WatchOutcome(id string, fn func(contract.JobOutcome)) (cancel fu
 	w := &outcomeWatch{fn: fn}
 	o := &q.outcomes
 	o.mu.Lock()
-	if id == "" || o.closed || q.ctx.Err() != nil {
+	if id == "" || q.ctx.Err() != nil {
 		o.mu.Unlock()
 		return func() {}
 	}
@@ -86,7 +80,7 @@ func (q *Queue) WatchOutcome(id string, fn func(contract.JobOutcome)) (cancel fu
 	go q.catchUp([]string{id})
 
 	return func() {
-		if w.state.CompareAndSwap(watchWaiting, watchCancelled) {
+		if w.done.CompareAndSwap(false, true) {
 			q.unwatch(id, w)
 		}
 	}
@@ -129,7 +123,7 @@ func (q *Queue) deliver(id string, out contract.JobOutcome) {
 
 	for w := range set {
 		go func() {
-			if w.state.CompareAndSwap(watchWaiting, watchCalled) {
+			if w.done.CompareAndSwap(false, true) {
 				w.fn(out)
 			}
 		}()
@@ -140,10 +134,9 @@ func (q *Queue) deliver(id string, out contract.JobOutcome) {
 func (o *outcomeWatchers) close() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.closed = true
 	for _, set := range o.byID {
 		for w := range set {
-			w.state.CompareAndSwap(watchWaiting, watchCancelled)
+			w.done.Store(true)
 		}
 	}
 	o.byID = nil
