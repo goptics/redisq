@@ -30,20 +30,12 @@ type dedupCase struct {
 }
 
 var dedupCases = []dedupCase{
-	{"list", listPushOnce, func(qs Queues, key string) (*Queue, func(string, string) bool, func() int, func()) {
+	{"list", listPushWakeOnce, func(qs Queues, key string) (*Queue, func(string, string) bool, func() int, func()) {
 		q := qs.NewQueue(key)
 		return q, func(v, id string) bool { return q.EnqueueOnce(v, id) }, q.Len, func() { q.Close() }
 	}},
-	{"priority", zsetPushOnce, func(qs Queues, key string) (*Queue, func(string, string) bool, func() int, func()) {
+	{"priority", zsetPushWakeOnce, func(qs Queues, key string) (*Queue, func(string, string) bool, func() int, func()) {
 		q := qs.NewPriorityQueue(key)
-		return q.Queue, func(v, id string) bool { return q.EnqueueOnce(v, 1, id) }, q.Len, func() { q.Close() }
-	}},
-	{"distributed", listPushWakeOnce, func(qs Queues, key string) (*Queue, func(string, string) bool, func() int, func()) {
-		q := qs.NewDistributedQueue(key)
-		return q.Queue, func(v, id string) bool { return q.EnqueueOnce(v, id) }, q.Len, func() { q.Close() }
-	}},
-	{"distributed priority", zsetPushWakeOnce, func(qs Queues, key string) (*Queue, func(string, string) bool, func() int, func()) {
-		q := qs.NewDistributedPriorityQueue(key)
 		return q.Queue, func(v, id string) bool { return q.EnqueueOnce(v, 1, id) }, q.Len, func() { q.Close() }
 	}},
 }

@@ -33,7 +33,7 @@ var jobsCases = []jobsCase{
 	}},
 	{"distributed", func(qs Queues, key string) (*Queue, contract.QueueInspector, func(string, string) bool, func() (string, bool), func()) {
 		q := qs.NewDistributedQueue(key)
-		return q.Queue, q, func(v, id string) bool { return q.EnqueueOnce(v, id) }, popWith(q), func() { q.Close() }
+		return q, q, func(v, id string) bool { return q.EnqueueOnce(v, id) }, popWith(q), func() { q.Close() }
 	}},
 	{"distributed priority", func(qs Queues, key string) (*Queue, contract.QueueInspector, func(string, string) bool, func() (string, bool), func()) {
 		q := qs.NewDistributedPriorityQueue(key)

@@ -194,10 +194,10 @@ func TestResumeWakesIdleConsumer(t *testing.T) {
 	woken := make(chan string, 10)
 	q.Subscribe(func(a string) { woken <- a })
 	require.NoError(t, q.Pause())
-	require.True(t, q.Queue.Enqueue("x")) // a plain push: no enqueue wake
+	require.NoError(t, q.client.RPush(q.ctx, q.queueKey, "x").Err()) // a raw push: no enqueue wake
 	assert.Equal(t, 1, q.Len())
 
-	require.NoError(t, q.Queue.client.SAdd(q.Queue.ctx, q.idleKey, q.id).Err()) // idle, as after an empty pop
+	require.NoError(t, q.client.SAdd(q.ctx, q.idleKey, q.id).Err()) // idle, as after an empty pop
 	require.NoError(t, q.Resume())
 	select {
 	case a := <-woken:

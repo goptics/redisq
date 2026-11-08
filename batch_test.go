@@ -513,14 +513,14 @@ func TestDequeueBatchReusedReservationMarksIdle(t *testing.T) {
 	defer qs.Close()
 	dq := qs.NewDistributedQueue("test_batch_reuse_idle")
 	defer dq.Close()
-	delKeys(t, dq.Queue.client, dq.Queue.queueKey)
-	defer delKeys(t, dq.Queue.client, dq.Queue.queueKey)
+	delKeys(t, dq.client, dq.queueKey)
+	defer delKeys(t, dq.client, dq.queueKey)
 	dq.Subscribe(func(string) {})
-	require.NoError(t, listAckPop.Load(ctx, dq.Queue.client).Err())
-	require.NoError(t, listAckPopOneLen.Load(ctx, dq.Queue.client).Err())
+	require.NoError(t, listAckPop.Load(ctx, dq.client).Err())
+	require.NoError(t, listAckPopOneLen.Load(ctx, dq.client).Err())
 
 	member := func() bool {
-		ok, err := dq.Queue.client.SIsMember(ctx, dq.idleKey, dq.id).Result()
+		ok, err := dq.client.SIsMember(ctx, dq.idleKey, dq.id).Result()
 		require.NoError(t, err)
 		return ok
 	}
@@ -531,14 +531,14 @@ func TestDequeueBatchReusedReservationMarksIdle(t *testing.T) {
 		for _, v := range vs {
 			require.True(t, dq.Enqueue(v))
 		}
-		dq.Queue.popLen.Store(maxPop) // the failing call reserves both its slots
+		dq.popLen.Store(maxPop) // the failing call reserves both its slots
 		p.drops.Store(4)
 		_, _, err := dq.DequeueBatchWithAckIds(make([]any, 2), make([]string, 2))
 		require.Error(t, err)
 		if wipe {
-			require.NoError(t, dq.Queue.client.Del(ctx, dq.getNackedItemKey(), dq.getTimeoutKey()).Err())
+			require.NoError(t, dq.client.Del(ctx, dq.getNackedItemKey(), dq.getTimeoutKey()).Err())
 		}
-		require.NoError(t, dq.Queue.client.SRem(ctx, dq.idleKey, dq.id).Err())
+		require.NoError(t, dq.client.SRem(ctx, dq.idleKey, dq.id).Err())
 	}
 
 	failPop(false, "a", "b")
@@ -549,7 +549,7 @@ func TestDequeueBatchReusedReservationMarksIdle(t *testing.T) {
 
 	failPop(true, "c", "d")
 	require.True(t, dq.Enqueue("e"))
-	require.NoError(t, dq.Queue.client.SRem(ctx, dq.idleKey, dq.id).Err())
+	require.NoError(t, dq.client.SRem(ctx, dq.idleKey, dq.id).Err())
 	items, _, remaining = popBatch(t, dq, 5)
 	assert.Equal(t, []string{"e"}, items)
 	assert.Equal(t, 0, remaining)
@@ -559,7 +559,7 @@ func TestDequeueBatchReusedReservationMarksIdle(t *testing.T) {
 	for _, v := range []string{"h", "i", "j"} {
 		require.True(t, dq.Enqueue(v))
 	}
-	require.NoError(t, dq.Queue.client.SRem(ctx, dq.idleKey, dq.id).Err())
+	require.NoError(t, dq.client.SRem(ctx, dq.idleKey, dq.id).Err())
 	items, _, remaining = popBatch(t, dq, 5)
 	assert.Equal(t, []string{"h", "i"}, items, "the reused reservation takes 2")
 	assert.Equal(t, 1, remaining)
@@ -574,22 +574,22 @@ func TestDequeueBatchMaxPopMarksIdle(t *testing.T) {
 	defer qs.Close()
 	dq := qs.NewDistributedQueue("test_batch_maxpop_idle")
 	defer dq.Close()
-	delKeys(t, dq.Queue.client, dq.Queue.queueKey)
-	defer delKeys(t, dq.Queue.client, dq.Queue.queueKey)
+	delKeys(t, dq.client, dq.queueKey)
+	defer delKeys(t, dq.client, dq.queueKey)
 	dq.Subscribe(func(string) {})
 
 	vs := make([]any, maxPop)
 	for i := range vs {
 		vs[i] = fmt.Sprintf("j%04d", i)
 	}
-	require.NoError(t, dq.Queue.client.RPush(ctx, dq.Queue.queueKey, vs...).Err())
-	require.NoError(t, dq.Queue.client.SRem(ctx, dq.idleKey, dq.id).Err())
+	require.NoError(t, dq.client.RPush(ctx, dq.queueKey, vs...).Err())
+	require.NoError(t, dq.client.SRem(ctx, dq.idleKey, dq.id).Err())
 
 	n, remaining, err := dq.DequeueBatchWithAckIds(make([]any, 1500), make([]string, 1500))
 	require.NoError(t, err)
 	assert.Equal(t, maxPop, n)
 	assert.Equal(t, 0, remaining)
-	member, err := dq.Queue.client.SIsMember(ctx, dq.idleKey, dq.id).Result()
+	member, err := dq.client.SIsMember(ctx, dq.idleKey, dq.id).Result()
 	require.NoError(t, err)
 	assert.True(t, member, "1500 slots, 1000 items, queue empty")
 }
@@ -968,19 +968,19 @@ func TestDequeueBatchOneItemIdleRule(t *testing.T) {
 	defer qs.Close()
 	dq := qs.NewDistributedQueue("test_batch_one_idle")
 	defer dq.Close()
-	delKeys(t, dq.Queue.client, dq.Queue.queueKey)
-	defer delKeys(t, dq.Queue.client, dq.Queue.queueKey)
+	delKeys(t, dq.client, dq.queueKey)
+	defer delKeys(t, dq.client, dq.queueKey)
 	dq.Subscribe(func(string) {})
 	member := func() bool {
-		ok, err := dq.Queue.client.SIsMember(ctx, dq.idleKey, dq.id).Result()
+		ok, err := dq.client.SIsMember(ctx, dq.idleKey, dq.id).Result()
 		require.NoError(t, err)
 		return ok
 	}
 
 	for _, slots := range []int{1, 5} {
 		require.True(t, dq.Enqueue("x"))
-		require.NoError(t, dq.Queue.client.SRem(ctx, dq.idleKey, dq.id).Err())
-		dq.Queue.popLen.Store(0)
+		require.NoError(t, dq.client.SRem(ctx, dq.idleKey, dq.id).Err())
+		dq.popLen.Store(0)
 		items, _, remaining := popBatch(t, dq, slots)
 		require.Equal(t, []string{"x"}, items)
 		require.Equal(t, 0, remaining)

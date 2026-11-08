@@ -14,8 +14,6 @@ import (
 var (
 	_ contract.QueueInspector = (*Queue)(nil)
 	_ contract.QueueInspector = (*PriorityQueue)(nil)
-	_ contract.QueueInspector = (*DistributedQueue)(nil)
-	_ contract.QueueInspector = (*DistributedPriorityQueue)(nil)
 )
 
 // QueueID is the queue's base key, redisq:[ns:]fifo|prio:{key}, the same on

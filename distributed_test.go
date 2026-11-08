@@ -20,11 +20,11 @@ func setupTestDistributedQueue(t *testing.T) (*DistributedQueue, func()) {
 
 	// Clear the queue before test
 	ctx := context.Background()
-	require.NoError(t, q.Queue.client.Del(ctx, q.Queue.queueKey).Err(), "Failed to clear test queue")
+	require.NoError(t, q.client.Del(ctx, q.queueKey).Err(), "Failed to clear test queue")
 
 	cleanup := func() {
 		q.Close() // first: it requeues what the test left pending
-		q.Queue.client.Del(ctx, q.Queue.queueKey)
+		q.client.Del(ctx, q.queueKey)
 		qs.Close()
 	}
 
@@ -35,7 +35,6 @@ func TestNewDistributedQueue(t *testing.T) {
 	q, cleanup := setupTestDistributedQueue(t)
 	defer cleanup()
 
-	assert.NotNil(t, q.Queue, "Queue should not be nil")
 	assert.NotNil(t, q.Notification, "Notification should not be nil")
 }
 
@@ -82,7 +81,7 @@ func TestDistributedQueueConcurrency(t *testing.T) {
 		notifications <- action
 	})
 	assert.Equal(t, 0, q.Len())
-	before := publishes(t, q.Queue.client)
+	before := publishes(t, q.client)
 
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines)
@@ -101,7 +100,7 @@ func TestDistributedQueueConcurrency(t *testing.T) {
 
 	// One idle consumer gets one wake for the whole burst, not one per item:
 	// once woken it keeps pulling on its own.
-	assert.Equal(t, 1, publishes(t, q.Queue.client)-before)
+	assert.Equal(t, 1, publishes(t, q.client)-before)
 	assert.Equal(t, numGoroutines*numOperations, q.Len())
 }
 
@@ -114,7 +113,7 @@ func TestDistributedQueueSweeperRequeues(t *testing.T) {
 	key := "test_sweeper_queue"
 	dq := qs.NewDistributedQueue(key)
 	defer dq.Close()
-	defer dq.Queue.client.Del(context.Background(), key, dq.getNackedItemKey(), dq.getTimeoutKey())
+	defer dq.client.Del(context.Background(), key, dq.getNackedItemKey(), dq.getTimeoutKey())
 
 	enqueued := make(chan struct{}, 10)
 	dq.Subscribe(func(action string) {
@@ -211,7 +210,7 @@ func TestDistributedEnqueueIsOneRoundTrip(t *testing.T) {
 		require.True(t, q.Enqueue("warm-up")) // loads the script
 
 		c := newCmdCounter()
-		q.Queue.client.AddHook(c)
+		q.client.AddHook(c)
 		for i := range n {
 			require.True(t, q.Enqueue(fmt.Sprint(i)))
 		}
@@ -225,7 +224,7 @@ func TestDistributedEnqueueIsOneRoundTrip(t *testing.T) {
 		require.True(t, q.Enqueue("warm-up", 1))
 
 		c := newCmdCounter()
-		q.Queue.client.AddHook(c)
+		q.client.AddHook(c)
 		for i := range n {
 			require.True(t, q.Enqueue(fmt.Sprint(i), i))
 		}
@@ -251,10 +250,10 @@ func TestEnqueueOntoBacklogWakesAllIdle(t *testing.T) {
 	}
 	producer := qs.NewDistributedQueue(key)
 	defer producer.Close()
-	full := producer.Queue.queueKey
-	defer producer.Queue.client.Del(ctx, full, full+":idle")
+	full := producer.queueKey
+	defer producer.client.Del(ctx, full, full+":idle")
 
-	require.NoError(t, producer.Queue.client.RPush(ctx, full, "a", "b", "c", "d").Err()) // no wake
+	require.NoError(t, producer.client.RPush(ctx, full, "a", "b", "c", "d").Err()) // no wake
 	require.True(t, producer.Enqueue("e"))
 
 	for i, got := range consumers {
@@ -333,7 +332,7 @@ var heartbeatCases = []struct {
 }{
 	{"list", func(qs Queues, key string) (distQueue, *Queue, func(string) bool) {
 		q := qs.NewDistributedQueue(key)
-		return q, q.Queue, func(v string) bool { return q.Enqueue(v) }
+		return q, q, func(v string) bool { return q.Enqueue(v) }
 	}},
 	{"priority", func(qs Queues, key string) (distQueue, *Queue, func(string) bool) {
 		q := qs.NewDistributedPriorityQueue(key)
@@ -523,8 +522,8 @@ func TestHeartbeatKeepsLiveConsumersItems(t *testing.T) {
 	key := "test_heartbeat_live"
 	holder := qs.NewDistributedQueue(key)
 	defer holder.Close()
-	delKeys(t, holder.Queue.client, key)
-	defer delKeys(t, holder.Queue.client, key)
+	delKeys(t, holder.client, key)
+	defer delKeys(t, holder.client, key)
 	sweeper := qs.NewDistributedQueue(key)
 	defer sweeper.Close()
 	holder.heartbeatTimeout.Store(int64(ttl))
@@ -553,8 +552,8 @@ func TestHeartbeatSurvivesRedisStall(t *testing.T) {
 	a, b := qs1.NewDistributedQueue(key), qs2.NewDistributedQueue(key)
 	defer a.Close()
 	defer b.Close()
-	delKeys(t, a.Queue.client, key)
-	defer delKeys(t, a.Queue.client, key)
+	delKeys(t, a.client, key)
+	defer delKeys(t, a.client, key)
 	for _, q := range []*DistributedQueue{a, b} {
 		q.heartbeatTimeout.Store(int64(ttl))
 		require.True(t, q.Enqueue("job"))
@@ -645,7 +644,7 @@ func TestPresenceGrace(t *testing.T) {
 				d1, d2 := qs.NewDistributedQueue(key), qs.NewDistributedQueue(key)
 				defer d1.Close()
 				defer d2.Close()
-				c1, c2 = d1.Queue, d2.Queue
+				c1, c2 = d1, d2
 			} else {
 				c1, c2 = qs.NewQueue(key), qs.NewQueue(key)
 				defer c1.Close()
@@ -710,6 +709,67 @@ func TestCloseKeepsItemWhenPushFails(t *testing.T) {
 			require.NoError(t, q.client.Set(ctx, q.queueKey, "not a queue", 0).Err())
 			assert.Error(t, q.Close())
 			assert.EqualValues(t, 1, q.client.HLen(ctx, q.getNackedItemKey()).Val())
+		})
+	}
+}
+
+// Every queue is distributed: an enqueue on a plain NewQueue wakes an idle
+// consumer, and the deprecated constructors return the same types.
+func TestMergedQueueWakesIdleConsumer(t *testing.T) {
+	qs := New(getTestRedisURL())
+	defer qs.Close()
+
+	var (
+		_ *Queue         = qs.NewDistributedQueue("x_merged_type")
+		_ *PriorityQueue = qs.NewDistributedPriorityQueue("x_merged_type")
+	)
+	assert.IsType(t, &Queue{}, qs.NewDistributedQueue(newID()))
+	assert.IsType(t, &PriorityQueue{}, qs.NewDistributedPriorityQueue(newID()))
+
+	for _, c := range []struct {
+		name string
+		open func(key string) (cons interface {
+			Subscribe(func(string))
+			Len() int
+			Close() error
+		}, push func() bool, closeProd func())
+	}{
+		{"list", func(key string) (interface {
+			Subscribe(func(string))
+			Len() int
+			Close() error
+		}, func() bool, func()) {
+			cons, prod := qs.NewQueue(key), qs.NewQueue(key)
+			return cons, func() bool { return prod.Enqueue("a") }, func() { prod.Close() }
+		}},
+		{"priority", func(key string) (interface {
+			Subscribe(func(string))
+			Len() int
+			Close() error
+		}, func() bool, func()) {
+			cons, prod := qs.NewPriorityQueue(key), qs.NewPriorityQueue(key)
+			return cons, func() bool { return prod.Enqueue("a", 1) }, func() { prod.Close() }
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			key := newID()
+			cons, push, closeProd := c.open(key)
+			defer cons.Close()
+			defer closeProd()
+			defer delKeys(t, qs.(*queues).client, key)
+
+			got := make(chan string, 4)
+			cons.Subscribe(func(a string) { got <- a }) // joins the idle set
+			assert.Zero(t, cons.Len())
+			start := time.Now()
+			require.True(t, push())
+			select {
+			case a := <-got:
+				assert.Equal(t, "enqueued", a)
+				assert.Less(t, time.Since(start), 500*time.Millisecond, "a wake, not the 1s nudge")
+			case <-time.After(2 * time.Second):
+				t.Fatal("no wake")
+			}
 		})
 	}
 }

@@ -6,6 +6,8 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// PriorityQueue is Queue with a priority per item: lowest score first, FIFO
+// within a score.
 type PriorityQueue struct {
 	*Queue
 }
@@ -17,18 +19,20 @@ type PriorityQueue struct {
 // by older versions are still read as is, and drain first.
 const seqPrefixLen = 17
 
-// zsetPushBody adds item ARGV[1] at score ARGV[3] under the next sequence
-// number, sets the queue to expire in ARGV[2] ms when that is above 0, and
-// counts the job as submitted in KEYS[3], :stats (see listPushBody).
-const zsetPushBody = `local s = redis.call('INCR', KEYS[2])
+// zsetPushWakeBody adds item ARGV[1] at score ARGV[3] under the next
+// sequence number (KEYS[2], :seq), sets the queue to expire in ARGV[2] ms
+// when that is above 0, wakes idle consumers of KEYS[3], up to one per
+// waiting item, on channel prefix ARGV[4], and counts the job as submitted
+// in KEYS[4], :stats (see listPushWakeBody).
+const zsetPushWakeBody = `local s = redis.call('INCR', KEYS[2])
 redis.call('ZADD', KEYS[1], ARGV[3], '\255' .. string.format('%016x', s) .. ARGV[1])
 if tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
-redis.call('HINCRBY', KEYS[3], 'submitted', 1)
-return s`
+redis.call('HINCRBY', KEYS[4], 'submitted', 1)
+return wake(KEYS[3], ARGV[4], redis.call('ZCARD', KEYS[1]))`
 
 var (
-	zsetPush     = redis.NewScript(zsetPushBody)
-	zsetPushOnce = redis.NewScript(once(zsetPushBody))
+	zsetPushWake     = redis.NewScript(wakeFn + zsetPushWakeBody)
+	zsetPushWakeOnce = redis.NewScript(wakeFn + once(zsetPushWakeBody))
 )
 
 // zsetRemove removes the first member holding item ARGV[1].
@@ -48,7 +52,7 @@ func itemOf(m string) []byte {
 }
 
 func (pq *PriorityQueue) pushKeys() []string {
-	return []string{pq.queueKey, pq.queueKey + ":seq", pq.getStatsKey()}
+	return []string{pq.queueKey, pq.queueKey + ":seq", pq.getIdleKey(), pq.getStatsKey()}
 }
 
 func newPriorityQueue(client *redis.Client, queueKey string) *PriorityQueue {
@@ -62,21 +66,24 @@ func newPriorityQueue(client *redis.Client, queueKey string) *PriorityQueue {
 	return q
 }
 
-// Enqueue adds an item to the queue with a specified priority
-// Lower priority values (closer to 1) will be dequeued first
+// Enqueue adds an item to the queue with a specified priority and wakes idle
+// consumers, as Queue.Enqueue does. Lower priority values (closer to 1) will
+// be dequeued first.
 func (pq *PriorityQueue) Enqueue(item any, priority int) bool {
-	return pq.enqueueWith(zsetPush, pq.pushKeys(), item, priority)
+	return pq.enqueueWith(zsetPushWake, pq.pushKeys(), item, priority, pq.getWakePrefix())
 }
 
-// EnqueueOnce is Enqueue for a job with an id (see Queue.EnqueueOnce).
+// EnqueueOnce is Enqueue for a job with an id (see Queue.EnqueueOnce). A
+// repeat wakes no one.
 func (pq *PriorityQueue) EnqueueOnce(item any, priority int, id string) bool {
 	if id == "" || pq.dedupWindow.Load() <= 0 {
 		return pq.Enqueue(item, priority)
 	}
-	return pq.enqueueOnceWith(zsetPushOnce, pq.pushKeys(), item, id, priority)
+	return pq.enqueueOnceWith(zsetPushWakeOnce, pq.pushKeys(), item, id, priority, pq.getWakePrefix())
 }
 
-// Dequeue removes and returns the highest priority item from the queue (lowest score)
+// Dequeue removes and returns the highest priority item from the queue
+// (lowest score). A consumer that finds the queue empty joins the idle set.
 func (pq *PriorityQueue) Dequeue() (any, bool) {
 	select {
 	case <-pq.ctx.Done():
@@ -91,15 +98,6 @@ func (pq *PriorityQueue) Dequeue() (any, bool) {
 
 		return itemOf(v), true
 	}
-}
-
-// Len returns the number of items in the priority queue
-func (pq *PriorityQueue) Len() int {
-	length, err := pq.client.ZCard(pq.ctx, pq.queueKey).Result()
-	if err != nil {
-		return 0
-	}
-	return int(length)
 }
 
 func (pq *PriorityQueue) Remove(item any) bool {
@@ -126,15 +124,17 @@ func (pq *PriorityQueue) Values() []any {
 	return values
 }
 
+// DequeueWithAckId pops the highest priority item; a consumer that finds the
+// queue empty joins the idle set in the same step.
 func (pq *PriorityQueue) DequeueWithAckId() (any, bool, string) {
-	return pq.dequeueOne(zsetAckPopOne, "", pq.getPriorityKey())
+	return pq.dequeueOne(zsetAckPopOne, pq.getPriorityKey())
 }
 
 // DequeueBatchWithAckIds moves up to len(items) items, lowest score first and
 // FIFO within a score, to pending in one atomic step (see
 // Queue.DequeueBatchWithAckIds).
 func (pq *PriorityQueue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n, remaining int, err error) {
-	return pq.dequeueBatch(zsetAckPop, zsetAckPopOneLen, items, ackIDs, "", pq.getPriorityKey())
+	return pq.dequeueBatch(zsetAckPop, zsetAckPopOneLen, items, ackIDs, pq.getPriorityKey())
 }
 
 // zsetRequeue re-adds requeued items at the priority they were dequeued at

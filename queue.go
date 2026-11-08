@@ -17,11 +17,14 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// Queue is a FIFO queue shared across processes: acknowledged pops,
+// heartbeats and wakes for idle consumers (Notification).
 type Queue struct {
-	client   *redis.Client
-	queueKey string
-	ctx      context.Context
-	cancel   context.CancelFunc
+	*Notification // wakes; built in start, on this object's subscription
+	client        *redis.Client
+	queueKey      string
+	ctx           context.Context
+	cancel        context.CancelFunc
 	// Config is atomic so no lock is held across a network call: Redis applies
 	// each command, pipeline and script on its own.
 	expiration            atomic.Int64                // time.Duration
@@ -59,26 +62,26 @@ func newQueue(c *redis.Client, queueKey string) *Queue {
 }
 
 // start subscribes this queue object to its wake channel and the queue's
-// control channel (pause and resume, see pause.go) and sweeps once now, which requeues the items past their deadline or held by a dead or
-// gone owner, and then every second.
+// control channel (pause and resume, see pause.go), starts its Notification
+// on that subscription, and sweeps once now, which requeues the items past
+// their deadline or held by a dead or gone owner, and then every second.
 // The subscription says the process is alive: Redis drops it within
 // milliseconds of the process exiting, and other processes' sweeps then
-// requeue its items (see tickBody). A distributed queue's Notification reads
-// it for wakes; a plain queue drains it (see drain). Sweeping at once lets
-// a restarted process start the grace of one that crashed straight away.
+// requeue its items (see tickBody). Sweeping at once lets a restarted process start the grace of one
+// that crashed straight away.
 func (q *Queue) start() {
 	q.presence = q.client.Subscribe(q.ctx, q.queueKey+":wake:"+q.ackPrefix, q.getControlKey())
+	q.Notification = newNotification(q.client, q.presence, q.queueKey, q.lenCmd(), q.ackPrefix, q.handle)
+	q.setOnRequeue(q.wake)
 	q.tick()
 	go q.sweep()
+	q.Notification.Start()
 }
 
-// drain reads a plain queue's subscription: control messages (see
-// Queue.control), and its wake channel, where nothing is published, so
-// go-redis pings the connection and resubscribes after a reconnect.
-func (q *Queue) drain() {
-	for msg := range q.presence.Channel() {
-		q.control(msg)
-	}
+// handle routes a message of the queue's subscription that is not a wake:
+// control (see Queue.control). It reports whether it took the message.
+func (q *Queue) handle(msg *redis.Message) bool {
+	return q.control(msg)
 }
 
 func newQueueBase(c *redis.Client, queueKey string) *Queue {
@@ -174,6 +177,7 @@ func (q *Queue) hbt() float64 {
 
 // Dequeue removes and returns an item from the queue without acknowledgment
 // For reliable processing with acknowledgment, use DequeueWithAck instead
+// A consumer that finds the queue empty joins the idle set.
 func (q *Queue) Dequeue() (any, bool) {
 	select {
 	case <-q.ctx.Done():
@@ -197,11 +201,16 @@ return redis.call('LPOP', KEYS[1])`)
 return redis.call('ZPOPMIN', KEYS[1])[1] or false`)
 )
 
-// rawPop runs pop and returns its item as stored.
+// rawPop runs pop and returns its item as stored. A consumer whose pop
+// finds the queue empty joins the idle set; a paused miss stays out (spec
+// 6.2).
 func (q *Queue) rawPop(pop *redis.Script) (string, bool) {
 	g := q.pauseHooks.gen.Load()
 	reply, err := pop.Run(q.ctx, q.client, q.rawKeys).Result()
 	if err == redis.Nil {
+		if !q.Paused() {
+			q.markIdle()
+		}
 		return "", false
 	}
 
@@ -216,6 +225,7 @@ func (q *Queue) rawPop(pop *redis.Script) (string, bool) {
 		return "", false
 	}
 
+	q.idle.Store(false)
 	return v, true
 }
 
@@ -232,13 +242,16 @@ func (q *Queue) toBytes(item any) ([]byte, error) {
 	return data, nil
 }
 
+// Enqueue pushes item and wakes idle consumers, up to one per waiting item,
+// in one round trip.
 func (q *Queue) Enqueue(item any) bool {
-	return q.enqueueWith(listPush, q.pushKeys(), item)
+	return q.enqueueWith(listPushWake, q.pushKeys(), item, q.getWakePrefix())
 }
 
-// pushKeys are the keys listPush and listPushOnce take before the id's key.
+// pushKeys are the keys listPushWake and listPushWakeOnce take before the
+// id's key.
 func (q *Queue) pushKeys() []string {
-	return []string{q.queueKey, q.getStatsKey()}
+	return []string{q.queueKey, q.getIdleKey(), q.getStatsKey()}
 }
 
 // SetDedupWindow sets how long EnqueueOnce remembers an id: a push of the
@@ -268,18 +281,20 @@ redis.call('SET', KEYS[#KEYS], '1', 'PX', ARGV[#ARGV])
 return r`
 }
 
-// listPushBody is Enqueue's push, with ARGV[1] the item and ARGV[2] the
-// queue expiration in ms (0: none). It counts the job as submitted in
-// KEYS[2], :stats; a dedupe repeat (see once) never gets here, so it isn't
-// counted.
-const listPushBody = `redis.call('RPUSH', KEYS[1], ARGV[1])
+// listPushWakeBody is Enqueue's push, with ARGV[1] the item, ARGV[2] the
+// queue expiration in ms (0: none) and ARGV[3] the wake channel prefix. It
+// wakes idle consumers of KEYS[2], up to one per waiting item, so a backlog
+// wakes them all, and counts the job as submitted in KEYS[3], :stats; a
+// dedupe repeat (see once) never gets here, so it isn't counted and wakes
+// no one.
+const listPushWakeBody = `local n = redis.call('RPUSH', KEYS[1], ARGV[1])
 if tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
-redis.call('HINCRBY', KEYS[2], 'submitted', 1)
-return 1`
+redis.call('HINCRBY', KEYS[3], 'submitted', 1)
+return wake(KEYS[2], ARGV[3], n)`
 
 var (
-	listPush     = redis.NewScript(listPushBody)
-	listPushOnce = redis.NewScript(once(listPushBody))
+	listPushWake     = redis.NewScript(wakeFn + listPushWakeBody)
+	listPushWakeOnce = redis.NewScript(wakeFn + once(listPushWakeBody))
 )
 
 // EnqueueOnce is Enqueue for a job with an id: it stores item unless an item
@@ -287,12 +302,13 @@ var (
 // SetDedupWindow), and returns true in both cases. A retried call, or
 // go-redis's re-send of a push whose reply was lost, then stores the item
 // once. The id is remembered for the whole window, even if its item is
-// handled, removed or purged sooner. An empty id is a plain Enqueue.
+// handled, removed or purged sooner. An empty id is a plain Enqueue. A
+// repeat wakes no one.
 func (q *Queue) EnqueueOnce(item any, id string) bool {
 	if id == "" || q.dedupWindow.Load() <= 0 {
 		return q.Enqueue(item)
 	}
-	return q.enqueueOnceWith(listPushOnce, q.pushKeys(), item, id)
+	return q.enqueueOnceWith(listPushWakeOnce, q.pushKeys(), item, id, q.getWakePrefix())
 }
 
 // enqueueOnceWith is enqueueWith for a script built with once: it
@@ -325,12 +341,10 @@ func (q *Queue) enqueueWith(script *redis.Script, keys []string, item any, extra
 	return true
 }
 
+// Len returns the number of items in the queue; a consumer that finds it
+// empty joins the idle set.
 func (q *Queue) Len() int {
-	length, err := q.client.LLen(q.ctx, q.queueKey).Result()
-	if err != nil {
-		return 0
-	}
-	return int(length)
+	return q.Notification.len()
 }
 
 // Purge deletes all of the queue's jobs and job data in one step: waiting
@@ -724,8 +738,10 @@ type reservation struct {
 
 var errQueueClosed = errors.New("queue closed")
 
+// DequeueWithAckId pops one item; a consumer that finds the queue empty
+// joins the idle set in the same step.
 func (q *Queue) DequeueWithAckId() (any, bool, string) {
-	return q.dequeueOne(listAckPopOne, "")
+	return q.dequeueOne(listAckPopOne)
 }
 
 // DequeueBatchWithAckIds moves up to min(len(items), len(ackIDs), 1000) items
@@ -743,20 +759,25 @@ func (q *Queue) DequeueWithAckId() (any, bool, string) {
 // reuse a failed call's ack IDs and get that call's items back: the next
 // call with at least that call's slots does. One failed call is kept at a
 // time; the items of another that failed with it stay pending until they are
-// requeued.
+// requeued. A consumer whose pop comes up short joins the idle set in the
+// same step.
 func (q *Queue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n, remaining int, err error) {
-	return q.dequeueBatch(listAckPop, listAckPopOneLen, items, ackIDs, "")
+	return q.dequeueBatch(listAckPop, listAckPopOneLen, items, ackIDs)
 }
 
-// dequeueOne pops one item with a lean single-item script (see popOneHead).
-func (q *Queue) dequeueOne(pop *redis.Script, consumer string, extraKeys ...string) (any, bool, string) {
+// dequeueOne pops one item with a lean single-item script (see popOneHead),
+// and sets this consumer idle when it finds nothing (a paused miss stays
+// out of :idle, spec 6.2).
+func (q *Queue) dequeueOne(pop *redis.Script, extraKeys ...string) (item any, ok bool, ackID string) {
 	if q.ctx.Err() != nil {
 		log.Println("queue closed, cannot dequeue")
 		return nil, false, ""
 	}
+	consumer := q.consumerID()
+	defer func() { q.idle.Store(!ok && !q.Paused()) }()
 
 	r := q.reserve(1, 1)
-	ackID := q.ackIDOf(fmt.Sprintf("%020d", r.start), 1)
+	ackID = q.ackIDOf(fmt.Sprintf("%020d", r.start), 1)
 	g := q.pauseHooks.gen.Load()
 	reply, err := pop.Run(q.ctx, q.client, q.popKeys(extraKeys...), q.vt(), ackID, consumer, q.hbt(), q.ackPrefix).Result()
 	if err == redis.Nil {
@@ -863,7 +884,10 @@ end
 // trickle then pops one item with the lean script instead of building and
 // checking an ack ID for every slot, and a burst like the last one takes one
 // call. A guess that is too small costs one more call, and remaining says so.
-func (q *Queue) dequeueBatch(pop, popOne *redis.Script, items []any, ackIDs []string, consumer string, extraKeys ...string) (int, int, error) {
+//
+// A consumer whose pop comes up short with the queue empty is idle after it
+// (as the script's idle rule; a paused miss stays out).
+func (q *Queue) dequeueBatch(pop, popOne *redis.Script, items []any, ackIDs []string, extraKeys ...string) (n, remaining int, err error) {
 	slots := min(len(items), len(ackIDs))
 	limit := min(slots, maxPop)
 	if limit == 0 {
@@ -873,13 +897,18 @@ func (q *Queue) dequeueBatch(pop, popOne *redis.Script, items []any, ackIDs []st
 	if q.ctx.Err() != nil {
 		return 0, 0, errQueueClosed
 	}
+	consumer := q.consumerID()
+	defer func() {
+		if err == nil {
+			q.idle.Store(remaining == 0 && n < slots && !q.Paused())
+		}
+	}()
 
 	r := q.reserve(limit, min(limit, max(1, int(q.popLen.Load()))))
 	resv := fmt.Sprintf("%020d", r.start)
 	keys := q.popKeys(extraKeys...)
 	g := q.pauseHooks.gen.Load()
 	var reply []any
-	var err error
 	if r.want == 1 {
 		reply, err = popOne.Run(q.ctx, q.client, keys, q.vt(), q.ackIDOf(resv, 1), consumer, slots, q.hbt(), q.ackPrefix).Slice()
 	} else {
@@ -904,7 +933,7 @@ func (q *Queue) dequeueBatch(pop, popOne *redis.Script, items []any, ackIDs []st
 		ackIDs[i] = q.ackIDOf(resv, i+1)
 	}
 
-	remaining := int(reply[0].(int64))
+	remaining = int(reply[0].(int64))
 	if remaining > 0 {
 		q.popRun.Add(int64(len(popped)))
 		q.popLen.Store(int64(remaining))
@@ -1139,7 +1168,7 @@ func (q *Queue) sweep() {
 // closed.
 func (q *Queue) tick() bool {
 	keys := append(q.requeueKeys(), q.getHeartbeatKey(), q.getHeartbeatKey()+":clock", q.getPresenceKey(), q.getPausedKey())
-	wakePrefix := q.queueKey + ":wake:" // as start and Notification name the channels
+	wakePrefix := q.getWakePrefix()
 	g := q.pauseHooks.gen.Load()
 	r, err := q.tickScript.Run(q.ctx, q.client, keys, q.ackPrefix, q.hbt(), sweepGap.Seconds(), wakePrefix, presenceGrace.Seconds()).Int64Slice()
 	if errors.Is(err, redis.ErrClosed) {
@@ -1216,6 +1245,12 @@ func (q *Queue) getIdleKey() string {
 	return q.queueKey + ":idle"
 }
 
+// getWakePrefix returns the prefix of the consumers' wake channels,
+// <key>:wake:<ack ID prefix>
+func (q *Queue) getWakePrefix() string {
+	return q.queueKey + ":wake:"
+}
+
 // getPriorityKey returns the Redis key for the priorities of pending items
 func (q *Queue) getPriorityKey() string {
 	return q.queueKey + ":prio"
@@ -1274,12 +1309,16 @@ func (q *Queue) getPresenceKey() string {
 // acknowledged, at once, as a broker requeues a closed channel's deliveries:
 // an Acknowledge after Close fails anyway. Stop or drain the workers first,
 // or jobs still running here run again elsewhere.
+//
+// It leaves the idle set first, so the wake for the requeued items goes to
+// another consumer.
 func (q *Queue) Close() error {
 	var err error
 	q.closeOnce.Do(func() {
-		q.cancel() // Cancel context to stop notification listener
+		q.leave()
+		q.cancel() // stops the sweep
 		err = q.release()
-		q.presence.Close()
+		q.Notification.Stop()
 	})
 	return err
 }
