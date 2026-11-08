@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/goptics/varmq/contract"
 	"github.com/redis/go-redis/v9"
@@ -53,6 +54,8 @@ type workflowStore struct {
 	resultLimit int
 	retention   time.Duration
 	trimFrom    atomic.Int64 // trimIndex's offset past old entries still live
+	trimming    atomic.Bool  // a trimIndex runs: every queue's sweep calls it
+	trimmedAt   atomic.Int64 // Unix ms of the last trimIndex
 }
 
 // WithWorkflowResultLimit caps a workflow task's result at n bytes (default
@@ -251,13 +254,16 @@ local function wfrelease(W, x, push)
 	end
 end
 local function wfdrop(W, x, push)
-	for _, d in ipairs(W.t[x].dependents) do
-		if W.s[d] == 'waiting' then
-			if W.t[d].always then
-				wfrelease(W, d, push)
-			else
-				wfset(W, d, 'cancelled')
-				wfdrop(W, d, push)
+	local stack = {x} -- not recursive: Lua caps nested calls near 20000, a long chain would abort mid-write
+	while #stack > 0 do
+		for _, d in ipairs(W.t[table.remove(stack)].dependents) do
+			if W.s[d] == 'waiting' then
+				if W.t[d].always then
+					wfrelease(W, d, push)
+				else
+					wfset(W, d, 'cancelled')
+					stack[#stack + 1] = d
+				end
 			end
 		end
 	end
@@ -613,6 +619,12 @@ func (s *workflowStore) planQueue(name, queueID string, q, item any) (*Queue, []
 	}
 	if !s.owns(rq) {
 		return nil, nil, fmt.Errorf("%w: task %q queue %s is not in redisq scope %s", contract.ErrScopeMismatch, name, queueID, s.scope)
+	}
+	if !utf8.ValidString(rq.queueKey) { // t: is JSON: the key must round-trip
+		return nil, nil, fmt.Errorf("varmq: task %q: queue key %q is not valid UTF-8", name, rq.queueKey)
+	}
+	if rq.getExpiration() > 0 { // pushes don't renew it: an expired task strands its workflow
+		return nil, nil, fmt.Errorf("varmq: task %q: queue %s has an expiration (SetExpiration)", name, queueID)
 	}
 	b, ok := item.([]byte)
 	if !ok || !json.Valid(b) || len(b) == 0 || b[0] != '{' {
@@ -1103,7 +1115,13 @@ return n`)
 // drop out of listings while Record still finds it. Old entries still live
 // are stepped over (trimFrom), so they don't stall the trim.
 func (s *workflowStore) trimIndex(ctx context.Context) {
-	cut := strconv.FormatInt(time.Now().Add(-s.retention).UnixMilli(), 10)
+	now := time.Now()
+	if now.UnixMilli()-s.trimmedAt.Load() < 50_000 || !s.trimming.CompareAndSwap(false, true) {
+		return // one trim per store a minute, not one per queue
+	}
+	defer s.trimming.Store(false)
+	s.trimmedAt.Store(now.UnixMilli())
+	cut := strconv.FormatInt(now.Add(-s.retention).UnixMilli(), 10)
 	from := s.trimFrom.Load()
 	old, err := s.client.ZRangeByScore(ctx, s.indexKey(), &redis.ZRangeBy{Min: "-inf", Max: cut, Offset: from, Count: 1000}).Result()
 	if err == nil {
@@ -1136,7 +1154,14 @@ func (s *workflowStore) trimIndex(ctx context.Context) {
 // reads their queues and runs it again. Else it deletes, then applies a
 // cancelled end (reason "queue purged") to each tagged item's task or undo,
 // in the order read, and pushes what that releases. Returns {1}.
-var wfPurgeScript = redis.NewScript(wfPrelude + envIDFn + bareFn + `local D, N = tonumber(ARGV[1]), tonumber(ARGV[2])
+//
+// KEYS[#KEYS] is a key unique to this call (<base>:purge:<nonce>): the
+// applying run sets it, and a re-send of the same script (go-redis, after a
+// lost reply) finds it and returns {1}, so it never deletes and cancels
+// what the first run pushed. Only items holding '"wf"' or a backslash
+// (an escaped key) are decoded.
+var wfPurgeScript = redis.NewScript(wfPrelude + envIDFn + bareFn + `if redis.call('EXISTS', KEYS[#KEYS]) == 1 then return {1} end
+local D, N = tonumber(ARGV[1]), tonumber(ARGV[2])
 local Q = wfqueues(D + N + 1, ARGV[3])
 local items = {}
 if ARGV[4] == 'prio' then
@@ -1148,7 +1173,8 @@ for _, v in ipairs(redis.call('HVALS', KEYS[2])) do items[#items + 1] = v end
 local hashes, Ws, tagged, found, seen, miss = {}, {}, {}, {}, {}, false
 for j = 1, N do hashes[ARGV[5 + j]] = KEYS[D + j] end
 for _, v in ipairs(items) do
-	local id, e = envid(v)
+	local id, e = '', nil
+	if string.find(v, '"wf"', 1, true) or string.find(v, '\\', 1, true) then id, e = envid(v) end
 	if wftag(e, id) then
 		tagged[#tagged + 1] = e
 		if not seen[e.wf] then
@@ -1170,6 +1196,7 @@ if miss then
 	for _, id in ipairs(found) do r[#r + 1] = id end
 	return r
 end
+redis.call('SET', KEYS[#KEYS], '1', 'PX', 600000)
 local del = {}
 for i = 1, D do del[i] = KEYS[i] end
 redis.call('DEL', unpack(del))
@@ -1203,6 +1230,10 @@ func (q *Queue) Purge() {
 	}
 }
 
+// purgeTimeout is how long a purge script may run before its client gives
+// up on the reply.
+const purgeTimeout = 5 * time.Minute
+
 func (q *Queue) purge() error {
 	del := append(q.requeueKeys(), q.getJobsKey(), q.getCompletedKey(), q.getFailedKey(), q.getStatsKey(), q.getCancelledKey())
 	if q.wf == nil { // no store (newQueueBase): no workflows to find
@@ -1210,6 +1241,9 @@ func (q *Queue) purge() error {
 	}
 	ret := q.wf.retention
 	var ids []string
+	// A purge scans every item in one script: give it time, so the read
+	// timeout doesn't re-send it while it runs.
+	slow := q.client.WithTimeout(purgeTimeout)
 	// Push targets per workflow ID, kept across tries: t: never changes, so
 	// only new IDs are read. ponytail: an ID that expired and was submitted
 	// again on other queues between tries fails the Purge (logged).
@@ -1246,7 +1280,8 @@ func (q *Queue) purge() error {
 		for _, id := range ids {
 			args = append(args, id)
 		}
-		r, err := wfPurgeScript.Run(q.ctx, q.client, slices.Concat(del, hashes, qkeys), args...).Slice()
+		once := q.queueKey + ":purge:" + newID()
+		r, err := wfPurgeScript.Run(q.ctx, slow, slices.Concat(del, hashes, qkeys, []string{once}), args...).Slice()
 		if err != nil {
 			return err
 		}

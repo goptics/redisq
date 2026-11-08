@@ -3233,13 +3233,14 @@ func TestWorkflowResults(t *testing.T) {
 		case "bad":
 			return contract.OutcomeCompleted, []byte(`{nope`)
 		}
-		return contract.OutcomeCompleted, []byte(`[[[1]]]`)
+		return contract.OutcomeCompleted, []byte(`[[[12]]]`) // exactly the limit
 	})
 	r := e.record("res")
 	assert.Equal(t, contract.WorkflowCompleted, r.State, "big's failure is absorbed by Always next")
 	assert.Equal(t, contract.JobFailed, r.Tasks[0].State)
 	assert.Equal(t, contract.ErrResultTooLarge.Error(), r.Tasks[0].Reason)
-	assert.Equal(t, len(`[[[1]]]`), r.Tasks[1].ResultSize)
+	assert.Equal(t, contract.JobCompleted, r.Tasks[1].State)
+	assert.Equal(t, 8, r.Tasks[1].ResultSize)
 	assert.Equal(t, contract.JobCompleted, r.Tasks[2].State)
 	assert.Zero(t, r.Tasks[2].ResultSize)
 	_, err := e.store.DepResult(t.Context(), "res", "big")
@@ -3682,4 +3683,53 @@ func TestWorkflowFinishChecks(t *testing.T) {
 	assert.True(t, ok)
 	assert.Zero(t, e.a.GetNackedItemsCount())
 	assert.ErrorContains(t, e.store.Cancel(ctx, "fc", nil), "unreadable")
+}
+
+// Review round 3: a long chain fails without overflowing Lua's call depth;
+// a re-sent applying Purge changes nothing; Submit refuses a queue with an
+// expiration or a key that isn't UTF-8; trimIndex runs once a minute.
+func TestWorkflowRobust(t *testing.T) {
+	e := newWFTest(t)
+	ctx := t.Context()
+
+	const n = 21000
+	tasks := []tk{{name: "c0", q: e.a}}
+	for i := 1; i < n; i++ {
+		tasks = append(tasks, tk{name: fmt.Sprintf("c%d", i), q: e.a, deps: []string{fmt.Sprintf("c%d", i-1)}})
+	}
+	require.NoError(t, e.store.Submit(ctx, wfPlan("chain", false, false, tasks...)))
+	assert.Equal(t, []string{"c0"}, e.drain(failing("c0")))
+	r := e.record("chain")
+	assert.Equal(t, contract.WorkflowFailed, r.State)
+	assert.Equal(t, contract.JobCancelled, r.Tasks[n-1].State)
+
+	// The applying run sets its once-key; a re-send with it returns at once.
+	require.NoError(t, e.store.Submit(ctx, wfPlan("rs", false, false,
+		tk{name: "a", q: e.a}, tk{name: "b", q: e.a, deps: []string{"a"}, always: true})))
+	once := e.a.queueKey + ":purge:test"
+	require.NoError(t, e.a.client.Set(ctx, once, "1", time.Minute).Err())
+	keys := append(e.a.requeueKeys(), e.a.getJobsKey(), e.a.getCompletedKey(), e.a.getFailedKey(), e.a.getStatsKey(), e.a.getCancelledKey(), once)
+	got, err := wfPurgeScript.Run(ctx, e.a.client, keys, len(keys)-1, 0, "", "fifo", 1000).Slice()
+	require.NoError(t, err)
+	assert.Equal(t, []any{int64(1)}, got)
+	assert.EqualValues(t, 1, e.a.client.LLen(ctx, e.a.queueKey).Val(), "re-send: nothing deleted")
+	e.a.Purge()
+	assert.Equal(t, map[string]contract.JobState{"a": contract.JobCancelled, "b": contract.JobPending}, taskStates(e.record("rs")))
+	assert.EqualValues(t, 1, e.a.client.LLen(ctx, e.a.queueKey).Val(), "b pushed after the delete")
+
+	exp := e.qs.NewQueue("exp")
+	defer exp.Close()
+	exp.SetExpiration(time.Hour)
+	assert.ErrorContains(t, e.store.Submit(ctx, wfPlan("x1", false, false, tk{name: "a", q: exp})), "expiration")
+	bad := e.qs.NewQueue("caf\xe9")
+	defer bad.Close()
+	assert.ErrorContains(t, e.store.Submit(ctx, wfPlan("x2", false, false, tk{name: "a", q: bad})), "UTF-8")
+
+	e.store.trimmedAt.Store(time.Now().UnixMilli())
+	require.NoError(t, e.a.client.ZAdd(ctx, e.store.indexKey(), redis.Z{Score: 1, Member: "old"}).Err())
+	e.store.trimIndex(ctx)
+	assert.EqualValues(t, 1, e.a.client.ZScore(ctx, e.store.indexKey(), "old").Val(), "trimmed under a minute ago: skipped")
+	e.store.trimmedAt.Store(0)
+	e.store.trimIndex(ctx)
+	assert.Equal(t, redis.Nil, e.a.client.ZScore(ctx, e.store.indexKey(), "old").Err())
 }

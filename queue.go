@@ -128,7 +128,10 @@ func (q *Queue) getVisibilityTimeout() time.Duration {
 	return time.Duration(q.visibilityTimeout.Load())
 }
 
-// SetExpiration sets the expiration time for the Queue
+// SetExpiration sets the expiration time for the Queue: each push of this
+// object renews it. Workflow pushes (Submit, promotions, Purge releases)
+// don't, so a workflow refuses a task on a queue object with an
+// expiration: an expired task would leave its workflow running forever.
 func (q *Queue) SetExpiration(expiration time.Duration) {
 	q.expiration.Store(int64(expiration))
 }

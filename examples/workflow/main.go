@@ -45,6 +45,10 @@ func main() {
 
 	switch os.Args[1] {
 	case "worker":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: workflow worker <queue,...>")
+			os.Exit(2)
+		}
 		names := strings.Split(os.Args[2], ",")
 		var stops []func() error
 		if slices.Contains(names, "upload") {

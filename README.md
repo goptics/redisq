@@ -292,7 +292,8 @@ A task finishes in one script that settles its job and pushes the tasks it relea
 workflow between the two. The layout is varmq's `spec/redis-storage.md` 1.5.0 (`redisq:[ns:]wf:<id>`,
 `redisq:[ns:]wf:index`). `WithWorkflowResultLimit` (default 64 KiB) and `WithWorkflowRetention` (default 7 days) set
 the store. Every consumer of a queue that carries workflow tasks must run this version. Anyone who can push to a
-task's queue can push a copy of that task, so treat push access as trusted. See [`examples/workflow`](examples/workflow).
+task's queue can push a copy of that task, so treat push access as trusted. Don't use `SetExpiration` on a queue that
+carries workflow tasks: workflow pushes don't renew the expiry, and Submit refuses such a queue object. See [`examples/workflow`](examples/workflow).
 
 ## How It Works
 
