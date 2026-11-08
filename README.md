@@ -256,10 +256,9 @@ w := varmq.NewResultWorker(func(j varmq.Job[string]) (int, error) { return len(j
 w.WithPriorityQueue(qs.NewPriorityQueue("jobs"))
 
 // producer process
-q := varmq.NewPriorityQueue[string](qs.NewPriorityQueue("jobs"))
+q := varmq.NewResultPriorityQueue[string, int](qs.NewPriorityQueue("jobs"))
 job, _ := q.Add("https://example.com", 1)
-o, err := job.Outcome(ctx)          // ends when any process finished it
-n, err := varmq.DecodeResult[int](o) // the worker's result
+n, err := job.Result() // waits until any process finished it
 ```
 
 See [`examples/varmq`](examples/varmq) for a provider/consumer setup.
