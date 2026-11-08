@@ -780,11 +780,12 @@ func TestSweeperStopsWhenClientClosed(t *testing.T) {
 	defer log.SetOutput(os.Stderr)
 
 	qs := New(getTestRedisURL())
-	_ = qs.NewQueue("test_sweeper_closed_client")
+	q := qs.NewQueue("test_sweeper_closed_client") // producer only: its nudge loop never runs a script
 	require.NoError(t, qs.Close())
 	time.Sleep(3500 * time.Millisecond)
 
 	assert.LessOrEqual(t, strings.Count(buf.String(), "Error requeueing"), 1)
+	assert.Error(t, q.Notification.ctx.Err(), "nudge loop and its ticker must stop too")
 }
 
 // lockedBuffer collects log output written by other goroutines.

@@ -1407,6 +1407,7 @@ func (q *Queue) sweep() {
 		}
 
 		if !q.tick() {
+			q.Notification.cancel() // else a producer's nudge loop never sees ErrClosed
 			return
 		}
 		q.sweepOutcomes()
