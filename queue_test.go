@@ -1868,6 +1868,47 @@ func TestCancelReAddAndPurge(t *testing.T) {
 	})
 }
 
+// A plain Enqueue keeps the id's mark, so the pop drops the job.
+func TestCancelPlainEnqueueDropped(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		require.NoError(t, c.prod.CancelJob("n"))
+		require.True(t, c.push(envelope("n", `1`), 1))
+		_, ok, _ := ackPopOf(c.cons)
+		assert.False(t, ok)
+		assertDropped(t, c.cons, "n")
+	})
+}
+
+// A cancelled running job whose consumer dies is requeued, and the next pop
+// drops it, its attempts counted.
+func TestCancelRequeuedRunningJob(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		got, _ := watch(c.prod, "r")
+		require.True(t, c.push(envelope("r", `1`), 1))
+		_, ok, _ := ackPopOf(c.cons)
+		require.True(t, ok)
+		require.NoError(t, c.prod.CancelJob("r"))
+		require.NoError(t, c.cons.Close()) // requeues its job
+
+		_, ok, _ = ackPopOf(c.prod)
+		assert.False(t, ok, "dropped")
+		r := record(t, c.prod, "r")
+		assert.Equal(t, "cancelled", r["state"])
+		assert.EqualValues(t, 2, r["attempts"])
+		assert.NotContains(t, r, "started_at")
+		assert.False(t, marked(t, c.prod, "r"))
+		assert.Equal(t, contract.JobOutcome{ID: "r", State: contract.JobCancelled, Error: "cancelled"}, outcomeWithin(t, got, time.Second))
+	})
+}
+
+func TestCancelJobClosedQueue(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+	assert.ErrorIs(t, q.CancelJob(""), errEmptyJobID)
+	require.NoError(t, q.Close())
+	assert.ErrorIs(t, q.CancelJob("x"), errQueueClosed)
+}
+
 // With the dedupe off, a pushing EnqueueOnce still drops the id's cancel
 // mark and old record (spec 6.13, 6.14 Re-add).
 func TestEnqueueOnceNoWindowReAdd(t *testing.T) {
@@ -1990,6 +2031,15 @@ func TestCancelDropBudget(t *testing.T) {
 			require.True(t, ok)
 			assert.Equal(t, "live", envID(t, v))
 			check(t, q, marks, false)
+		})
+	})
+	t.Run("single, one call", func(t *testing.T) {
+		eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+			fill(t, c)
+			v, ok, _ := ackPopOf(c.cons) // pops again after a spent budget
+			require.True(t, ok)
+			assert.Equal(t, "live", envID(t, v))
+			check(t, c.cons, marks, false)
 		})
 	})
 	t.Run("raw", func(t *testing.T) {
@@ -2189,13 +2239,91 @@ func TestWatchOutcomeCatchUp(t *testing.T) {
 // A lost message is made up by the sweep's read of the record.
 func TestWatchOutcomeSweepCatchUp(t *testing.T) {
 	eachOutcomeCase(t, func(t *testing.T, prod, cons *Queue, push func(string) bool) {
-		got, _ := watch(prod, "j6")
-		time.Sleep(50 * time.Millisecond) // the watch's own read finds nothing
+		got := make(chan contract.JobOutcome, 1)
+		addWatch(prod, "j6", func(o contract.JobOutcome) { got <- o }) // no subscribe, no catch-up
 		rec := `{"id":"j6","state":"completed","item":1,"finished_at":1,"attempts":1,"result":7}`
 		require.NoError(t, cons.client.HSet(t.Context(), cons.getJobsKey(), "j6", rec).Err()) // no PUBLISH
 
-		o := outcomeWithin(t, got, 3*time.Second)
+		prod.sweepOutcomes()
+		o := outcomeWithin(t, got, time.Second)
 		assert.Equal(t, `7`, string(o.Result))
+		watchGone(t, prod, "j6")
+	})
+}
+
+// addWatch adds a watch of id to q as WatchOutcome does, but without its
+// subscribe and catch-up, so only a sweep (or a message) delivers it.
+func addWatch(q *Queue, id string, fn func(contract.JobOutcome)) {
+	o := &q.outcomes
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.byID == nil {
+		o.byID = map[string]map[*outcomeWatch]struct{}{}
+	}
+	if o.byID[id] == nil {
+		o.byID[id] = map[*outcomeWatch]struct{}{}
+	}
+	o.byID[id][&outcomeWatch{fn: fn}] = struct{}{}
+}
+
+// One sweep reads at most maxCatchUp watched ids; the next takes the rest.
+// A queue object without its sweep, so only these calls deliver.
+func TestSweepOutcomesCap(t *testing.T) {
+	qs := New(getTestRedisURL()).(*queues)
+	defer qs.Close()
+	q := newQueueBase(qs.client, "redisq:test:{"+newID()+"}")
+	defer q.cancel()
+	q.presence = q.client.Subscribe(q.ctx)
+	defer q.presence.Close()
+	defer q.client.Del(context.Background(), q.getJobsKey())
+
+	q.unwatch("none", &outcomeWatch{}) // no set: nothing to drop
+	const n = maxCatchUp + 100
+	var calls atomic.Int32
+	fields := make([]any, 0, 2*n)
+	for i := range n {
+		id := fmt.Sprintf("s%d", i)
+		fields = append(fields, id, `{"state":"completed"}`)
+		addWatch(q, id, func(contract.JobOutcome) { calls.Add(1) })
+	}
+	require.NoError(t, q.client.HSet(t.Context(), q.getJobsKey(), fields...).Err())
+
+	q.sweepOutcomes()
+	assert.Len(t, q.outcomes.byID, n-maxCatchUp, "one sweep reads maxCatchUp ids")
+	q.sweepOutcomes()
+	assert.Empty(t, q.outcomes.byID)
+	assert.Eventually(t, func() bool { return calls.Load() == n }, time.Second, 10*time.Millisecond)
+}
+
+// A record that isn't JSON or isn't final gives no outcome; a cancelled one
+// without errors gets error "cancelled".
+func TestOutcomeOf(t *testing.T) {
+	for _, rec := range []string{`{`, `[]`, `{"state":"processing"}`, `{"state":"pending"}`} {
+		_, ok := outcomeOf("x", rec)
+		assert.False(t, ok, rec)
+	}
+	out, ok := outcomeOf("x", `{"state":"cancelled"}`)
+	require.True(t, ok)
+	assert.Equal(t, contract.JobOutcome{ID: "x", State: contract.JobCancelled, Error: "cancelled"}, out)
+}
+
+// A done message that isn't JSON or isn't final calls nothing; the id comes
+// from the channel, not the payload.
+func TestWatchOutcomeIgnoresBadPayload(t *testing.T) {
+	eachOutcomeCase(t, func(t *testing.T, prod, cons *Queue, push func(string) bool) {
+		ctx := t.Context()
+		ch := prod.donePrefix() + "j"
+		got, _ := watch(prod, "j")
+		require.Eventually(t, func() bool {
+			n, err := cons.client.PubSubNumSub(ctx, ch).Result()
+			return err == nil && n[ch] == 1
+		}, 2*time.Second, 10*time.Millisecond, "subscribed")
+
+		for _, p := range []string{`{`, `{"state":"processing"}`, `{"id":"other","state":"completed","result":1}`} {
+			require.NoError(t, cons.client.Publish(ctx, ch, p).Err())
+		}
+		assert.Equal(t, contract.JobOutcome{ID: "j", State: contract.JobCompleted, Result: json.RawMessage(`1`)}, outcomeWithin(t, got, time.Second))
+		watchGone(t, prod, "j")
 	})
 }
 
