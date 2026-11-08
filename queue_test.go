@@ -1694,18 +1694,36 @@ func TestEnqueueRefusesLuaUndecodable(t *testing.T) {
 	})
 }
 
-// A pop that drops the last waiting item finds the queue empty.
+// A pop that drops the last waiting item finds the queue empty. With no
+// record kept, the sweep can't catch up: the outcome comes from the pop's
+// PUBLISH alone, in every pop.
 func TestCancelOnlyItem(t *testing.T) {
-	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
-		c.cons.SetFailedRetention(0, 0)
-		got, _ := watch(c.prod, "a")
-		require.True(t, c.push(envelope("a", `1`), 1))
-		require.NoError(t, c.prod.CancelJob("a"))
-		_, ok, _ := ackPopOf(c.cons)
-		assert.False(t, ok)
-		assert.Zero(t, c.cons.client.HLen(t.Context(), c.cons.getJobsKey()).Val(), "no retention: no record")
-		assert.Equal(t, contract.JobOutcome{ID: "a", State: contract.JobCancelled, Error: "cancelled"}, outcomeWithin(t, got, time.Second))
-	})
+	pops := map[string]func(q *Queue) bool{ // reports whether an item came out
+		"raw":    func(q *Queue) bool { _, ok := rawPopOf(q); return ok },
+		"single": func(q *Queue) bool { _, ok, _ := ackPopOf(q); return ok },
+		"batch one": func(q *Queue) bool {
+			n, _, err := batchPopOf(q, make([]any, 1), make([]string, 1))
+			return err == nil && n > 0
+		},
+		"batch": func(q *Queue) bool { // want 2: the full batch script
+			q.popLen.Store(2)
+			n, _, err := batchPopOf(q, make([]any, 2), make([]string, 2))
+			return err == nil && n > 0
+		},
+	}
+	for name, pop := range pops {
+		t.Run(name, func(t *testing.T) {
+			eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+				c.cons.SetFailedRetention(0, 0)
+				got, _ := watch(c.prod, "a")
+				require.True(t, c.push(envelope("a", `1`), 1))
+				require.NoError(t, c.prod.CancelJob("a"))
+				assert.False(t, pop(c.cons))
+				assert.Zero(t, c.cons.client.HLen(t.Context(), c.cons.getJobsKey()).Val(), "no retention: no record")
+				assert.Equal(t, contract.JobOutcome{ID: "a", State: contract.JobCancelled, Error: "cancelled"}, outcomeWithin(t, got, time.Second))
+			})
+		})
+	}
 }
 
 // A job whose record shows it ended can't be cancelled; an unknown id is
