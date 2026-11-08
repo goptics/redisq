@@ -2402,6 +2402,32 @@ func TestWatchOutcomeTwoWatchers(t *testing.T) {
 	})
 }
 
+// Cancelling one of two watchers before the job ends keeps the other's
+// entry and subscription: it still gets the outcome by message.
+func TestWatchOutcomeOneOfTwoCancelled(t *testing.T) {
+	eachOutcomeCase(t, func(t *testing.T, prod, cons *Queue, push func(string) bool) {
+		var a, b atomic.Int32
+		cancelA := prod.WatchOutcome("j9", func(contract.JobOutcome) { a.Add(1) })
+		prod.WatchOutcome("j9", func(contract.JobOutcome) { b.Add(1) })
+		cancelA()
+
+		prod.outcomes.mu.Lock()
+		_, held := prod.outcomes.byID["j9"]
+		prod.outcomes.mu.Unlock()
+		assert.True(t, held, "B's entry stays")
+		ch := prod.donePrefix() + "j9"
+		assert.EqualValues(t, 1, prod.client.PubSubNumSub(t.Context(), ch).Val()[ch], "still subscribed")
+
+		require.True(t, push(envelope("j9", `1`)))
+		require.True(t, cons.Acknowledge(popAck(t, cons)))
+		require.Eventually(t, func() bool { return b.Load() == 1 }, time.Second, 10*time.Millisecond)
+		time.Sleep(1500 * time.Millisecond) // past a sweep
+		assert.Zero(t, a.Load(), "A cancelled")
+		assert.EqualValues(t, 1, b.Load())
+		watchGone(t, prod, "j9")
+	})
+}
+
 // A job without an envelope id publishes nothing; an empty id watches
 // nothing.
 func TestOutcomeWithoutJobID(t *testing.T) {
