@@ -150,15 +150,16 @@ func (o *outcomeWatchers) close() {
 }
 
 // outcome handles a message on an outcome channel and reports whether it
-// was one. A payload that isn't a JobOutcome is dropped; the sweep reads
-// the record instead.
+// was one. A payload that isn't a final JobOutcome (completed or failed) is
+// dropped; the sweep reads the record instead.
 func (q *Queue) outcome(msg *redis.Message) bool {
 	id, ok := strings.CutPrefix(msg.Channel, q.donePrefix())
 	if !ok {
 		return false
 	}
 	var out contract.JobOutcome
-	if json.Unmarshal([]byte(msg.Payload), &out) == nil {
+	if json.Unmarshal([]byte(msg.Payload), &out) == nil &&
+		(out.State == contract.JobCompleted || out.State == contract.JobFailed) {
 		out.ID = id
 		q.deliver(id, out)
 	}
