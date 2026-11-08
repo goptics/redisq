@@ -1847,6 +1847,33 @@ func TestCancelStopDuringLiveCheck(t *testing.T) {
 	})
 }
 
+// A live check that fails calls OnCancel anyway.
+func TestCancelCheckErrorCallsHook(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		ctx := t.Context()
+		var buf lockedBuffer
+		log.SetOutput(&buf)
+		defer log.SetOutput(os.Stderr)
+		var mu sync.Mutex
+		var seen []string
+		stop := c.cons.OnCancel(func(id string) { mu.Lock(); seen = append(seen, id); mu.Unlock() })
+		defer stop()
+
+		require.NoError(t, c.prod.client.Set(ctx, c.prod.getCancelledKey(), "x", 0).Err()) // ZSCORE: WRONGTYPE
+		require.Eventually(t, func() bool { // again until the subscription is live
+			require.NoError(t, c.prod.client.Publish(ctx, c.prod.getControlKey(), cancelPrefix+"e").Err())
+			mu.Lock()
+			defer mu.Unlock()
+			return len(seen) > 0
+		}, time.Second, 50*time.Millisecond, "no call on a failed check")
+		mu.Lock()
+		assert.Equal(t, "e", seen[0])
+		mu.Unlock()
+		assert.Contains(t, buf.String(), "Error checking cancel mark of e")
+		require.NoError(t, c.prod.client.Del(ctx, c.prod.getCancelledKey()).Err())
+	})
+}
+
 // A job that ends another way despite its mark drops the mark.
 func TestCancelFinishClearsMark(t *testing.T) {
 	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
