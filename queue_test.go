@@ -2064,8 +2064,9 @@ func TestCancelExpiredMark(t *testing.T) {
 // once, not at the next minute's sweep trim.
 func TestCancelDropTrimsFailed(t *testing.T) {
 	pops := map[string]func(q *Queue){
-		"raw":    func(q *Queue) { rawPopOf(q) },
-		"single": func(q *Queue) { ackPopOf(q) },
+		"raw":       func(q *Queue) { rawPopOf(q) },
+		"single":    func(q *Queue) { ackPopOf(q) },
+		"batch one": func(q *Queue) { batchPopOf(q, make([]any, 1), make([]string, 1)) }, // the lean batch script
 		"batch": func(q *Queue) { // want 2: the full batch script
 			q.popLen.Store(2)
 			batchPopOf(q, make([]any, 2), make([]string, 2))
