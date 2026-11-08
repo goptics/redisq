@@ -786,6 +786,19 @@ func TestSweeperStopsWhenClientClosed(t *testing.T) {
 
 	assert.LessOrEqual(t, strings.Count(buf.String(), "Error requeueing"), 1)
 	assert.Error(t, q.Notification.ctx.Err(), "nudge loop and its ticker must stop too")
+	assert.Error(t, q.ctx.Err(), "pause loop waits on q.ctx")
+
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		assert.NoError(t, q.Close())
+		assert.NoError(t, q.Close())
+	}()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close hangs after the client closed")
+	}
 }
 
 // lockedBuffer collects log output written by other goroutines.

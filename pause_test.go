@@ -132,18 +132,6 @@ func TestPauseKeepsCancelledItem(t *testing.T) {
 	})
 }
 
-// Closing the client without closing the queue stops a started pause loop.
-func TestPauseLoopStopsWhenClientClosed(t *testing.T) {
-	qs := New(getTestRedisURL())
-	q := qs.NewQueue(newID())
-	require.NoError(t, q.Pause()) // starts the pause loop
-	defer pauseClient(t).client.Del(context.Background(), q.getPausedKey())
-	require.NoError(t, qs.Close())
-
-	assert.Eventually(t, func() bool { return q.ctx.Err() != nil }, 3*time.Second, 50*time.Millisecond,
-		"pause loop waits on q.ctx; it must end once the sweep sees the client closed")
-}
-
 // A paused pop still hands back what an earlier run of the same call popped
 // (a go-redis re-send), and a refused pop leaves no reservation behind.
 func TestPauseGuardBeforeGate(t *testing.T) {
