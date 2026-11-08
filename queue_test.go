@@ -1891,18 +1891,22 @@ func TestCancelCheckErrorCallsHook(t *testing.T) {
 		defer stop()
 
 		require.NoError(t, c.prod.client.Set(ctx, c.prod.getCancelledKey(), "x", 0).Err()) // ZSCORE: WRONGTYPE
+		t.Cleanup(func() { c.prod.client.Del(context.Background(), c.prod.getCancelledKey()) })
 		// publish again until the subscription is live
+		var pubErr error
 		require.Eventually(t, func() bool {
-			require.NoError(t, c.prod.client.Publish(ctx, c.prod.getControlKey(), cancelPrefix+"e").Err())
+			if pubErr = c.prod.client.Publish(ctx, c.prod.getControlKey(), cancelPrefix+"e").Err(); pubErr != nil {
+				return false
+			}
 			mu.Lock()
 			defer mu.Unlock()
 			return len(seen) > 0
 		}, time.Second, 50*time.Millisecond, "no call on a failed check")
+		require.NoError(t, pubErr)
 		mu.Lock()
 		assert.Equal(t, "e", seen[0])
 		mu.Unlock()
 		assert.Contains(t, buf.String(), "Error checking cancel mark of e")
-		require.NoError(t, c.prod.client.Del(ctx, c.prod.getCancelledKey()).Err())
 	})
 }
 
@@ -2506,7 +2510,9 @@ func TestWatchOutcomeOneOfTwoCancelled(t *testing.T) {
 		prod.outcomes.mu.Unlock()
 		assert.True(t, held, "B's entry stays")
 		ch := prod.donePrefix() + "j9"
-		assert.EqualValues(t, 1, prod.client.PubSubNumSub(t.Context(), ch).Val()[ch], "still subscribed")
+		require.Eventually(t, func() bool { // SUBSCRIBE is not awaited
+			return prod.client.PubSubNumSub(t.Context(), ch).Val()[ch] == 1
+		}, time.Second, 10*time.Millisecond, "still subscribed")
 
 		require.True(t, push(envelope("j9", `1`)))
 		require.True(t, cons.Acknowledge(popAck(t, cons)))
