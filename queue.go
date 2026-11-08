@@ -574,7 +574,10 @@ func (q *Queue) SetFailedRetention(most int, age time.Duration) {
 // workflow fields a Submit could write: wf a workflow ID, task a task name,
 // undo absent or a boolean, and id wf:<wf>:<task> (":undo" appended for
 // undo true). Mirrors varmq's taskTag.matches; anything else is a plain job
-// and no wf: key is built from it.
+// and no wf: key is built from it. Go's encoding/json matches keys without
+// case (and folds "ſ" to s, "K" to k), cjson does not: an envelope with
+// any such variant of id, wf, task or undo (wffold) reads differently in
+// varmq, so it is never a workflow item here and a cancel mark drops it.
 const envIDFn = `local function envid(v)
 	local ok, e = pcall(cjson.decode, v)
 	if ok and type(e) == 'table' and type(e.id) == 'string' then return e.id, e end
@@ -583,8 +586,16 @@ end
 local function wfname(s, n)
 	return type(s) == 'string' and #s >= 1 and #s <= n and string.find(s, '^[A-Za-z0-9_.%-]+$') ~= nil
 end
+local function wffold(k)
+	if type(k) ~= 'string' then return nil end
+	return string.lower((string.gsub(string.gsub(k, '\197\191', 's'), '\226\132\170', 'k')))
+end
 local function wftag(e, id)
 	if type(e) ~= 'table' or e.wf == nil then return false end
+	for k in pairs(e) do
+		local f = wffold(k)
+		if (f == 'id' or f == 'wf' or f == 'task' or f == 'undo') and k ~= f then return false end
+	end
 	if e.undo ~= nil and type(e.undo) ~= 'boolean' then return false end
 	if not wfname(e.wf, 128) or e.wf == 'index' or not wfname(e.task, 64) then return false end
 	return id == 'wf:' .. e.wf .. ':' .. e.task .. (e.undo == true and ':undo' or '')

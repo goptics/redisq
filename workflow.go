@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -663,6 +664,8 @@ func (q *Queue) FinishTask(ackID string, e contract.TaskEnd) ([]string, bool) {
 	if q.wf != nil {
 		limit, ret = q.wf.resultLimit, q.wf.retention
 	}
+	// ponytail: a queue with no store (only newQueueBase) settles every
+	// end as a plain job: it has no namespace to find workflows in.
 
 	state, reason, result := "completed", e.Reason, e.Result
 	switch e.Outcome {
@@ -681,7 +684,7 @@ func (q *Queue) FinishTask(ackID string, e contract.TaskEnd) ([]string, bool) {
 		return nil, false
 	}
 
-	if !validWorkflowID(e.Workflow) || !validTaskName(e.Task) {
+	if q.wf == nil || !validWorkflowID(e.Workflow) || !validTaskName(e.Task) {
 		return nil, q.finish(ackID, state, reason, result)
 	}
 
@@ -690,7 +693,7 @@ func (q *Queue) FinishTask(ackID string, e contract.TaskEnd) ([]string, bool) {
 	if e.Undo {
 		undo = "1"
 	}
-	wfKey := q.wfKey(e.Workflow)
+	wfKey := q.wf.key(e.Workflow)
 	var pushed []string
 	err := reread(func() error {
 		targets, kinds, err := wfTargets(q.ctx, q.client, wfKey)
@@ -716,21 +719,6 @@ func (q *Queue) FinishTask(ackID string, e contract.TaskEnd) ([]string, bool) {
 		return nil, false
 	}
 	return pushed, true
-}
-
-// wfKey is the hash of workflow id in this queue's namespace: its store's
-// prefix, else the part of the queue key before its kind.
-func (q *Queue) wfKey(id string) string {
-	if q.wf != nil {
-		return q.wf.key(id)
-	}
-	return q.keyPrefix() + "wf:" + id
-}
-
-// keyPrefix is redisq:[<ns>:] of this queue's key.
-func (q *Queue) keyPrefix() string {
-	head := q.queueKey[:strings.IndexByte(q.queueKey, '{')]
-	return strings.TrimSuffix(head, q.kind()+":")
 }
 
 // wfCancelScript is Cancel (spec 6.11). KEYS: workflow hash, push-target
@@ -873,6 +861,11 @@ func (s *workflowStore) Record(ctx context.Context, id string) (contract.Workflo
 	if err != nil {
 		return contract.WorkflowRecord{}, err
 	}
+	return s.recordOf(id, h)
+}
+
+// recordOf builds workflow id's record from its hash h.
+func (s *workflowStore) recordOf(id string, h map[string]string) (contract.WorkflowRecord, error) {
 	var m wfMeta
 	if h["meta"] == "" {
 		return contract.WorkflowRecord{}, s.notFound(id)
@@ -910,9 +903,17 @@ func (s *workflowStore) Workflows(ctx context.Context, state contract.WorkflowSt
 	if err != nil {
 		return nil, err
 	}
+	pipe := s.client.Pipeline()
+	hs := make([]*redis.MapStringStringCmd, len(keys))
+	for i, k := range keys {
+		hs[i] = pipe.HGetAll(ctx, s.key(k.ID))
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nil, err
+	}
 	out := make([]contract.WorkflowRecord, 0, len(keys))
-	for _, k := range keys {
-		r, err := s.Record(ctx, k.ID)
+	for i, k := range keys {
+		r, err := s.recordOf(k.ID, hs[i].Val())
 		if errors.Is(err, contract.ErrWorkflowNotFound) {
 			continue // expired since the listing
 		}
@@ -934,6 +935,7 @@ const listChunk = 200
 // ties sort by ID as varmq merges them.
 func (s *workflowStore) WorkflowKeys(ctx context.Context, state contract.WorkflowState, offset, limit int) ([]contract.WorkflowKey, error) {
 	offset, limit = max(offset, 0), max(limit, 0)
+	limit = min(limit, math.MaxInt-offset)
 	want := offset + limit
 	var out []contract.WorkflowKey
 	for start := int64(0); ; start += listChunk {
@@ -964,7 +966,7 @@ func (s *workflowStore) WorkflowKeys(ctx context.Context, state contract.Workflo
 			}
 		}
 		scanned := start + int64(len(zs))
-		if len(zs) < listChunk || state != "" && scanned >= int64(maxWorkflowsScan+limit) {
+		if len(zs) < listChunk || state != "" && scanned-int64(limit) >= maxWorkflowsScan {
 			return page(out, offset, want), nil
 		}
 	}
@@ -1060,17 +1062,17 @@ func (q *Queue) Purge() {
 
 func (q *Queue) purge() error {
 	del := append(q.requeueKeys(), q.getJobsKey(), q.getCompletedKey(), q.getFailedKey(), q.getStatsKey(), q.getCancelledKey())
-	ret := defaultWFRetention
-	if q.wf != nil {
-		ret = q.wf.retention
+	if q.wf == nil { // no store (newQueueBase): no workflows to find
+		return q.client.Del(q.ctx, del...).Err()
 	}
+	ret := q.wf.retention
 	var ids []string
 	// One try more than wfTries: the first only finds the workflows.
 	for range wfTries + 1 {
 		keys, qkeys, kinds := slices.Clone(del), []string(nil), ""
 		for _, id := range ids {
-			keys = append(keys, q.wfKey(id))
-			t, k, err := wfTargets(q.ctx, q.client, q.wfKey(id))
+			keys = append(keys, q.wf.key(id))
+			t, k, err := wfTargets(q.ctx, q.client, q.wf.key(id))
 			if err != nil {
 				return err
 			}

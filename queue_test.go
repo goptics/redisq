@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -3094,6 +3095,15 @@ func TestWorkflowPurgeCancels(t *testing.T) {
 	assert.Equal(t, []string{"x", "b"}, e.drain(completeAll), "b pushed into a after the purge")
 	assert.Equal(t, contract.WorkflowCompleted, e.record("p2").State, "a's cancel is absorbed by Always b")
 
+	// A priority queue: its members carry the sequence prefix.
+	require.NoError(t, e.store.Submit(ctx, wfPlan("p3", false, true,
+		tk{name: "a", q: e.b, prio: 2}, tk{name: "b", q: e.c, deps: []string{"a"}, always: true})))
+	e.b.Purge()
+	r = e.record("p3")
+	assert.Equal(t, contract.JobCancelled, r.Tasks[0].State)
+	assert.Equal(t, []string{"b"}, e.drain(completeAll))
+	assert.Equal(t, contract.WorkflowCompleted, e.record("p3").State)
+
 	// A queue with no workflow item purges in one call.
 	require.True(t, e.c.Enqueue("plain"))
 	e.c.Purge()
@@ -3136,6 +3146,7 @@ func TestWorkflowListing(t *testing.T) {
 	assert.Equal(t, []string{"w3", "w1"}, ids(contract.WorkflowFailed, 2, 5))
 	assert.Empty(t, ids(contract.WorkflowRunning, 0, 10))
 	assert.Empty(t, ids("", 0, 0))
+	assert.Equal(t, []string{"w2", "w3", "w1"}, ids("", 2, math.MaxInt), "no overflow")
 
 	recs, err := e.store.Workflows(ctx, contract.WorkflowCompleted, 0, 10)
 	require.NoError(t, err)
@@ -3262,12 +3273,15 @@ func TestCancelGateWorkflowItem(t *testing.T) {
 	items := map[string]string{
 		"wf:w:a":      string(wfEnvelope("w", "a", false, "1")),
 		"wf:w:a:undo": string(wfEnvelope("w", "a", true, "1")),
-		"wf:w:b":      `{"id":"wf:w:b","wf":"w"}`,                         // no task
-		"wf:w:c":      `{"id":"wf:w:c","wf":"w","task":"c","undo":"yes"}`, // undo not a bool
-		"wf:x:d":      `{"id":"wf:x:d","wf":"w","task":"d"}`,              // id names another workflow
-		"wf:w:e:undo": `{"id":"wf:w:e:undo","wf":"w","task":"e"}`,         // undo id without undo
-		"wf:index:f":  `{"id":"wf:index:f","wf":"index","task":"f"}`,      // reserved ID
-		"wf:w:g":      `{"id":"wf:w:g","wf":null,"task":"g"}`,             // null wf
+		"wf:w:b":      `{"id":"wf:w:b","wf":"w"}`,                           // no task
+		"wf:w:c":      `{"id":"wf:w:c","wf":"w","task":"c","undo":"yes"}`,   // undo not a bool
+		"wf:x:d":      `{"id":"wf:x:d","wf":"w","task":"d"}`,                // id names another workflow
+		"wf:w:e:undo": `{"id":"wf:w:e:undo","wf":"w","task":"e"}`,           // undo id without undo
+		"wf:index:f":  `{"id":"wf:index:f","wf":"index","task":"f"}`,        // reserved ID
+		"wf:w:g":      `{"id":"wf:w:g","wf":null,"task":"g"}`,               // null wf
+		"wf:w:h":      `{"id":"wf:w:h","wf":"w","task":"h","WF":""}`,        // Go reads WF: a plain job there
+		"wf:w:i":      `{"id":"wf:w:i","wf":"w","task":"i","tas\u212a":""}`, // Kelvin sign k: Go folds it
+		"wf:w:j":      `{"id":"wf:w:j","wf":"w","task":"j","ID":"x"}`,       // Go reads ID
 	}
 	for id, v := range items {
 		require.NoError(t, q.CancelJob(id))
@@ -3285,8 +3299,8 @@ func TestCancelGateWorkflowItem(t *testing.T) {
 // Two varmq worker processes, each serving part of the queues, and a
 // producer process run one workflow end to end (examples/workflow).
 func TestWorkflowTwoProcesses(t *testing.T) {
-	if testing.Short() {
-		t.Skip("builds examples/workflow")
+	if _, err := exec.LookPath("go"); testing.Short() || err != nil {
+		t.Skip("builds examples/workflow with the go tool")
 	}
 	bin := filepath.Join(t.TempDir(), "workflow")
 	build := exec.Command("go", "build", "-o", bin, ".")
