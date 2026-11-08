@@ -90,13 +90,14 @@ func (pq *PriorityQueue) Dequeue() (any, bool) {
 		log.Println("queue closed, cannot dequeue")
 		return nil, false
 	default:
-		// Get and remove the highest priority item (lowest score) in a single operation
+		// Get and remove the highest priority item (lowest score) in a single
+		// operation; the script strips the sequence prefix
 		v, ok := pq.rawPop(zsetRawPop)
 		if !ok {
 			return nil, false
 		}
 
-		return itemOf(v), true
+		return []byte(v), true
 	}
 }
 

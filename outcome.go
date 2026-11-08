@@ -54,8 +54,8 @@ func (q *Queue) donePrefix() string {
 	return q.queueKey + ":done:"
 }
 
-// WatchOutcome calls fn once, from its own goroutine, when job id completes
-// or fails in any process; a job whose record is still kept is reported
+// WatchOutcome calls fn once, from its own goroutine, when job id completes,
+// fails or is cancelled in any process; a job whose record is still kept is reported
 // even if it ended before the call. After fn the watch ends by itself, and
 // the id's channel is unsubscribed once it has no watchers. cancel stops an
 // early watch; fn is not called after cancel returns, except a call already
@@ -150,16 +150,15 @@ func (o *outcomeWatchers) close() {
 }
 
 // outcome handles a message on an outcome channel and reports whether it
-// was one. A payload that isn't a final JobOutcome (completed or failed) is
-// dropped; the sweep reads the record instead.
+// was one. A payload that isn't a final JobOutcome (completed, failed or
+// cancelled) is dropped; the sweep reads the record instead.
 func (q *Queue) outcome(msg *redis.Message) bool {
 	id, ok := strings.CutPrefix(msg.Channel, q.donePrefix())
 	if !ok {
 		return false
 	}
 	var out contract.JobOutcome
-	if json.Unmarshal([]byte(msg.Payload), &out) == nil &&
-		(out.State == contract.JobCompleted || out.State == contract.JobFailed) {
+	if json.Unmarshal([]byte(msg.Payload), &out) == nil && final(out.State) {
 		out.ID = id
 		q.deliver(id, out)
 	}
@@ -205,20 +204,28 @@ func (q *Queue) catchUp(ids []string) {
 	}
 }
 
+// final reports whether s ends a job (spec 6.13, 6.14).
+func final(s contract.JobState) bool {
+	return s == contract.JobCompleted || s == contract.JobFailed || s == contract.JobCancelled
+}
+
 // outcomeOf turns Job Record rec of job id into its outcome: the state, the
-// last error's text, the result as stored.
+// last error's text, the result as stored. A cancelled record without
+// errors (dropped before it ran) gets error "cancelled", as its message.
 func outcomeOf(id, rec string) (contract.JobOutcome, bool) {
 	var r struct {
 		State  contract.JobState   `json:"state"`
 		Errors []contract.JobError `json:"errors"`
 		Result json.RawMessage     `json:"result"`
 	}
-	if json.Unmarshal([]byte(rec), &r) != nil || (r.State != contract.JobCompleted && r.State != contract.JobFailed) {
+	if json.Unmarshal([]byte(rec), &r) != nil || !final(r.State) {
 		return contract.JobOutcome{}, false
 	}
 	out := contract.JobOutcome{ID: id, State: r.State, Result: r.Result}
 	if n := len(r.Errors); n > 0 {
 		out.Error = r.Errors[n-1].Error
+	} else if r.State == contract.JobCancelled {
+		out.Error = "cancelled"
 	}
 	return out, true
 }

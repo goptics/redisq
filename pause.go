@@ -191,7 +191,8 @@ func (q *Queue) pauseLoop() {
 // it was a control message. Messages are hints (spec 6.8), and an unknown
 // one is ignored. "resumed" is taken as is: a wrong one costs one refused
 // pop, which sets the flag back. "paused:" only makes pauseLoop read the
-// key, so forged ones never stop this consumer.
+// key, so forged ones never stop this consumer. "cancel:<id>" goes to the
+// OnCancel callbacks (see cancel.go).
 func (q *Queue) control(msg *redis.Message) bool {
 	if msg.Channel != q.getControlKey() {
 		return false
@@ -205,6 +206,8 @@ func (q *Queue) control(msg *redis.Message) bool {
 		q.pauseHooks.gen.Add(1)
 		q.pauseHooks.recheck.Store(true)
 		q.kickPause()
+	case strings.HasPrefix(msg.Payload, cancelPrefix):
+		q.cancelRequested(msg.Payload[len(cancelPrefix):])
 	}
 	return true
 }
@@ -222,7 +225,7 @@ func (q *Queue) getPausedKey() string {
 	return q.pausedKey
 }
 
-// getControlKey returns the pub/sub channel of pause and resume messages
+// getControlKey returns the pub/sub channel of pause, resume and cancel messages
 func (q *Queue) getControlKey() string {
 	return q.controlKey
 }

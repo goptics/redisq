@@ -52,6 +52,7 @@ type Queue struct {
 	paused                atomic.Bool                 // the queue pause as this object last saw it (see pause.go)
 	pauseHooks            pauseHooks                  // OnPauseChange callbacks
 	pausedKey, controlKey string                      // <key>:paused and <key>:control, built once
+	cancelHooks           cancelHooks                 // OnCancel callbacks (see cancel.go)
 	rawKeys               []string                    // what Dequeue's scripts take
 	closeOnce             sync.Once
 	outcomes              outcomeWatchers // WatchOutcome watchers (see outcome.go)
@@ -99,8 +100,9 @@ func newQueueBase(c *redis.Client, queueKey string) *Queue {
 		ackPrefix: newID(),
 	}
 	q.pauseHooks.kick = make(chan struct{}, 1)
+	q.cancelHooks.kick = make(chan struct{}, 1)
 	q.pausedKey, q.controlKey = queueKey+":paused", queueKey+":control"
-	q.rawKeys = []string{queueKey, q.pausedKey}
+	q.rawKeys = []string{queueKey, q.pausedKey, q.getCancelledKey(), q.getJobsKey(), q.getCompletedKey(), q.getFailedKey(), q.getAttemptsKey()}
 	q.visibilityTimeout.Store(int64(5 * time.Minute))
 	q.dedupWindow.Store(int64(5 * time.Minute))
 	q.heartbeatTimeout.Store(int64(30 * time.Second))
@@ -198,20 +200,26 @@ func (q *Queue) Dequeue() (any, bool) {
 }
 
 // listRawPop and zsetRawPop are Dequeue's pop without acknowledgment: 0 while
-// KEYS[2], :paused, exists, else the item, or false when the queue is empty.
+// KEYS[2], :paused, exists, else the item (a zset's without its sequence
+// prefix), or false when the queue is empty. Cancelled items are dropped
+// (see cancelFn). KEYS[3..7]: :cancelled, :jobs, :completed, :failed,
+// :attempts. ARGV: failed retention (most, age ms), outcome channel prefix.
 var (
-	listRawPop = redis.NewScript(`if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
-return redis.call('LPOP', KEYS[1])`)
-	zsetRawPop = redis.NewScript(`if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
-return redis.call('ZPOPMIN', KEYS[1])[1] or false`)
+	listRawPop = rawPopScript(listPop1)
+	zsetRawPop = rawPopScript(zsetPop1)
 )
+
+func rawPopScript(pop1 string) *redis.Script {
+	return redis.NewScript(deadlineFn + envIDFn + trimFn + cancelFn("3", "1") +
+		"if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end\n" + pop1 + popOneGate + "return v or false")
+}
 
 // rawPop runs pop and returns its item as stored. A consumer whose pop
 // finds the queue empty joins the idle set; a paused miss stays out (spec
 // 6.2).
 func (q *Queue) rawPop(pop *redis.Script) (string, bool) {
 	g := q.pauseHooks.gen.Load()
-	reply, err := pop.Run(q.ctx, q.client, q.rawKeys).Result()
+	reply, err := pop.Run(q.ctx, q.client, q.rawKeys, q.cancelArgs()...).Result()
 	if err == redis.Nil {
 		if !q.Paused() {
 			q.markIdle()
@@ -281,7 +289,9 @@ func (q *Queue) SetDedupWindow(d time.Duration) {
 // A push also drops the id's (ARGV[#ARGV - 1]) old Job Record: KEYS[#KEYS -
 // 3] :jobs, KEYS[#KEYS - 2] :completed, KEYS[#KEYS - 1] :failed. Else an id
 // reused after the window has WatchOutcome's catch-up report the previous
-// run's outcome and result (spec 6.13). A dedupe hit changes nothing.
+// run's outcome and result (spec 6.13). And its cancel mark, KEYS[#KEYS - 4]
+// :cancelled, so the new job isn't dropped (spec 6.14). A dedupe hit changes
+// nothing.
 func once(body string) string {
 	return `if redis.call('EXISTS', KEYS[#KEYS]) == 1 then return 0 end
 local r = (function()
@@ -291,6 +301,7 @@ redis.call('SET', KEYS[#KEYS], '1', 'PX', ARGV[#ARGV])
 redis.call('HDEL', KEYS[#KEYS - 3], ARGV[#ARGV - 1])
 redis.call('ZREM', KEYS[#KEYS - 2], ARGV[#ARGV - 1])
 redis.call('ZREM', KEYS[#KEYS - 1], ARGV[#ARGV - 1])
+redis.call('SREM', KEYS[#KEYS - 4], ARGV[#ARGV - 1])
 return r`
 }
 
@@ -325,11 +336,11 @@ func (q *Queue) EnqueueOnce(item any, id string) bool {
 }
 
 // enqueueOnceWith is enqueueWith for a script built with once: it adds the
-// record keys and id's key to keys, and id and the dedupe window to the
-// arguments.
+// cancel mark, record and id's keys to keys, and id and the dedupe window
+// to the arguments.
 func (q *Queue) enqueueOnceWith(script *redis.Script, keys []string, item any, id string, extra ...any) bool {
 	window := max(1, time.Duration(q.dedupWindow.Load()).Milliseconds())
-	keys = append(keys, q.getJobsKey(), q.getCompletedKey(), q.getFailedKey(), q.queueKey+":dedup:"+id)
+	keys = append(keys, q.getCancelledKey(), q.getJobsKey(), q.getCompletedKey(), q.getFailedKey(), q.queueKey+":dedup:"+id)
 	return q.enqueueWith(script, keys, item, append(extra, id, window)...)
 }
 
@@ -365,11 +376,11 @@ func (q *Queue) Len() int {
 // Purge deletes all of the queue's jobs and job data in one step: waiting
 // and processing items (an Acknowledge or Reject of a purged item then does
 // nothing), deadlines, start times, attempt counts, Job Records, the :stats
-// counters, and a priority queue's sequence and priorities. Consumer state
-// stays (the idle set, heartbeats, presence), and so do EnqueueOnce ids,
-// which expire on their own (see EnqueueOnce).
+// counters, cancel marks, and a priority queue's sequence and priorities.
+// Consumer state stays (the idle set, heartbeats, presence), and so do
+// EnqueueOnce ids, which expire on their own (see EnqueueOnce).
 func (q *Queue) Purge() {
-	q.client.Del(q.ctx, append(q.requeueKeys(), q.getJobsKey(), q.getCompletedKey(), q.getFailedKey(), q.getStatsKey())...)
+	q.client.Del(q.ctx, append(q.requeueKeys(), q.getJobsKey(), q.getCompletedKey(), q.getFailedKey(), q.getStatsKey(), q.getCancelledKey())...)
 }
 
 func (q *Queue) Values() []any {
@@ -439,6 +450,8 @@ func (q *Queue) Reject(ackID string, reason string) bool {
 	return q.finish(ackID, "failed", reason, nil)
 }
 
+// finish ends ackID's job in state (completed, failed or cancelled). A
+// cancelled job is indexed, kept and counted as failed (spec 6.14: as Reject).
 func (q *Queue) finish(ackID, state, reason string, result []byte) bool {
 	if q.ctx.Err() != nil {
 		log.Println("queue closed, cannot acknowledge or reject")
@@ -447,12 +460,14 @@ func (q *Queue) finish(ackID, state, reason string, result []byte) bool {
 
 	this, other := q.getCompletedKey(), q.getFailedKey()
 	keep, age := q.keepCompleted.Load(), q.keepCompletedAge.Load()
-	if state == "failed" {
+	counter := "completed"
+	if state != "completed" {
 		this, other = other, this
 		keep, age = q.keepFailed.Load(), q.keepFailedAge.Load()
+		counter = "failed"
 	}
-	keys := []string{q.getNackedItemKey(), q.getTimeoutKey(), q.getStartedKey(), q.getAttemptsKey(), q.getStatsKey(), q.getJobsKey(), this, other, q.getPriorityKey()}
-	r, err := finishScript.Run(q.ctx, q.client, keys, ackID, state, reason, keep, time.Duration(age).Milliseconds(), result, q.donePrefix()).Int()
+	keys := []string{q.getNackedItemKey(), q.getTimeoutKey(), q.getStartedKey(), q.getAttemptsKey(), q.getStatsKey(), q.getJobsKey(), this, other, q.getPriorityKey(), q.getCancelledKey()}
+	r, err := finishScript.Run(q.ctx, q.client, keys, ackID, state, reason, keep, time.Duration(age).Milliseconds(), result, q.donePrefix(), counter).Int()
 	if err != nil {
 		log.Printf("Error finishing item as %s: %v", state, err)
 		return false
@@ -511,12 +526,15 @@ const trimFn = `local function trim(z, jobs, keep, age, now)
 end
 `
 
-// finishScript is Acknowledge and Reject (spec/redis-storage.md 6.3, 6.4).
+// finishScript is Acknowledge, Reject and AcknowledgeCancelled
+// (spec/redis-storage.md 6.3, 6.4, 6.14).
 //
 // KEYS: nacked, timeouts, started, attempts, stats, jobs, the state's ZSET,
-// the other state's ZSET, prio. ARGV: ack ID, state (completed or failed),
-// reason, most records kept, longest age (ms), result JSON (” for none),
-// outcome channel prefix (<base>:done:).
+// the other state's ZSET, prio, cancelled. ARGV: ack ID, state (completed,
+// failed or cancelled), reason, most records kept, longest age (ms), result
+// JSON (” for none), outcome channel prefix (<base>:done:), :stats counter.
+//
+// Every finish drops the Job ID's cancel mark: the job ended.
 //
 // A result that cjson can't decode returns -1 before any write. A completed
 // record gets "result", spliced raw: a cjson round trip turns big integers
@@ -545,7 +563,8 @@ if id ~= '' then
 else
 	id = ARGV[1]
 end
-redis.call('HINCRBY', KEYS[5], ARGV[2], 1)
+redis.call('SREM', KEYS[10], id)
+redis.call('HINCRBY', KEYS[5], ARGV[8], 1)
 local now = tonumber(nowms())
 local keep, age = tonumber(ARGV[4]), tonumber(ARGV[5])
 redis.call('ZREM', KEYS[8], id)
@@ -556,7 +575,7 @@ if keep > 0 and age > 0 then
 	if started then rec = rec .. ',"started_at":' .. string.format('%.0f', started) end
 	rec = rec .. ',"finished_at":' .. string.format('%.0f', now) .. ',"attempts":' .. string.format('%.0f', attempts)
 	if ARGV[2] == 'completed' and ARGV[6] ~= '' then rec = rec .. ',"result":' .. ARGV[6] end
-	if ARGV[2] == 'failed' then
+	if ARGV[2] ~= 'completed' then
 		rec = rec .. ',"errors":[{"attempt":' .. string.format('%.0f', attempts) .. ',"at":' .. string.format('%.0f', now) .. ',"error":' .. cjson.encode(ARGV[3]) .. '}]'
 	end
 	redis.call('HSET', KEYS[6], id, rec .. '}')
@@ -567,7 +586,7 @@ end
 trim(KEYS[7], KEYS[6], keep, age, now)
 if env ~= '' then
 	local out = '{"id":' .. cjson.encode(env) .. ',"state":"' .. ARGV[2] .. '"'
-	if ARGV[2] == 'failed' then out = out .. ',"error":' .. cjson.encode(ARGV[3]) end
+	if ARGV[2] ~= 'completed' then out = out .. ',"error":' .. cjson.encode(ARGV[3]) end
 	if ARGV[2] == 'completed' and ARGV[6] ~= '' then out = out .. ',"result":' .. ARGV[6] end
 	redis.call('PUBLISH', ARGV[7] .. env, out .. '}')
 end
@@ -599,11 +618,13 @@ const maxPop = 1000
 // popHead and popTail wrap the storage-specific part of the ack pop scripts,
 // which leaves the popped items, as stored, in `items`.
 //
-// KEYS: queue, pending hash, deadlines, idle set [, priorities], paused,
-// start times, heartbeats (see popKeys).
+// KEYS: queue, pending hash, deadlines, idle set [, priorities], cancelled,
+// jobs, completed, failed, attempts, paused, start times, heartbeats (see
+// popKeys).
 // ARGV: want, visibility timeout (seconds; 0: none), ack ID
 // prefix, reservation (20-digit start), consumer ID (” if the caller is not
-// a distributed consumer), the caller's free slots, heartbeat timeout
+// a distributed consumer), the caller's free slots, failed retention (most,
+// age ms) and outcome channel prefix (see cancelFn), heartbeat timeout
 // (seconds; 0: none), the ack ID prefix again (see beatFn).
 //
 // Item i is pending under "<prefix>:<reservation>:<i as 4 digits>". IDs are
@@ -623,7 +644,7 @@ const maxPop = 1000
 // slots makes a distributed consumer join the idle set, in the same step, so
 // an enqueue right after it wakes it. A hand-back counts too: a reused
 // reservation can be smaller than the call.
-const popHead = deadlineFn + beatFn + `local want, pre, resv = tonumber(ARGV[1]), ARGV[3], ARGV[4]
+var popHead = deadlineFn + beatFn + envIDFn + trimFn + cancelFn("#KEYS - 7", "#ARGV - 4") + `local want, pre, resv = tonumber(ARGV[1]), ARGV[3], ARGV[4]
 local dl = deadline(ARGV[2])
 local function reply(items)
 	local len = redis.call(__LEN__, KEYS[1])
@@ -668,29 +689,69 @@ if n > 0 then
 end
 return reply(items)`
 
-// popScript builds an ack pop script whose body pops into `items`, for
-// storage whose length command is lenCmd.
-func popScript(lenCmd, body string) *redis.Script {
-	return redis.NewScript(strings.ReplaceAll(popHead+pausedBatch+body+popTail, "__LEN__", "'"+lenCmd+"'"))
+// popScript builds an ack pop script for storage whose length command is
+// lenCmd: take(k) pops up to k items and returns them, as stored, with
+// their scores (see listTake), popGate drops the cancelled ones, and after
+// runs on the items handed out.
+func popScript(lenCmd, take, after string) *redis.Script {
+	return redis.NewScript(strings.ReplaceAll(popHead+pausedBatch+take+popGate+after+popTail, "__LEN__", "'"+lenCmd+"'"))
 }
 
-var (
-	// listAckPop pops from the head of a list. LRANGE+LTRIM rather than
-	// LPOP with a count, which needs Redis 6.2. dequeueBatch sends every
-	// one-item call to the lean script, so want is at least 2 here.
-	listAckPop = popScript("LLEN", `items = redis.call('LRANGE', KEYS[1], 0, want - 1)
-if #items > 0 then redis.call('LTRIM', KEYS[1], #items, -1) end`)
-	// zsetAckPop pops the lowest scores, stores the bare items (without the
-	// sequence prefix) and keeps each score in KEYS[5] so a requeue restores
-	// the item's priority.
-	zsetAckPop = popScript("ZCARD", `local r, p = redis.call('ZPOPMIN', KEYS[1], want), {}
-for i = 1, #r / 2 do
-	local m = r[2*i-1]
-	if #m >= 17 and string.byte(m, 1) == 255 then m = string.sub(m, 18) end
-	items[i] = m
-	p[2*i-1] = ids[i]; p[2*i] = r[2*i]
+// popGate pops want items into items (scores in sc). With cancel marks
+// (spec 6.14) it drops the marked items (see cancelFn) and pops more in
+// their place, until it has want or the queue is empty. Without them it
+// costs one EXISTS.
+const popGate = `local sc
+items, sc = take(want)
+if #items > 0 and cancelling() then
+	local all, alls = items, sc
+	items, sc = {}, {}
+	while #all > 0 do
+		for i, v in ipairs(all) do
+			if not dropped(v) then items[#items + 1] = v; sc[#items] = alls[i] end
+		end
+		if #items == want then break end
+		all, alls = take(want - #items)
+	end
 end
-if #items > 0 then redis.call('HSET', KEYS[5], unpack(p)) end`)
+`
+
+const (
+	// listTake pops from the head of a list. LRANGE+LTRIM rather than LPOP
+	// with a count, which needs Redis 6.2. A list has no scores.
+	listTake = `local function take(k)
+	local r = redis.call('LRANGE', KEYS[1], 0, k - 1)
+	if #r > 0 then redis.call('LTRIM', KEYS[1], #r, -1) end
+	return r, {}
+end
+`
+	// zsetTake pops the lowest scores and returns the bare items (without
+	// the sequence prefix).
+	zsetTake = `local function take(k)
+	local r, it, s = redis.call('ZPOPMIN', KEYS[1], k), {}, {}
+	for i = 1, #r / 2 do
+		local m = r[2*i-1]
+		if #m >= 17 and string.byte(m, 1) == 255 then m = string.sub(m, 18) end
+		it[i] = m; s[i] = r[2*i]
+	end
+	return it, s
+end
+`
+	// zsetKeepPrio keeps each handed-out item's score in KEYS[5] so a
+	// requeue restores its priority.
+	zsetKeepPrio = `if #items > 0 then
+	local p = {}
+	for i = 1, #items do p[2*i-1] = ids[i]; p[2*i] = sc[i] end
+	redis.call('HSET', KEYS[5], unpack(p))
+end
+`
+)
+
+var (
+	// dequeueBatch sends every one-item call to the lean script, so want is
+	// at least 2 here.
+	listAckPop = popScript("LLEN", listTake, "")
+	zsetAckPop = popScript("ZCARD", zsetTake, zsetKeepPrio)
 )
 
 // popOneHead and popOneTail wrap the lean single-item pop that DequeueWithAckId
@@ -700,8 +761,9 @@ if #items > 0 then redis.call('HSET', KEYS[5], unpack(p)) end`)
 // before batches.
 //
 // ARGV: visibility timeout (seconds; 0: none), ack ID, consumer ID (” if
-// the caller is not a distributed consumer), heartbeat timeout, ack ID prefix.
-const popOneHead = deadlineFn + beatFn + `local dl = deadline(ARGV[1])
+// the caller is not a distributed consumer), failed retention (most, age
+// ms), outcome channel prefix, heartbeat timeout, ack ID prefix.
+var popOneHead = deadlineFn + beatFn + envIDFn + trimFn + cancelFn("#KEYS - 7", "#ARGV - 4") + `local dl = deadline(ARGV[1])
 local held = redis.call('HGET', KEYS[2], ARGV[2])
 if held then
 	if dl > 0 then
@@ -724,16 +786,36 @@ redis.call('HSET', KEYS[#KEYS - 1], ARGV[2], nowms())
 beat()
 return v`
 
-// listPopOne and zsetPopOne pop one item into v (nil when empty). The zset
-// one keeps the item's score in KEYS[5] and strips the sequence prefix.
+// listPop1 and zsetPop1 define pop1(), which pops one item and returns it
+// (false when empty) and its score (zset only); the zset one strips the
+// sequence prefix.
 const (
-	listPopOne = `local v = redis.call('LPOP', KEYS[1])`
-	zsetPopOne = `local r = redis.call('ZPOPMIN', KEYS[1])
-local v = r[1]
-if v then
-	redis.call('HSET', KEYS[5], ARGV[2], r[2])
-	if #v >= 17 and string.byte(v, 1) == 255 then v = string.sub(v, 18) end
-end`
+	listPop1 = `local function pop1() return redis.call('LPOP', KEYS[1]) end
+`
+	zsetPop1 = `local function pop1()
+	local r = redis.call('ZPOPMIN', KEYS[1])
+	local v = r[1]
+	if v and #v >= 17 and string.byte(v, 1) == 255 then v = string.sub(v, 18) end
+	return v or false, r[2]
+end
+`
+)
+
+// popOneGate pops one item into v (false when empty), score sc. With cancel
+// marks it drops marked items (see cancelFn) and pops the next, so a
+// dropped head never leaves the consumer idle with work waiting.
+const popOneGate = `local v, sc = pop1()
+if v and cancelling() then
+	while v and dropped(v) do v, sc = pop1() end
+end
+`
+
+// listPopOne and zsetPopOne pop one item into v; the zset one keeps its
+// score in KEYS[5] (see zsetKeepPrio).
+const (
+	listPopOne = listPop1 + popOneGate
+	zsetPopOne = zsetPop1 + popOneGate + `if v then redis.call('HSET', KEYS[5], ARGV[2], sc) end
+`
 )
 
 var (
@@ -747,7 +829,8 @@ var (
 // building and checking ack IDs for the slots it would not fill.
 //
 // ARGV: visibility timeout, ack ID, consumer ID, the caller's free slots,
-// heartbeat timeout, ack ID prefix.
+// failed retention (most, age ms), outcome channel prefix, heartbeat
+// timeout, ack ID prefix.
 var popOneLenHead = `local function reply(items)
 	local len = redis.call(__LEN__, KEYS[1])
 	if ARGV[3] ~= '' and len == 0 and #items < tonumber(ARGV[4]) then redis.call('SADD', KEYS[4], ARGV[3]) end
@@ -822,7 +905,8 @@ func (q *Queue) dequeueOne(pop *redis.Script, extraKeys ...string) (item any, ok
 	r := q.reserve(1, 1)
 	ackID = q.ackIDOf(fmt.Sprintf("%020d", r.start), 1)
 	g := q.pauseHooks.gen.Load()
-	reply, err := pop.Run(q.ctx, q.client, q.popKeys(extraKeys...), q.vt(), ackID, consumer, q.hbt(), q.ackPrefix).Result()
+	args := append(append([]any{q.vt(), ackID, consumer}, q.cancelArgs()...), q.hbt(), q.ackPrefix)
+	reply, err := pop.Run(q.ctx, q.client, q.popKeys(extraKeys...), args...).Result()
 	if err == redis.Nil {
 		return nil, false, ""
 	}
@@ -844,10 +928,19 @@ func (q *Queue) dequeueOne(pop *redis.Script, extraKeys ...string) (item any, ok
 }
 
 // popKeys are the keys of the ack pop scripts (see popHead), with extraKeys
-// (a zset's :prio) after the idle set. The last three are read from the end:
-// :paused, :started, :heartbeats.
+// (a zset's :prio) after the idle set. The rest are read from the end:
+// :cancelled, :jobs, :completed, :failed, :attempts (see cancelFn), :paused,
+// :started, :heartbeats.
 func (q *Queue) popKeys(extraKeys ...string) []string {
-	return append(append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey()}, extraKeys...), q.getPausedKey(), q.getStartedKey(), q.getHeartbeatKey())
+	return append(append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey()}, extraKeys...),
+		q.getCancelledKey(), q.getJobsKey(), q.getCompletedKey(), q.getFailedKey(), q.getAttemptsKey(),
+		q.getPausedKey(), q.getStartedKey(), q.getHeartbeatKey())
+}
+
+// cancelArgs are the pop scripts' arguments for cancelFn: failed retention
+// (most, age ms) and the outcome channel prefix.
+func (q *Queue) cancelArgs() []any {
+	return []any{q.keepFailed.Load(), time.Duration(q.keepFailedAge.Load()).Milliseconds(), q.donePrefix()}
 }
 
 // reserve returns the ack IDs for a pop of up to want items, by a call with
@@ -952,10 +1045,11 @@ func (q *Queue) dequeueBatch(pop, popOne *redis.Script, items []any, ackIDs []st
 	keys := q.popKeys(extraKeys...)
 	g := q.pauseHooks.gen.Load()
 	var reply []any
+	tail := append(q.cancelArgs(), q.hbt(), q.ackPrefix)
 	if r.want == 1 {
-		reply, err = popOne.Run(q.ctx, q.client, keys, q.vt(), q.ackIDOf(resv, 1), consumer, slots, q.hbt(), q.ackPrefix).Slice()
+		reply, err = popOne.Run(q.ctx, q.client, keys, append([]any{q.vt(), q.ackIDOf(resv, 1), consumer, slots}, tail...)...).Slice()
 	} else {
-		reply, err = pop.Run(q.ctx, q.client, keys, r.want, q.vt(), q.ackPrefix, resv, consumer, slots, q.hbt(), q.ackPrefix).Slice()
+		reply, err = pop.Run(q.ctx, q.client, keys, append([]any{r.want, q.vt(), q.ackPrefix, resv, consumer, slots}, tail...)...).Slice()
 	}
 	if err != nil {
 		q.retryPop.CompareAndSwap(nil, r)
@@ -1335,6 +1429,11 @@ func (q *Queue) getCompletedKey() string {
 // getFailedKey returns the Redis key for the failed jobs by finish time
 func (q *Queue) getFailedKey() string {
 	return q.queueKey + ":failed"
+}
+
+// getCancelledKey returns the Redis key for the Job IDs with a cancel request
+func (q *Queue) getCancelledKey() string {
+	return q.queueKey + ":cancelled"
 }
 
 // getStatsKey returns the Redis key for the submitted, completed and failed
