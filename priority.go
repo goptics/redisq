@@ -70,7 +70,7 @@ func newPriorityQueue(client *redis.Client, queueKey string) *PriorityQueue {
 // consumers, as Queue.Enqueue does. Lower priority values (closer to 1) will
 // be dequeued first.
 func (pq *PriorityQueue) Enqueue(item any, priority int) bool {
-	return pq.enqueueWith(zsetPushWake, pq.pushKeys(), item, priority, pq.getWakePrefix())
+	return pq.enqueueWith(zsetPushWake, pq.pushKeys(), item, priority, pq.wakePrefix)
 }
 
 // EnqueueOnce is Enqueue for a job with an id (see Queue.EnqueueOnce). A
@@ -79,7 +79,7 @@ func (pq *PriorityQueue) EnqueueOnce(item any, priority int, id string) bool {
 	if id == "" || pq.dedupWindow.Load() <= 0 {
 		return pq.Enqueue(item, priority)
 	}
-	return pq.enqueueOnceWith(zsetPushWakeOnce, pq.pushKeys(), item, id, priority, pq.getWakePrefix())
+	return pq.enqueueOnceWith(zsetPushWakeOnce, pq.pushKeys(), item, id, priority, pq.wakePrefix)
 }
 
 // Dequeue removes and returns the highest priority item from the queue

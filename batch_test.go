@@ -439,6 +439,8 @@ func TestDequeueBatchShortPopRetry(t *testing.T) {
 			late := []string{"n0", "n1", "n2", "n3", "n4"}
 			all = append(all, late...)
 			directPQ := &PriorityQueue{Queue: newQueueBase(direct.client, q.queueKey)}
+			directPQ.Notification = &Notification{wakePrefix: q.wakePrefix} // no start: Enqueue reads only this
+
 			p.onDrop = func() { // between the first run and the re-send
 				for _, v := range late {
 					if c.name == "priority" {

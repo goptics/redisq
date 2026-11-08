@@ -106,7 +106,7 @@ func (q *Queue) Pause() error {
 // Idempotent.
 func (q *Queue) Resume() error {
 	keys := []string{q.getPausedKey(), q.queueKey, q.getIdleKey(), q.getControlKey()}
-	if err := resumeScript.Run(q.ctx, q.client, keys, q.getWakePrefix(), q.lenCmd()).Err(); err != nil {
+	if err := resumeScript.Run(q.ctx, q.client, keys, q.wakePrefix, q.lenCmd()).Err(); err != nil {
 		return err
 	}
 	q.pauseHooks.gen.Add(1)

@@ -31,7 +31,6 @@ type Queue struct {
 	// each command, pipeline and script on its own.
 	expiration            atomic.Int64                // time.Duration
 	visibilityTimeout     atomic.Int64                // time.Duration
-	onRequeue             atomic.Pointer[func(int64)] // called after the sweeper requeues n items
 	ackPrefix             string                      // ack IDs are <ackPrefix>:<reservation>:<index>, unique per Queue object
 	ackSeq                atomic.Uint64               // last reservation number handed out
 	retryPop              atomic.Pointer[reservation] // ack IDs of a pop that failed with an error, reused by the next pop
@@ -77,7 +76,6 @@ func newQueue(c *redis.Client, queueKey string) *Queue {
 func (q *Queue) start() {
 	q.presence = q.client.Subscribe(q.ctx, q.queueKey+":wake:"+q.ackPrefix, q.getControlKey())
 	q.Notification = newNotification(q.client, q.presence, q.queueKey, q.lenCmd(), q.ackPrefix, q.handle)
-	q.setOnRequeue(q.wake)
 	q.tick()
 	go q.sweep()
 	q.Notification.Start()
@@ -268,7 +266,7 @@ func (q *Queue) toBytes(item any) ([]byte, error) {
 // Enqueue pushes item and wakes idle consumers, up to one per waiting item,
 // in one round trip.
 func (q *Queue) Enqueue(item any) bool {
-	return q.enqueueWith(listPushWake, q.pushKeys(), item, q.getWakePrefix())
+	return q.enqueueWith(listPushWake, q.pushKeys(), item, q.wakePrefix)
 }
 
 // pushKeys are the keys listPushWake and listPushWakeOnce take before the
@@ -342,7 +340,7 @@ func (q *Queue) EnqueueOnce(item any, id string) bool {
 	if id == "" || q.dedupWindow.Load() <= 0 {
 		return q.Enqueue(item)
 	}
-	return q.enqueueOnceWith(listPushWakeOnce, q.pushKeys(), item, id, q.getWakePrefix())
+	return q.enqueueOnceWith(listPushWakeOnce, q.pushKeys(), item, id, q.wakePrefix)
 }
 
 // enqueueOnceWith is enqueueWith for a script built with once: it adds the
@@ -1309,7 +1307,7 @@ func (q *Queue) RequeueNackedItems() error {
 }
 
 // sweep runs the sweep script (see tickBody) every second until Close, and
-// calls onRequeue after it moves any item. Once a minute it also trims the
+// wakes idle consumers after it moves any item. Once a minute it also trims the
 // Job Records (see trimScript). Without it an item whose consumer
 // died stayed pending until the next process start. It requeues only items
 // past their deadline or held by a dead owner, never every pending item as
@@ -1342,9 +1340,8 @@ func (q *Queue) sweep() {
 // closed.
 func (q *Queue) tick() bool {
 	keys := q.tickKeys()
-	wakePrefix := q.getWakePrefix()
 	g := q.pauseHooks.gen.Load()
-	r, err := q.tickScript.Run(q.ctx, q.client, keys, q.ackPrefix, q.hbt(), sweepGap.Seconds(), wakePrefix, presenceGrace.Seconds()).Int64Slice()
+	r, err := q.tickScript.Run(q.ctx, q.client, keys, q.ackPrefix, q.hbt(), sweepGap.Seconds(), q.wakePrefix, presenceGrace.Seconds()).Int64Slice()
 	if errors.Is(err, redis.ErrClosed) {
 		return false // the client was closed without closing this queue
 	}
@@ -1369,12 +1366,10 @@ func (q *Queue) tickKeys() []string {
 	return append(q.requeueKeys(), q.getHeartbeatKey(), q.getHeartbeatKey()+":clock", q.getPresenceKey(), q.getPausedKey(), q.getCancelledKey())
 }
 
-// requeued calls onRequeue after n items went back to the queue.
+// requeued wakes idle consumers after n items went back to the queue.
 func (q *Queue) requeued(n int64) {
 	if n > 0 {
-		if onRequeue := q.onRequeue.Load(); onRequeue != nil {
-			(*onRequeue)(n)
-		}
+		q.wake(n)
 	}
 }
 
@@ -1383,11 +1378,6 @@ func (q *Queue) requeued(n int64) {
 // storageKeys (a zset's :seq and :prio).
 func (q *Queue) requeueKeys() []string {
 	return append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getStartedKey(), q.getAttemptsKey()}, q.storageKeys...)
-}
-
-// setOnRequeue sets the callback the sweeper runs after requeueing items.
-func (q *Queue) setOnRequeue(fn func(n int64)) {
-	q.onRequeue.Store(&fn)
 }
 
 func (q *Queue) requeue(script *redis.Script) (int64, error) {
@@ -1422,12 +1412,6 @@ func (q *Queue) getNackedItemKey() string {
 // getIdleKey returns the Redis key for the idle consumers of a distributed queue
 func (q *Queue) getIdleKey() string {
 	return q.queueKey + ":idle"
-}
-
-// getWakePrefix returns the prefix of the consumers' wake channels,
-// <key>:wake:<ack ID prefix>
-func (q *Queue) getWakePrefix() string {
-	return q.queueKey + ":wake:"
 }
 
 // getPriorityKey returns the Redis key for the priorities of pending items

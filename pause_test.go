@@ -207,19 +207,25 @@ func TestResumeWakesIdleConsumer(t *testing.T) {
 	}
 }
 
-// The sweep still requeues and calls onRequeue on an unpaused queue (its
-// reply grew a third element).
+// The sweep still requeues and wakes an idle consumer on an unpaused queue
+// (its reply grew a third element).
 func TestPauseSweepStillRequeues(t *testing.T) {
 	q := pauseClient(t).NewQueue(newID())
 	q.SetVisibilityTimeout(time.Millisecond)
-	var requeued atomic.Int64
-	q.setOnRequeue(func(n int64) { requeued.Add(n) })
+	wake := q.client.Subscribe(q.ctx, q.wakePrefix+"w")
+	defer wake.Close()
+	_, err := wake.Receive(q.ctx)
+	require.NoError(t, err)
 	require.True(t, q.Enqueue("x"))
+	require.NoError(t, q.client.SAdd(q.ctx, q.idleKey, "w").Err()) // after the push's own wake
 	_, ok, _ := q.DequeueWithAckId()
 	require.True(t, ok)
 	time.Sleep(10 * time.Millisecond)
 	require.True(t, q.tick())
-	assert.EqualValues(t, 1, requeued.Load())
+	msg, err := wake.ReceiveTimeout(q.ctx, 2*time.Second)
+	require.NoError(t, err, "the requeue woke no one")
+	assert.Equal(t, "enqueued", msg.(*redis.Message).Payload)
+	assert.Equal(t, 1, q.Len())
 	assert.False(t, q.Paused())
 }
 
