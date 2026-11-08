@@ -3,6 +3,7 @@ package redisq
 import (
 	"context"
 	crand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -305,24 +306,14 @@ func luaDecodable(b []byte) bool {
 
 // hex4 is the value of the 4 hex digits at b[i:], or -1.
 func hex4(b []byte, i int) int {
+	var d [2]byte
 	if i+4 > len(b) {
 		return -1
 	}
-	n := 0
-	for _, c := range b[i : i+4] {
-		switch {
-		case '0' <= c && c <= '9':
-			c -= '0'
-		case 'a' <= c && c <= 'f':
-			c -= 'a' - 10
-		case 'A' <= c && c <= 'F':
-			c -= 'A' - 10
-		default:
-			return -1
-		}
-		n = n<<4 | int(c)
+	if _, err := hex.Decode(d[:], b[i:i+4]); err != nil {
+		return -1
 	}
-	return n
+	return int(d[0])<<8 | int(d[1])
 }
 
 // Enqueue pushes item and wakes idle consumers, up to one per waiting item,
