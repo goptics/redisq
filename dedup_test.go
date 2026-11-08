@@ -170,6 +170,54 @@ func TestEnqueueOnceWindow(t *testing.T) {
 	}
 }
 
+// lastArg records the last argument of each EVALSHA of script hash.
+type lastArg struct {
+	hash string
+	mx   sync.Mutex
+	args []any
+}
+
+func (h *lastArg) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h *lastArg) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+func (h *lastArg) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if a := cmd.Args(); len(a) > 1 && a[0] == "evalsha" && a[1] == h.hash {
+			h.mx.Lock()
+			h.args = append(h.args, a[len(a)-1])
+			h.mx.Unlock()
+		}
+		return next(ctx, cmd)
+	}
+}
+
+// EnqueueOnce sends a window under 1ms as 1ms, and none as 0.
+func TestEnqueueOnceWindowArg(t *testing.T) {
+	for _, c := range dedupCases {
+		t.Run(c.name, func(t *testing.T) {
+			qs := New(getTestRedisURL())
+			defer qs.Close()
+			client := qs.(*queues).client
+			delKeys(t, client, c.key())
+			defer delKeys(t, client, c.key())
+			require.NoError(t, c.script.Load(context.Background(), client).Err()) // so every push is an EVALSHA
+			h := &lastArg{hash: c.script.Hash()}
+			client.AddHook(h)
+			q, push, _, done := c.open(qs, c.key())
+			defer done()
+
+			for i, d := range []time.Duration{500 * time.Microsecond, 0, -time.Second, 2 * time.Second} {
+				q.SetDedupWindow(d)
+				require.True(t, push("a", fmt.Sprint("w", i)))
+			}
+			h.mx.Lock()
+			defer h.mx.Unlock()
+			assert.Equal(t, []any{int64(1), int64(0), int64(0), int64(2000)}, h.args)
+		})
+	}
+}
+
 // A push that fails after its id was checked (a key of the wrong type) must
 // leave the id free: a retry once the key is fixed stores the item.
 func TestEnqueueOnceFailedPushKeepsIdFree(t *testing.T) {
