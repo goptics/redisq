@@ -98,6 +98,40 @@ func TestPauseGatesEveryPop(t *testing.T) {
 	}
 }
 
+// The cancel gate runs after the pause gate: a paused pop neither hands out
+// nor drops a marked item; after Resume the pop drops it.
+func TestPauseKeepsCancelledItem(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		ctx := t.Context()
+		got, _ := watch(c.prod, "a")
+		require.NoError(t, c.cons.Pause())
+		require.True(t, c.push(envelope("a", `1`), 1))
+		require.NoError(t, c.prod.CancelJob("a"))
+
+		_, ok := rawPopOf(c.cons)
+		assert.False(t, ok)
+		_, ok, _ = ackPopOf(c.cons)
+		assert.False(t, ok)
+		n, _, err := batchPopOf(c.cons, make([]any, 2), make([]string, 2))
+		require.NoError(t, err)
+		assert.Zero(t, n)
+		assert.True(t, marked(t, c.cons, "a"), "mark stays")
+		assert.False(t, c.cons.client.HExists(ctx, c.cons.getJobsKey(), "a").Val(), "no record")
+		assert.Equal(t, 1, c.cons.Len())
+		select {
+		case o := <-got:
+			t.Fatalf("outcome while paused: %+v", o)
+		case <-time.After(300 * time.Millisecond):
+		}
+
+		require.NoError(t, c.cons.Resume())
+		_, ok, _ = ackPopOf(c.cons)
+		assert.False(t, ok)
+		assertDropped(t, c.cons, "a")
+		assert.Equal(t, contract.JobOutcome{ID: "a", State: contract.JobCancelled, Error: "cancelled"}, outcomeWithin(t, got, time.Second))
+	})
+}
+
 // A paused pop still hands back what an earlier run of the same call popped
 // (a go-redis re-send), and a refused pop leaves no reservation behind.
 func TestPauseGuardBeforeGate(t *testing.T) {
