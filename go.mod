@@ -40,3 +40,5 @@ require (
 	golang.org/x/sys v0.48.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
+
+replace github.com/goptics/varmq/contract => ../../../../varmq/.claude/worktrees/unified-queues/contract
