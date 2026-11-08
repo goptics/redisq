@@ -3337,6 +3337,9 @@ func TestWorkflowTwoProcesses(t *testing.T) {
 	build := exec.Command("go", "build", "-o", bin, ".")
 	build.Dir = filepath.Join("examples", "workflow")
 	out, err := build.CombinedOutput()
+	if err != nil && strings.Contains(string(out), "requires go >=") {
+		t.Skipf("examples/workflow needs a newer go: %s", out) // CI on go.mod's go with GOTOOLCHAIN=local
+	}
 	require.NoError(t, err, string(out))
 
 	env := append(os.Environ(), "REDIS_URL="+getTestRedisURL(), "REDIS_NS="+newID())
