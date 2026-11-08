@@ -19,6 +19,13 @@ type PriorityQueue struct {
 // by older versions are still read as is, and drain first.
 const seqPrefixLen = 17
 
+// bareFn defines bare(m): the item stored in member m (see itemOf).
+const bareFn = `local function bare(m)
+	if #m >= 17 and string.byte(m, 1) == 255 then return string.sub(m, 18) end
+	return m
+end
+`
+
 // zsetPushWakeBody adds item ARGV[1] at score ARGV[3] under the next
 // sequence number (KEYS[2], :seq), sets the queue to expire in ARGV[2] ms
 // when that is above 0, wakes idle consumers of KEYS[3], up to one per
@@ -36,8 +43,8 @@ var (
 )
 
 // zsetRemove removes the first member holding item ARGV[1].
-var zsetRemove = redis.NewScript(`for _, m in ipairs(redis.call('ZRANGE', KEYS[1], 0, -1)) do
-	if m == ARGV[1] or (#m >= 17 and string.byte(m, 1) == 255 and string.sub(m, 18) == ARGV[1]) then
+var zsetRemove = redis.NewScript(bareFn + `for _, m in ipairs(redis.call('ZRANGE', KEYS[1], 0, -1)) do
+	if m == ARGV[1] or bare(m) == ARGV[1] then
 		return redis.call('ZREM', KEYS[1], m)
 	end
 end

@@ -207,7 +207,7 @@ var (
 )
 
 func rawPopScript(pop1 string) *redis.Script {
-	return redis.NewScript(deadlineFn + envIDFn + asJSONFn + trimFn + cancelFn("3", "1") +
+	return redis.NewScript(deadlineFn + cancelFn("3", "1") +
 		"if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end\n" + pop1 + popOneGate +
 		"if not v and budget <= 0 then return -1 end\nreturn v or false")
 }
@@ -468,14 +468,12 @@ func (q *Queue) finish(ackID, state, reason string, result []byte) bool {
 
 	this, other := q.getCompletedKey(), q.getFailedKey()
 	keep, age := q.keepCompleted.Load(), q.keepCompletedAge.Load()
-	counter := "completed"
 	if state != "completed" {
 		this, other = other, this
 		keep, age = q.keepFailed.Load(), q.keepFailedAge.Load()
-		counter = "failed"
 	}
 	keys := []string{q.getNackedItemKey(), q.getTimeoutKey(), q.getStartedKey(), q.getAttemptsKey(), q.getStatsKey(), q.getJobsKey(), this, other, q.getPriorityKey(), q.getCancelledKey()}
-	r, err := finishScript.Run(q.ctx, q.client, keys, ackID, state, reason, keep, time.Duration(age).Milliseconds(), result, q.donePrefix(), counter).Int()
+	r, err := finishScript.Run(q.ctx, q.client, keys, ackID, state, reason, keep, time.Duration(age).Milliseconds(), result, q.donePrefix()).Int()
 	if err != nil {
 		log.Printf("Error finishing item as %s: %v", state, err)
 		return false
@@ -550,22 +548,21 @@ end
 // KEYS: nacked, timeouts, started, attempts, stats, jobs, the state's ZSET,
 // the other state's ZSET, prio, cancelled. ARGV: ack ID, state (completed,
 // failed or cancelled), reason, most records kept, longest age (ms), result
-// JSON (” for none), outcome channel prefix (<base>:done:), :stats counter.
+// JSON (” for none), outcome channel prefix (<base>:done:). :stats counts
+// completed, else failed.
 //
 // Every finish drops the Job ID's cancel mark: the job ended.
 //
-// A result that cjson can't decode returns -1 before any write. A completed
+// A result that cjson can't decode returns -1 before any write (Go's
+// json.Valid passes some it rejects, e.g. deep nesting). A completed
 // record gets "result", spliced raw: a cjson round trip turns big integers
 // into doubles. A job with an envelope id has its outcome (contract
 // JobOutcome) published on <base>:done:<id> after the record step, kept or
 // not (spec 6.13).
 //
-// The Job ID is the envelope id, else the ack ID. The record is built by
-// string concatenation around the raw item: numbers go through
-// string.format('%.0f'), strings through cjson.encode. An item that isn't
-// JSON is recorded as a JSON string. cjson.decode takes nan, inf and hex
-// numbers, so a bare number is taken as JSON only when it looks like one.
-var finishScript = redis.NewScript(deadlineFn + envIDFn + asJSONFn + trimFn + `if ARGV[6] ~= '' and not pcall(cjson.decode, ARGV[6]) then return -1 end
+// The Job ID is the envelope id, else the ack ID. Record and outcome come
+// from recordFn.
+var finishScript = redis.NewScript(deadlineFn + envIDFn + asJSONFn + trimFn + recordFn + `if ARGV[6] ~= '' and not pcall(cjson.decode, ARGV[6]) then return -1 end
 local item = redis.call('HGET', KEYS[1], ARGV[1])
 if not item then return 0 end
 local started = tonumber(redis.call('HGET', KEYS[3], ARGV[1]))
@@ -582,30 +579,21 @@ else
 	id = ARGV[1]
 end
 redis.call('ZREM', KEYS[10], id)
-redis.call('HINCRBY', KEYS[5], ARGV[8], 1)
+local done = ARGV[2] == 'completed'
+redis.call('HINCRBY', KEYS[5], done and 'completed' or 'failed', 1)
 local now = tonumber(nowms())
 local keep, age = tonumber(ARGV[4]), tonumber(ARGV[5])
+local err = not done and ARGV[3] or nil
+local res = (done and ARGV[6] ~= '') and (',"result":' .. ARGV[6]) or ''
 redis.call('ZREM', KEYS[8], id)
 if keep > 0 and age > 0 then
-	local rec = '{"id":' .. cjson.encode(id) .. ',"state":"' .. ARGV[2] .. '","item":' .. asjson(item)
-	if started then rec = rec .. ',"started_at":' .. string.format('%.0f', started) end
-	rec = rec .. ',"finished_at":' .. string.format('%.0f', now) .. ',"attempts":' .. string.format('%.0f', attempts)
-	if ARGV[2] == 'completed' and ARGV[6] ~= '' then rec = rec .. ',"result":' .. ARGV[6] end
-	if ARGV[2] ~= 'completed' then
-		rec = rec .. ',"errors":[{"attempt":' .. string.format('%.0f', attempts) .. ',"at":' .. string.format('%.0f', now) .. ',"error":' .. cjson.encode(ARGV[3]) .. '}]'
-	end
-	redis.call('HSET', KEYS[6], id, rec .. '}')
+	redis.call('HSET', KEYS[6], id, record(id, ARGV[2], item, started, now, attempts, err, res))
 	redis.call('ZADD', KEYS[7], string.format('%.0f', now), id)
 else
 	redis.call('HDEL', KEYS[6], id)
 end
 trim(KEYS[7], KEYS[6], keep, age, now)
-if env ~= '' then
-	local out = '{"id":' .. cjson.encode(env) .. ',"state":"' .. ARGV[2] .. '"'
-	if ARGV[2] ~= 'completed' then out = out .. ',"error":' .. cjson.encode(ARGV[3]) end
-	if ARGV[2] == 'completed' and ARGV[6] ~= '' then out = out .. ',"result":' .. ARGV[6] end
-	redis.call('PUBLISH', ARGV[7] .. env, out .. '}')
-end
+if env ~= '' then redis.call('PUBLISH', ARGV[7] .. env, outcome(env, ARGV[2], err, res)) end
 return 1`)
 
 // trimScript trims both Job States (see trimFn), so an idle queue's records
@@ -660,7 +648,7 @@ const maxPop = 1000
 // slots makes a distributed consumer join the idle set, in the same step, so
 // an enqueue right after it wakes it. A hand-back counts too: a reused
 // reservation can be smaller than the call.
-var popHead = deadlineFn + beatFn + envIDFn + asJSONFn + trimFn + cancelFn("#KEYS - 7", "#ARGV - 4") + `local want, pre, resv = tonumber(ARGV[1]), ARGV[3], ARGV[4]
+var popHead = deadlineFn + beatFn + cancelFn("#KEYS - 7", "#ARGV - 4") + `local want, pre, resv = tonumber(ARGV[1]), ARGV[3], ARGV[4]
 local dl = deadline(ARGV[2])
 local function reply(items)
 	local len = redis.call(__LEN__, KEYS[1])
@@ -747,12 +735,10 @@ end
 `
 	// zsetTake pops the lowest scores and returns the bare items (without
 	// the sequence prefix).
-	zsetTake = `local function take(k)
+	zsetTake = bareFn + `local function take(k)
 	local r, it, s = redis.call('ZPOPMIN', KEYS[1], k), {}, {}
 	for i = 1, #r / 2 do
-		local m = r[2*i-1]
-		if #m >= 17 and string.byte(m, 1) == 255 then m = string.sub(m, 18) end
-		it[i] = m; s[i] = r[2*i]
+		it[i] = bare(r[2*i-1]); s[i] = r[2*i]
 	end
 	return it, s
 end
@@ -784,7 +770,7 @@ var (
 // ARGV: visibility timeout (seconds; 0: none), ack ID, consumer ID (” if
 // the caller is not a distributed consumer), failed retention (most, age
 // ms), outcome channel prefix, heartbeat timeout, ack ID prefix.
-var popOneHead = deadlineFn + beatFn + envIDFn + asJSONFn + trimFn + cancelFn("#KEYS - 7", "#ARGV - 4") + `local dl = deadline(ARGV[1])
+var popOneHead = deadlineFn + beatFn + cancelFn("#KEYS - 7", "#ARGV - 4") + `local dl = deadline(ARGV[1])
 local held = redis.call('HGET', KEYS[2], ARGV[2])
 if held then
 	if dl > 0 then
@@ -814,11 +800,10 @@ return v`
 const (
 	listPop1 = `local function pop1() return redis.call('LPOP', KEYS[1]) end
 `
-	zsetPop1 = `local function pop1()
+	zsetPop1 = bareFn + `local function pop1()
 	local r = redis.call('ZPOPMIN', KEYS[1])
-	local v = r[1]
-	if v and #v >= 17 and string.byte(v, 1) == 255 then v = string.sub(v, 18) end
-	return v or false, r[2]
+	if not r[1] then return false end
+	return bare(r[1]), r[2]
 end
 `
 )

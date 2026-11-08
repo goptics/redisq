@@ -73,7 +73,7 @@ func (q *Queue) QueueStats(ctx context.Context) (contract.QueueStats, error) {
 // sorts each owner's jobs in hand-out order.
 // ponytail: a processing page reads every ack ID (HKEYS); index them if
 // processing runs to millions.
-var jobsScript = redis.NewScript(envIDFn + `local st, a, b = ARGV[1], tonumber(ARGV[2]), tonumber(ARGV[3])
+var jobsScript = redis.NewScript(envIDFn + bareFn + `local st, a, b = ARGV[1], tonumber(ARGV[2]), tonumber(ARGV[3])
 if st == 'completed' or st == 'failed' then
 	local ids = redis.call('ZREVRANGE', st == 'completed' and KEYS[6] or KEYS[7], a, b)
 	if #ids == 0 then return {} end
@@ -84,9 +84,7 @@ if st == 'pending' then
 	local items
 	if ARGV[4] == '1' then
 		items = redis.call('ZRANGE', KEYS[1], a, b)
-		for i, m in ipairs(items) do
-			if #m >= 17 and string.byte(m, 1) == 255 then items[i] = string.sub(m, 18) end
-		end
+		for i, m in ipairs(items) do items[i] = bare(m) end
 	else
 		items = redis.call('LRANGE', KEYS[1], a, b)
 	end

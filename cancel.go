@@ -103,9 +103,32 @@ func (q *Queue) cancelRequested(id string) {
 	}
 }
 
+// recordFn defines, after asJSONFn, record(id, state, item, started, now,
+// attempts, err, res), a Job Record, and outcome(id, state, err, res), a
+// JobOutcome, for finishScript and dropped(). started and err may be nil
+// (no started_at; no errors, no error). res is ” or ',"result":' and the
+// result JSON, spliced raw: a cjson round trip turns big integers into
+// doubles. Built by concatenation: numbers through string.format('%.0f'),
+// strings through cjson.encode, the item through asjson.
+const recordFn = `local function record(id, state, item, started, now, attempts, err, res)
+	local rec = '{"id":' .. cjson.encode(id) .. ',"state":"' .. state .. '","item":' .. asjson(item)
+	if started then rec = rec .. ',"started_at":' .. string.format('%.0f', started) end
+	rec = rec .. ',"finished_at":' .. string.format('%.0f', now) .. ',"attempts":' .. string.format('%.0f', attempts) .. res
+	if err then
+		rec = rec .. ',"errors":[{"attempt":' .. string.format('%.0f', attempts) .. ',"at":' .. string.format('%.0f', now) .. ',"error":' .. cjson.encode(err) .. '}]'
+	end
+	return rec .. '}'
+end
+local function outcome(id, state, err, res)
+	local out = '{"id":' .. cjson.encode(id) .. ',"state":"' .. state .. '"'
+	if err then out = out .. ',"error":' .. cjson.encode(err) end
+	return out .. res .. '}'
+end
+`
+
 // cancelFn defines cancelling(), dropped(v), budget and trimDropped() for
-// the pop scripts (spec 6.14), after deadlineFn, envIDFn, asJSONFn and
-// trimFn. k is the KEYS index of
+// the pop scripts (spec 6.14), after deadlineFn; it brings envIDFn,
+// asJSONFn, trimFn and recordFn. k is the KEYS index of
 // :cancelled, which :jobs, :completed, :failed and :attempts follow; a the
 // ARGV index of the failed retention (most, age ms), which the outcome
 // channel prefix follows.
@@ -124,7 +147,7 @@ func (q *Queue) cancelRequested(id string) {
 // out stops and returns what it has, and its caller pops again (see
 // popGate, popOneGate). trimDropped() trims :failed once, after the drops.
 func cancelFn(k, a string) string {
-	return `local ck, ca = ` + k + `, ` + a + `
+	return envIDFn + asJSONFn + trimFn + recordFn + `local ck, ca = ` + k + `, ` + a + `
 local budget = ` + strconv.Itoa(maxPop) + `
 local function cancelling() return redis.call('EXISTS', KEYS[ck]) == 1 end
 local function trimDropped()
@@ -146,13 +169,12 @@ local function dropped(v)
 	local keep, age = tonumber(ARGV[ca]), tonumber(ARGV[ca + 1])
 	redis.call('ZREM', KEYS[ck + 2], id)
 	if keep > 0 and age > 0 then
-		redis.call('HSET', KEYS[ck + 1], id, '{"id":' .. cjson.encode(id) .. ',"state":"cancelled","item":' .. asjson(v) ..
-			',"finished_at":' .. string.format('%.0f', now) .. ',"attempts":' .. string.format('%.0f', attempts) .. '}')
+		redis.call('HSET', KEYS[ck + 1], id, record(id, 'cancelled', v, nil, now, attempts, nil, ''))
 		redis.call('ZADD', KEYS[ck + 3], string.format('%.0f', now), id)
 	else
 		redis.call('HDEL', KEYS[ck + 1], id)
 	end
-	redis.call('PUBLISH', ARGV[ca + 2] .. id, '{"id":' .. cjson.encode(id) .. ',"state":"cancelled","error":"cancelled"}')
+	redis.call('PUBLISH', ARGV[ca + 2] .. id, outcome(id, 'cancelled', 'cancelled', ''))
 	return true
 end
 `
