@@ -13,8 +13,7 @@ import (
 // Job cancel (spec/redis-storage.md 1.7.0, 6.14). CancelJob marks a Job ID
 // in ZSET <base>:cancelled (score: when the mark expires, ms) and announces
 // it on <base>:control. Pops drop a marked
-// waiting job (cancelFn) with record and outcome cancelled, but hand out a
-// workflow item (envelope wf) as usual; consumers learn
+// waiting job (cancelFn) with record and outcome cancelled; consumers learn
 // of a running one (OnCancel) and finish it with AcknowledgeCancelled. Any
 // finish or re-add drops the mark. Cooperative: storage never stops a
 // running job itself.
@@ -54,8 +53,7 @@ redis.call('PUBLISH', KEYS[3], 'cancel:' .. ARGV[1])
 return 1`)
 
 // CancelJob asks every process to cancel job id. A waiting job is dropped
-// by the pop that would hand it out (record and outcome cancelled), unless
-// its envelope has wf (a workflow item: handed out, mark kept); a
+// by the pop that would hand it out (record and outcome cancelled); a
 // running one is announced to OnCancel callbacks, and ends only if its
 // worker stops it. contract.ErrJobEnded when its record shows it ended. An
 // unknown id is marked too (24 h): a later push of it under that id is
@@ -161,10 +159,7 @@ end
 // cancelling() reports whether any job is marked, so a pop without marks
 // costs one EXISTS. dropped(v) drops item v if its envelope id has a mark
 // that has not expired (an item without an id is never dropped; an expired
-// mark is removed and counts as none). An envelope with a wf field (a
-// workflow task or undo) is never dropped and its mark stays: the drop
-// can't end the workflow, so the consumer's pre-run check does (spec 6.12).
-// Else it clears the mark and the attempts
+// mark is removed and counts as none): it clears the mark and the attempts
 // count, writes a record with state cancelled (no started_at, no errors),
 // indexed in :failed under the failed retention, publishes outcome
 // cancelled, and returns true. It counts nothing in :stats. The item goes
@@ -184,8 +179,8 @@ local function trimDropped()
 	end
 end
 local function dropped(v)
-	local id, e = envid(v)
-	if id == '' or e.wf ~= nil then return false end
+	local id = envid(v)
+	if id == '' then return false end
 	local exp = redis.call('ZSCORE', KEYS[ck], id)
 	if not exp then return false end
 	redis.call('ZREM', KEYS[ck], id)

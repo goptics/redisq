@@ -500,12 +500,11 @@ func (q *Queue) SetFailedRetention(most int, age time.Duration) {
 }
 
 // envIDFn defines envid(v): the envelope id of item v, or empty when v is not
-// a JSON object with a string id, and the decoded envelope (nil then). Items
-// are only decoded, never re-encoded: cjson.encode rounds numbers to 14
-// digits.
+// a JSON object with a string id. Items are only decoded, never re-encoded:
+// cjson.encode rounds numbers to 14 digits.
 const envIDFn = `local function envid(v)
 	local ok, e = pcall(cjson.decode, v)
-	if ok and type(e) == 'table' and type(e.id) == 'string' then return e.id, e end
+	if ok and type(e) == 'table' and type(e.id) == 'string' then return e.id end
 	return ''
 end
 `
