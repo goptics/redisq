@@ -202,7 +202,7 @@ func (q *Queue) Dequeue() (any, bool) {
 // listRawPop and zsetRawPop are Dequeue's pop without acknowledgment: 0 while
 // KEYS[2], :paused, exists, else the item (a zset's without its sequence
 // prefix), or false when the queue is empty. Cancelled items are dropped
-// (see cancelFn). KEYS[3..7]: :cancelled, :jobs, :completed, :failed,
+// (see cancelFn); -1 when the drop budget ran out first (pop again). KEYS[3..7]: :cancelled, :jobs, :completed, :failed,
 // :attempts. ARGV: failed retention (most, age ms), outcome channel prefix.
 var (
 	listRawPop = rawPopScript(listPop1)
@@ -210,8 +210,16 @@ var (
 )
 
 func rawPopScript(pop1 string) *redis.Script {
-	return redis.NewScript(deadlineFn + envIDFn + trimFn + cancelFn("3", "1") +
-		"if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end\n" + pop1 + popOneGate + "return v or false")
+	return redis.NewScript(deadlineFn + envIDFn + asJSONFn + trimFn + cancelFn("3", "1") +
+		"if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end\n" + pop1 + popOneGate +
+		"if not v and budget <= 0 then return -1 end\nreturn v or false")
+}
+
+// spent reports a pop reply of -1: the script's drop budget ran out before
+// it found an item to hand out (see cancelFn), so the caller pops again.
+func spent(reply any) bool {
+	n, ok := reply.(int64)
+	return ok && n < 0
 }
 
 // rawPop runs pop and returns its item as stored. A consumer whose pop
@@ -220,6 +228,9 @@ func rawPopScript(pop1 string) *redis.Script {
 func (q *Queue) rawPop(pop *redis.Script) (string, bool) {
 	g := q.pauseHooks.gen.Load()
 	reply, err := pop.Run(q.ctx, q.client, q.rawKeys, q.cancelArgs()...).Result()
+	for err == nil && spent(reply) {
+		reply, err = pop.Run(q.ctx, q.client, q.rawKeys, q.cancelArgs()...).Result()
+	}
 	if err == redis.Nil {
 		if !q.Paused() {
 			q.markIdle()
@@ -503,6 +514,16 @@ const envIDFn = `local function envid(v)
 end
 `
 
+// asJSONFn defines asjson(v): item v as it goes into a record, v itself
+// when it is JSON, else v as a JSON string. cjson.decode takes nan, inf and
+// hex numbers, so a bare number counts as JSON only when it looks like one.
+const asJSONFn = `local function asjson(v)
+	local ok, e = pcall(cjson.decode, v)
+	if not ok or (type(e) == 'number' and not string.match(v, '^%s*-?%d[%d.eE+-]*%s*$')) then return cjson.encode(v) end
+	return v
+end
+`
+
 // trimFn defines trim(z, jobs, keep, age, now) for the finish and sweep
 // trims: it drops the members of Job State ZSET z older than age ms or
 // outside the newest keep, all of them when either is 0, and their records
@@ -547,7 +568,7 @@ end
 // string.format('%.0f'), strings through cjson.encode. An item that isn't
 // JSON is recorded as a JSON string. cjson.decode takes nan, inf and hex
 // numbers, so a bare number is taken as JSON only when it looks like one.
-var finishScript = redis.NewScript(deadlineFn + envIDFn + trimFn + `if ARGV[6] ~= '' and not pcall(cjson.decode, ARGV[6]) then return -1 end
+var finishScript = redis.NewScript(deadlineFn + envIDFn + asJSONFn + trimFn + `if ARGV[6] ~= '' and not pcall(cjson.decode, ARGV[6]) then return -1 end
 local item = redis.call('HGET', KEYS[1], ARGV[1])
 if not item then return 0 end
 local started = tonumber(redis.call('HGET', KEYS[3], ARGV[1]))
@@ -569,9 +590,7 @@ local now = tonumber(nowms())
 local keep, age = tonumber(ARGV[4]), tonumber(ARGV[5])
 redis.call('ZREM', KEYS[8], id)
 if keep > 0 and age > 0 then
-	local ok, e = pcall(cjson.decode, item)
-	if not ok or (type(e) == 'number' and not string.match(item, '^%s*-?%d[%d.eE+-]*%s*$')) then item = cjson.encode(item) end
-	local rec = '{"id":' .. cjson.encode(id) .. ',"state":"' .. ARGV[2] .. '","item":' .. item
+	local rec = '{"id":' .. cjson.encode(id) .. ',"state":"' .. ARGV[2] .. '","item":' .. asjson(item)
 	if started then rec = rec .. ',"started_at":' .. string.format('%.0f', started) end
 	rec = rec .. ',"finished_at":' .. string.format('%.0f', now) .. ',"attempts":' .. string.format('%.0f', attempts)
 	if ARGV[2] == 'completed' and ARGV[6] ~= '' then rec = rec .. ',"result":' .. ARGV[6] end
@@ -644,7 +663,7 @@ const maxPop = 1000
 // slots makes a distributed consumer join the idle set, in the same step, so
 // an enqueue right after it wakes it. A hand-back counts too: a reused
 // reservation can be smaller than the call.
-var popHead = deadlineFn + beatFn + envIDFn + trimFn + cancelFn("#KEYS - 7", "#ARGV - 4") + `local want, pre, resv = tonumber(ARGV[1]), ARGV[3], ARGV[4]
+var popHead = deadlineFn + beatFn + envIDFn + asJSONFn + trimFn + cancelFn("#KEYS - 7", "#ARGV - 4") + `local want, pre, resv = tonumber(ARGV[1]), ARGV[3], ARGV[4]
 local dl = deadline(ARGV[2])
 local function reply(items)
 	local len = redis.call(__LEN__, KEYS[1])
@@ -699,8 +718,11 @@ func popScript(lenCmd, take, after string) *redis.Script {
 
 // popGate pops want items into items (scores in sc). With cancel marks
 // (spec 6.14) it drops the marked items (see cancelFn) and pops more in
-// their place, until it has want or the queue is empty. Without them it
-// costs one EXISTS.
+// their place, until it has want, the queue is empty or the drop budget is
+// spent. It never takes more than the budget left, so every item it takes
+// is handed out or dropped. A spent budget leaves items in the queue, so
+// reply() reports them and adds no idle consumer: the caller pops again.
+// Without marks it costs one EXISTS.
 const popGate = `local sc
 items, sc = take(want)
 if #items > 0 and cancelling() then
@@ -710,9 +732,10 @@ if #items > 0 and cancelling() then
 		for i, v in ipairs(all) do
 			if not dropped(v) then items[#items + 1] = v; sc[#items] = alls[i] end
 		end
-		if #items == want then break end
-		all, alls = take(want - #items)
+		if #items == want or budget <= 0 then break end
+		all, alls = take(math.min(want - #items, budget))
 	end
+	trimDropped()
 end
 `
 
@@ -756,14 +779,15 @@ var (
 
 // popOneHead and popOneTail wrap the lean single-item pop that DequeueWithAckId
 // runs, which leaves the popped item, as stored, in v (nil when the queue is
-// empty). Same keys, ack IDs and rules as the batch scripts (see popHead),
+// empty; the script returns -1 when the drop budget ran out, see
+// popOneGate). Same keys, ack IDs and rules as the batch scripts (see popHead),
 // with none of the batch bookkeeping: per call it costs what a single pop did
 // before batches.
 //
 // ARGV: visibility timeout (seconds; 0: none), ack ID, consumer ID (” if
 // the caller is not a distributed consumer), failed retention (most, age
 // ms), outcome channel prefix, heartbeat timeout, ack ID prefix.
-var popOneHead = deadlineFn + beatFn + envIDFn + trimFn + cancelFn("#KEYS - 7", "#ARGV - 4") + `local dl = deadline(ARGV[1])
+var popOneHead = deadlineFn + beatFn + envIDFn + asJSONFn + trimFn + cancelFn("#KEYS - 7", "#ARGV - 4") + `local dl = deadline(ARGV[1])
 local held = redis.call('HGET', KEYS[2], ARGV[2])
 if held then
 	if dl > 0 then
@@ -777,6 +801,7 @@ end
 
 const popOneTail = `
 if not v then
+	if budget <= 0 then return -1 end
 	if ARGV[3] ~= '' then redis.call('SADD', KEYS[4], ARGV[3]) end
 	return false
 end
@@ -803,10 +828,16 @@ end
 
 // popOneGate pops one item into v (false when empty), score sc. With cancel
 // marks it drops marked items (see cancelFn) and pops the next, so a
-// dropped head never leaves the consumer idle with work waiting.
+// dropped head never leaves the consumer idle with work waiting. Once the
+// drop budget is spent it stops with v false (budget 0): the single pop
+// returns -1 instead of idling, the lean batch pop reports the items left.
 const popOneGate = `local v, sc = pop1()
 if v and cancelling() then
-	while v and dropped(v) do v, sc = pop1() end
+	while v and dropped(v) do
+		if budget <= 0 then v = false; break end
+		v, sc = pop1()
+	end
+	trimDropped()
 end
 `
 
@@ -906,7 +937,11 @@ func (q *Queue) dequeueOne(pop *redis.Script, extraKeys ...string) (item any, ok
 	ackID = q.ackIDOf(fmt.Sprintf("%020d", r.start), 1)
 	g := q.pauseHooks.gen.Load()
 	args := append(append([]any{q.vt(), ackID, consumer}, q.cancelArgs()...), q.hbt(), q.ackPrefix)
-	reply, err := pop.Run(q.ctx, q.client, q.popKeys(extraKeys...), args...).Result()
+	keys := q.popKeys(extraKeys...)
+	reply, err := pop.Run(q.ctx, q.client, keys, args...).Result()
+	for err == nil && spent(reply) { // nothing handed out, so ackID is still free
+		reply, err = pop.Run(q.ctx, q.client, keys, args...).Result()
+	}
 	if err == redis.Nil {
 		return nil, false, ""
 	}

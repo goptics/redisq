@@ -2,6 +2,7 @@ package redisq
 
 import (
 	"errors"
+	"strconv"
 	"sync"
 	"time"
 
@@ -94,7 +95,8 @@ type cancelHooks struct {
 }
 
 // OnCancel calls fn with the job ID of each cancel request on the queue
-// (from any process, this one included), until stop. Calls come from one
+// (from any process, this one included), until stop. A call already taken
+// for a request may still run once after stop returns. Calls come from one
 // goroutine of this object, in order, off the pub/sub reader, so a slow fn
 // delays only later calls. A request whose message was lost (a reconnect)
 // is not repeated.
@@ -136,6 +138,7 @@ func (q *Queue) cancelRequested(id string) {
 
 // cancelLoop, one per Queue object from its first cancel request until
 // Close, passes each pending id to the callbacks registered at that moment.
+// A hook taken for an id may run once more after its stop returns.
 func (q *Queue) cancelLoop() {
 	c := &q.cancelHooks
 	for {
@@ -167,8 +170,9 @@ func (q *Queue) cancelLoop() {
 	}
 }
 
-// cancelFn defines cancelling() and dropped(v) for the pop scripts (spec
-// 6.14), after deadlineFn, envIDFn and trimFn. k is the KEYS index of
+// cancelFn defines cancelling(), dropped(v), budget and trimDropped() for
+// the pop scripts (spec 6.14), after deadlineFn, envIDFn, asJSONFn and
+// trimFn. k is the KEYS index of
 // :cancelled, which :jobs, :completed, :failed and :attempts follow; a the
 // ARGV index of the failed retention (most, age ms), which the outcome
 // channel prefix follows.
@@ -179,11 +183,22 @@ func (q *Queue) cancelLoop() {
 // mark is removed and counts as none): it clears the mark and the attempts
 // count, writes a record with state cancelled (no started_at, no errors),
 // indexed in :failed under the failed retention, publishes outcome
-// cancelled, and returns true. It counts nothing in :stats. The item is a
-// JSON object here (envid decoded it), so it is spliced in raw.
+// cancelled, and returns true. It counts nothing in :stats. The item goes
+// through asjson, as in finishScript.
+//
+// budget caps the drops of one script call at maxPop, so a backlog of
+// marked items can't hold Redis in one long script: a pop whose budget ran
+// out stops and returns what it has, and its caller pops again (see
+// popGate, popOneGate). trimDropped() trims :failed once, after the drops.
 func cancelFn(k, a string) string {
 	return `local ck, ca = ` + k + `, ` + a + `
+local budget = ` + strconv.Itoa(maxPop) + `
 local function cancelling() return redis.call('EXISTS', KEYS[ck]) == 1 end
+local function trimDropped()
+	if budget < ` + strconv.Itoa(maxPop) + ` then
+		trim(KEYS[ck + 3], KEYS[ck + 1], tonumber(ARGV[ca]), tonumber(ARGV[ca + 1]), tonumber(nowms()))
+	end
+end
 local function dropped(v)
 	local id = envid(v)
 	if id == '' then return false end
@@ -192,18 +207,18 @@ local function dropped(v)
 	redis.call('ZREM', KEYS[ck], id)
 	local now = tonumber(nowms())
 	if tonumber(exp) <= now then return false end
+	budget = budget - 1
 	local attempts = 1 + (tonumber(redis.call('HGET', KEYS[ck + 4], id)) or 0)
 	redis.call('HDEL', KEYS[ck + 4], id)
 	local keep, age = tonumber(ARGV[ca]), tonumber(ARGV[ca + 1])
 	redis.call('ZREM', KEYS[ck + 2], id)
 	if keep > 0 and age > 0 then
-		redis.call('HSET', KEYS[ck + 1], id, '{"id":' .. cjson.encode(id) .. ',"state":"cancelled","item":' .. v ..
+		redis.call('HSET', KEYS[ck + 1], id, '{"id":' .. cjson.encode(id) .. ',"state":"cancelled","item":' .. asjson(v) ..
 			',"finished_at":' .. string.format('%.0f', now) .. ',"attempts":' .. string.format('%.0f', attempts) .. '}')
 		redis.call('ZADD', KEYS[ck + 3], string.format('%.0f', now), id)
 	else
 		redis.call('HDEL', KEYS[ck + 1], id)
 	end
-	trim(KEYS[ck + 3], KEYS[ck + 1], keep, age, now)
 	redis.call('PUBLISH', ARGV[ca + 2] .. id, '{"id":' .. cjson.encode(id) .. ',"state":"cancelled","error":"cancelled"}')
 	return true
 end

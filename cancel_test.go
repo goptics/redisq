@@ -2,6 +2,7 @@ package redisq
 
 import (
 	"encoding/json"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -374,6 +375,90 @@ func TestCancelExpiredMark(t *testing.T) {
 			return c.cons.client.ZScore(ctx, key, "old").Err() == redis.Nil
 		}, 3*time.Second, 50*time.Millisecond, "the sweep prunes")
 		assert.True(t, marked(t, c.cons, "new"), "a live mark stays")
+	})
+}
+
+// One script call drops at most maxPop marked items; the pop that ran out
+// of budget leaves the rest, keeps the consumer out of :idle, and the next
+// pop goes on.
+func TestCancelDropBudget(t *testing.T) {
+	const marks = maxPop + 500
+	fill := func(t *testing.T, c cancelQueues) {
+		ctx := t.Context()
+		c.cons.Subscribe(func(string) {})
+		exp := float64(c.cons.client.Time(ctx).Val().UnixMilli() + time.Hour.Milliseconds())
+		z := make([]redis.Z, marks)
+		for i := range marks {
+			id := fmt.Sprintf("c%d", i)
+			require.True(t, c.push(envelope(id, `1`), 1))
+			z[i] = redis.Z{Score: exp, Member: id}
+		}
+		require.True(t, c.push(envelope("live", `1`), 1))
+		require.NoError(t, c.cons.client.ZAdd(ctx, c.cons.getCancelledKey(), z...).Err())
+	}
+	check := func(t *testing.T, q *Queue, dropped int64, idle bool) {
+		t.Helper()
+		ctx := t.Context()
+		assert.Equal(t, dropped, q.client.ZCard(ctx, q.getFailedKey()).Val())
+		assert.Equal(t, dropped, q.client.HLen(ctx, q.getJobsKey()).Val())
+		assert.Equal(t, idle, q.client.SIsMember(ctx, q.getIdleKey(), q.consumerID()).Val(), "idle")
+	}
+	extra := func(q *Queue) []string {
+		if q.isPriority {
+			return []string{q.getPriorityKey()}
+		}
+		return nil
+	}
+
+	t.Run("batch", func(t *testing.T) {
+		eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+			fill(t, c)
+			items, ids := make([]any, 2), make([]string, 2)
+			n, remaining, err := batchPopOf(c.cons, items, ids)
+			require.NoError(t, err)
+			assert.Zero(t, n)
+			assert.Equal(t, marks-maxPop+1, remaining, "the rest is reported")
+			check(t, c.cons, maxPop, false)
+
+			n, remaining, err = batchPopOf(c.cons, items, ids)
+			require.NoError(t, err)
+			require.Equal(t, 1, n)
+			assert.Zero(t, remaining)
+			assert.Equal(t, "live", envID(t, items[0]))
+			check(t, c.cons, marks, true) // short of its slots with the queue empty
+			assert.Equal(t, "cancelled", record(t, c.cons, "c0")["state"])
+			assert.Equal(t, "cancelled", record(t, c.cons, fmt.Sprintf("c%d", marks-1))["state"])
+		})
+	})
+	t.Run("single", func(t *testing.T) {
+		eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+			fill(t, c)
+			q := c.cons
+			pop := listAckPopOne
+			if q.isPriority {
+				pop = zsetAckPopOne
+			}
+			ackID := q.ackIDOf(fmt.Sprintf("%020d", q.ackSeq.Add(1)), 1)
+			args := append([]any{q.vt(), ackID, q.consumerID()}, append(q.cancelArgs(), q.hbt(), q.ackPrefix)...)
+			r, err := pop.Run(t.Context(), q.client, q.popKeys(extra(q)...), args...).Result()
+			require.NoError(t, err)
+			assert.EqualValues(t, -1, r, "budget spent")
+			check(t, q, maxPop, false)
+
+			v, ok, _ := ackPopOf(q)
+			require.True(t, ok)
+			assert.Equal(t, "live", envID(t, v))
+			check(t, q, marks, false)
+		})
+	})
+	t.Run("raw", func(t *testing.T) {
+		eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+			fill(t, c)
+			v, ok := rawPopOf(c.cons) // pops again after a spent budget
+			require.True(t, ok)
+			assert.Equal(t, "live", envID(t, v))
+			check(t, c.cons, marks, false)
+		})
 	})
 }
 
