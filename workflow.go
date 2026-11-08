@@ -198,7 +198,10 @@ local function wfload(key, ret)
 		for j = 0, #f / 4 - 1 do
 			local x = order[i + j]
 			local t, u = wfdecode(r[4 * j + 1]), r[4 * j + 4]
-			if not t or type(t.queue) ~= 'string' or type(t.deps) ~= 'table' or type(t.dependents) ~= 'table' then return nil, true end
+			if not t or type(t.queue) ~= 'string' or (t.kind ~= 'fifo' and t.kind ~= 'prio') or type(t.deps) ~= 'table' or type(t.dependents) ~= 'table' or
+				(t.undo ~= nil and (type(t.undo) ~= 'table' or type(t.undo.queue) ~= 'string' or (t.undo.kind ~= 'fifo' and t.undo.kind ~= 'prio'))) then
+				return nil, true
+			end
 			W.tj[x], W.t[x] = r[4 * j + 1], t
 			W.s[x] = r[4 * j + 2]
 			W.n[x] = tonumber(r[4 * j + 3])
@@ -460,9 +463,10 @@ local ok, meta = pcall(cjson.decode, m)
 if not ok or type(meta) ~= 'table' or type(meta.tasks) ~= 'table' then return {} end
 for _, x in ipairs(meta.tasks) do
 	local okt, t = pcall(cjson.decode, redis.call('HGET', KEYS[1], 't:' .. x) or '')
-	if okt and type(t) == 'table' and type(t.queue) == 'string' and type(t.kind) == 'string' then
+	if okt and type(t) == 'table' and type(t.queue) == 'string' and (t.kind == 'fifo' or t.kind == 'prio') then
 		add(t.queue, t.kind)
-		if type(t.undo) == 'table' and type(t.undo.queue) == 'string' and type(t.undo.kind) == 'string' then add(t.undo.queue, t.undo.kind) end
+		local u = t.undo
+		if type(u) == 'table' and type(u.queue) == 'string' and (u.kind == 'fifo' or u.kind == 'prio') then add(u.queue, u.kind) end
 	end
 end
 return out`)
@@ -648,21 +652,16 @@ func (s *workflowStore) Submit(ctx context.Context, p contract.WorkflowPlan) err
 		if err != nil {
 			return err
 		}
-		def, err := json.Marshal(taskDef{Queue: q.queueKey, Kind: q.kind(), Priority: tp.Priority,
+		// strings, ints, bools: Marshal can't fail
+		def, _ := json.Marshal(taskDef{Queue: q.queueKey, Kind: q.kind(), Priority: tp.Priority,
 			Deps: nonNil(tp.Deps), Dependents: nonNil(dependents[tp.Name]),
 			Always: tp.Always, JobID: tp.JobID})
-		if err != nil {
-			return err
-		}
 		if u := tp.Undo; u != nil {
 			uq, uitem, err := s.planQueue(tp.Name+" undo", u.QueueID, u.Queue, u.Item)
 			if err != nil {
 				return err
 			}
-			head, err := json.Marshal(undoDef{Queue: uq.queueKey, Kind: uq.kind(), JobID: u.JobID})
-			if err != nil {
-				return err
-			}
+			head, _ := json.Marshal(undoDef{Queue: uq.queueKey, Kind: uq.kind(), JobID: u.JobID})
 			def = slices.Concat(def[:len(def)-1], []byte(`,"undo":`), head[:len(head)-1], []byte(`,"item":`), uitem, []byte("}}"))
 		}
 		fields = append(fields, "t:"+tp.Name, def)
@@ -680,10 +679,7 @@ func (s *workflowStore) Submit(ctx context.Context, p contract.WorkflowPlan) err
 		}
 	}
 
-	tasks, err := json.Marshal(names)
-	if err != nil {
-		return err
-	}
+	tasks, _ := json.Marshal(names)
 	args := append([]any{string(kinds), p.ID, p.Hash, strconv.FormatBool(p.FailFast), strconv.FormatBool(p.UndoOnCancel), tasks, len(fields) / 2}, fields...)
 	n, err := wfSubmitScript.Run(ctx, s.client, append([]string{s.key(p.ID), s.indexKey()}, keys...), append(args, pushes...)...).Int()
 	if err != nil {
@@ -1002,14 +998,9 @@ func (s *workflowStore) Workflows(ctx context.Context, state contract.WorkflowSt
 	}
 	out := make([]contract.WorkflowRecord, 0, len(keys))
 	for i, k := range keys {
-		r, err := s.recordOf(k.ID, hs[i].Val())
-		if errors.Is(err, contract.ErrWorkflowNotFound) {
-			continue // expired since the listing
+		if r, err := s.recordOf(k.ID, hs[i].Val()); err == nil { // else expired or broken since the listing
+			out = append(out, r)
 		}
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, r)
 	}
 	return out, nil
 }

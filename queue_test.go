@@ -3437,7 +3437,20 @@ func TestWorkflowGuards(t *testing.T) {
 	assert.Error(t, err)
 	_, ok = q.FinishTask("x", contract.TaskEnd{Workflow: "g", Task: "a", Outcome: contract.OutcomeCompleted})
 	assert.False(t, ok)
-	q.Purge() // logs the error
+	q.Purge()                             // logs the error
+	store.trimIndex(context.Background()) // logs the error
+
+	// A meta that is not JSON: reads fail, listings skip it.
+	require.NoError(t, e.a.client.HSet(ctx, e.store.key("g"), "meta", "{nope").Err())
+	_, err = e.store.Record(ctx, "g")
+	assert.Error(t, err)
+	_, err = e.store.Runnable(ctx, "g", "a", false)
+	assert.Error(t, err)
+	_, err = e.store.DepResult(ctx, "g", "a")
+	assert.Error(t, err)
+	recs, err := e.store.Workflows(ctx, "", 0, 10)
+	require.NoError(t, err)
+	assert.Empty(t, recs)
 }
 
 // Purge of a queue holding items of more workflows than Lua can unpack at
@@ -3476,6 +3489,19 @@ func TestWorkflowScale(t *testing.T) {
 	keys, err = e.store.WorkflowKeys(ctx, contract.WorkflowRunning, 440, 5)
 	require.NoError(t, err)
 	assert.Len(t, keys, 5)
+	// A filter reads at most 10000 + limit entries: t000..t449 (oldest)
+	// sit past that many newer ones.
+	pipe = e.a.client.Pipeline()
+	for i := range 10100 {
+		id := fmt.Sprintf("n%05d", i)
+		pipe.HSet(ctx, e.store.key(id), "meta", `{"state":"completed","created_at":9,"tasks":[]}`)
+		pipe.ZAdd(ctx, e.store.indexKey(), redis.Z{Score: 9, Member: id})
+	}
+	_, err = pipe.Exec(ctx)
+	require.NoError(t, err)
+	keys, err = e.store.WorkflowKeys(ctx, contract.WorkflowRunning, 0, 5)
+	require.NoError(t, err)
+	assert.Empty(t, keys, "running ones lie past the scan cap")
 
 	// Items Redis's cjson can't decode are refused at Submit: as a task, as
 	// a waiting task, as an undo; nothing is written.
