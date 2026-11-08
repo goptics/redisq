@@ -427,9 +427,9 @@ func TestCancelExpiredMark(t *testing.T) {
 	})
 }
 
-// One script call drops at most maxPop marked items; the pop that ran out
-// of budget leaves the rest, keeps the consumer out of :idle, and the next
-// pop goes on.
+// One script call drops at most maxPop marked items; the script that ran
+// out of budget leaves the rest and keeps the consumer out of :idle, and
+// every pop call runs it again.
 func TestCancelDropBudget(t *testing.T) {
 	const marks = maxPop + 500
 	fill := func(t *testing.T, c cancelQueues) {
@@ -459,26 +459,25 @@ func TestCancelDropBudget(t *testing.T) {
 		return nil
 	}
 
-	t.Run("batch", func(t *testing.T) {
-		eachCancelCase(t, func(t *testing.T, c cancelQueues) {
-			fill(t, c)
-			items, ids := make([]any, 2), make([]string, 2)
-			n, remaining, err := batchPopOf(c.cons, items, ids)
-			require.NoError(t, err)
-			assert.Zero(t, n)
-			assert.Equal(t, marks-maxPop+1, remaining, "the rest is reported")
-			check(t, c.cons, maxPop, false)
-
-			n, remaining, err = batchPopOf(c.cons, items, ids)
-			require.NoError(t, err)
-			require.Equal(t, 1, n)
-			assert.Zero(t, remaining)
-			assert.Equal(t, "live", envID(t, items[0]))
-			check(t, c.cons, marks, true) // short of its slots with the queue empty
-			assert.Equal(t, "cancelled", record(t, c.cons, "c0")["state"])
-			assert.Equal(t, "cancelled", record(t, c.cons, fmt.Sprintf("c%d", marks-1))["state"])
+	// one batch call pops again after a spent budget, with the lean (want 1)
+	// and the full (want 2) script
+	for _, want := range []int64{1, 2} {
+		t.Run(fmt.Sprintf("batch want %d", want), func(t *testing.T) {
+			eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+				fill(t, c)
+				c.cons.popLen.Store(want)
+				items, ids := make([]any, 2), make([]string, 2)
+				n, remaining, err := batchPopOf(c.cons, items, ids)
+				require.NoError(t, err)
+				require.Equal(t, 1, n)
+				assert.Zero(t, remaining)
+				assert.Equal(t, "live", envID(t, items[0]))
+				check(t, c.cons, marks, true) // short of its slots with the queue empty
+				assert.Equal(t, "cancelled", record(t, c.cons, "c0")["state"])
+				assert.Equal(t, "cancelled", record(t, c.cons, fmt.Sprintf("c%d", marks-1))["state"])
+			})
 		})
-	})
+	}
 	t.Run("single", func(t *testing.T) {
 		eachCancelCase(t, func(t *testing.T, c cancelQueues) {
 			fill(t, c)

@@ -1040,7 +1040,10 @@ end
 // call. A guess that is too small costs one more call, and remaining says so.
 //
 // A consumer whose pop comes up short with the queue empty is idle after it
-// (as the script's idle rule; a paused miss stays out).
+// (as the script's idle rule; a paused miss stays out). A call whose drop
+// budget ran out before it handed out anything (see popGate) runs again, as
+// the single pops do, while the queue shrinks, so a backlog of cancelled
+// items costs no wait for a wake-up.
 func (q *Queue) dequeueBatch(pop, popOne *redis.Script, items []any, ackIDs []string, extraKeys ...string) (n, remaining int, err error) {
 	slots := min(len(items), len(ackIDs))
 	limit := min(slots, maxPop)
@@ -1062,24 +1065,35 @@ func (q *Queue) dequeueBatch(pop, popOne *redis.Script, items []any, ackIDs []st
 	resv := fmt.Sprintf("%020d", r.start)
 	keys := q.popKeys(extraKeys...)
 	g := q.pauseHooks.gen.Load()
-	var reply []any
 	tail := append(q.cancelArgs(), q.hbt(), q.ackPrefix)
+	script, args := pop, append([]any{r.want, q.vt(), q.ackPrefix, resv, consumer, slots}, tail...)
 	if r.want == 1 {
-		reply, err = popOne.Run(q.ctx, q.client, keys, append([]any{q.vt(), q.ackIDOf(resv, 1), consumer, slots}, tail...)...).Slice()
-	} else {
-		reply, err = pop.Run(q.ctx, q.client, keys, append([]any{r.want, q.vt(), q.ackPrefix, resv, consumer, slots}, tail...)...).Slice()
+		script, args = popOne, append([]any{q.vt(), q.ackIDOf(resv, 1), consumer, slots}, tail...)
 	}
-	if err != nil {
-		q.retryPop.CompareAndSwap(nil, r)
-		return 0, 0, err
+	var reply, popped []any
+	for last := -1; ; last = remaining {
+		reply, err = script.Run(q.ctx, q.client, keys, args...).Slice()
+		if err != nil {
+			q.retryPop.CompareAndSwap(nil, r)
+			return 0, 0, err
+		}
+
+		if len(reply) > 2 { // {0, {}, 1}: paused (pausedBatch); popLen stays for the Resume
+			q.refused(g)
+			return 0, 0, nil
+		}
+
+		popped = reply[1].([]any)
+		remaining = int(reply[0].(int64))
+		// Nothing handed out with items left: the drop budget ran out (see
+		// popGate). Pop again; nothing was handed out, so r is still free.
+		// Only while the queue shrinks, so no other empty reply (a hand-back
+		// whose first item left pending) can spin.
+		if len(popped) > 0 || remaining == 0 || (last >= 0 && remaining >= last) {
+			break
+		}
 	}
 
-	if len(reply) > 2 { // {0, {}, 1}: paused (pausedBatch); popLen stays for the Resume
-		q.refused(g)
-		return 0, 0, nil
-	}
-
-	popped := reply[1].([]any)
 	if len(popped) > 0 {
 		q.beating.Store(q.hbt() > 0)
 	}
@@ -1088,7 +1102,6 @@ func (q *Queue) dequeueBatch(pop, popOne *redis.Script, items []any, ackIDs []st
 		ackIDs[i] = q.ackIDOf(resv, i+1)
 	}
 
-	remaining = int(reply[0].(int64))
 	if remaining > 0 {
 		q.popRun.Add(int64(len(popped)))
 		q.popLen.Store(int64(remaining))
