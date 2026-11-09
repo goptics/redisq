@@ -2,7 +2,7 @@
 
 Two rows on one real-seconds clock. A: the process is killed, so Redis drops its subscription at once.
 B: the host is lost, so Redis keeps its socket and still counts the subscription. In both rows C1, alive and
-idle, sweeps once a second. Every sweep runs a port of the sweep script (tickBody, queue.go:806-856), in whole
+idle, sweeps once a second. Every sweep runs a port of the sweep script (tickBody, queue.go:1315-1367), in whole
 milliseconds so "now - mark >= 2.5 s" is exact. Facts and invariants: STORYBOARD.md, section 4.
 """
 import heapq
@@ -14,13 +14,13 @@ import kfu
 from kfu import at, bar, flash, kf, ring
 
 # ---- the rules, in milliseconds ----
-HBT = 30_000          # heartbeat timeout, default 30 s (queue.go:85)
-GRACE = 2_500         # presenceGrace (queue.go:891)
+HBT = 30_000          # heartbeat timeout, default 30 s (queue.go:108)
+GRACE = 2_500         # presenceGrace (queue.go:1402)
 GRACE_S = f"{GRACE / 1000:g}"   # as the labels print it
-TICK = 500            # a sweep moves the shared clock only if >= .5 s since the last move (queue.go:814)
-GAP = 2_000           # sweepGap: a longer gap is a stall (queue.go:810-813, 862); must not fire here
-VT = 300_000          # visibility timeout, default 5 min (queue.go:83): out of reach in this story
-C2_PHASE, C1_PHASE = 0, 300   # each Queue object sweeps once a second (queue.go:908-909); fixed phases
+TICK = 500            # a sweep moves the shared clock only if >= .5 s since the last move (queue.go:1325)
+GAP = 2_000           # sweepGap: a longer gap is a stall (queue.go:1321-1324, 1393); must not fire here
+VT = 300_000          # visibility timeout, default 5 min (queue.go:106): out of reach in this story
+C2_PHASE, C1_PHASE = 0, 300   # each Queue object sweeps once a second (queue.go:1420-1421); fixed phases
 T0 = -5_000           # history: C2 popped J1, then J2 (varmq pops one per call for ack storage)
 KILL = 100            # C2 stops 0.1 s after its own sweep at 0
 END = 34_600          # real time drawn (the clock shows 0-34 s)
@@ -57,7 +57,7 @@ class Redis:
 
     def pop_one(self, owner, now):
         """listAckPopOne: LPOP the head into pending with a deadline, renew the owner's heartbeat, one script
-        (queue.go:539-558, 588-592; beat: queue.go:665-668)."""
+        (queue.go:877-899, 905, 939; beat: queue.go:1131-1134)."""
         if not self.lst:
             self.idle.add(owner)
             return None
@@ -67,11 +67,11 @@ class Redis:
         return aid, v
 
     def ack(self, aid):
-        """Acknowledge deletes the entry and its deadline (queue.go:353-373)."""
+        """Acknowledge deletes the entry and its deadline (queue.go:502-504, 671-672)."""
         del self.pending[aid], self.dl[aid]
 
     def move(self, aid):
-        """moveFn + listRepush: LPUSH to the front, then drop from pending (queue.go:749-775)."""
+        """moveFn + listRepush: LPUSH to the front, then drop from pending (queue.go:1270-1282)."""
         v = self.pending.get(aid)
         if v is not None:
             self.lst.insert(0, v)
@@ -80,7 +80,7 @@ class Redis:
         return int(v is not None)
 
     def tick(self, me, now):
-        """tickBody (queue.go:806-856) for Queue object `me`. Returns (moved, ticked, notes)."""
+        """tickBody (queue.go:1315-1367) for Queue object `me`. Returns (moved, ticked, notes)."""
         notes = []
         last = self.clock
         assert not (last is not None and now - last > GAP), ("stall guard fired", now, last)
@@ -94,9 +94,9 @@ class Redis:
         n = 0
         assert all(d > now for d in self.dl.values()), "no visibility deadline passes in this story"
         if last is not None:
-            dead = {m for m, s in self.hb.items() if s <= now}            # heartbeat ran out (queue.go:830)
+            dead = {m for m, s in self.hb.items() if s <= now}            # heartbeat ran out (queue.go:1341)
             notes += [("heartbeat ran out", m) for m in sorted(dead)]
-            if ticked:                                                    # presence (queue.go:831-841)
+            if ticked:                                                    # presence (queue.go:1342-1353)
                 for m in sorted(m for m, s in self.hb.items() if s >= now):
                     s = self.pres.get(m)
                     if self.subs.get(m, 0) > 0:
@@ -110,7 +110,7 @@ class Redis:
                         notes.append(("gone", m))
                     elif s is not None:
                         notes.append(("waiting", m))
-            if dead:                                                      # reap (queue.go:843-853)
+            if dead:                                                      # reap (queue.go:1354-1364)
                 for aid in sorted(a for a in self.pending if a.split(":")[0] in dead):
                     n += self.move(aid)
                 for m in dead:
@@ -120,7 +120,7 @@ class Redis:
         return n, ticked, notes
 
     def wake(self, count, order):
-        """wakeFn (notification.go:54-65): SPOP members until count are reached; a member whose channel has no
+        """wakeFn (notification.go:56-66): SPOP members until count are reached; a member whose channel has no
         subscriber is skipped. SPOP is random: `order` is one possible sequence of picks."""
         woken = []
         for m in order:
@@ -134,9 +134,9 @@ class Redis:
 
 def simulate(row):
     r = Redis()
-    r.subs = {"C1": 1, "C2": 1}            # both subscribed to their own wake channel (notification.go:85)
+    r.subs = {"C1": 1, "C2": 1}            # both subscribed to their own wake channel (queue.go:80)
     r.idle = {"C1"}                        # Subscribe added both; C2 popped J1, J2, so its nudge leaves it out while
-    r.lst = ["J1", "J2"]                   # it holds them (notification.go:74-77, 164-171)
+    r.lst = ["J1", "J2"]                   # it holds them (notification.go:76-79, 169-176)
     for _ in range(2):
         r.pop_one("C2", T0)
     where = {"J1": [(T0, "pending:C2")], "J2": [(T0, "pending:C2")]}
@@ -164,7 +164,7 @@ def simulate(row):
             if any(k_ == "reap" for k_, *_ in notes):
                 for v in r.lst:
                     where[v].append((t, "list"))
-            if n and arg == "C1":          # a DistributedQueue's onRequeue is wake(n) (distributed.go:29, queue.go:950-956)
+            if n and arg == "C1":          # every Queue's requeued(n) is wake(n) (queue.go:1479, queue.go:1477-1481)
                 heapq.heappush(ev, (t + WAKE_MS, next(seq), "wake", n))
         elif kind == "wake":
             members = sorted(r.idle)

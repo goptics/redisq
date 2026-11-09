@@ -20,7 +20,8 @@
     <a href="#how-it-works">How It Works</a> ·
     <a href="#trade-offs">Trade-offs</a> ·
     <a href="#delivery-guarantees">Delivery Guarantees</a> ·
-    <a href="#development">Development</a>
+    <a href="#development">Development</a> ·
+    <a href="#contributing">Contributing</a>
   </p>
 
   <p>
@@ -37,10 +38,14 @@
 - **Fast handover**: a consumer that [closes](#when-a-consumer-closes) hands its unacknowledged jobs back at once; one that [dies](#when-a-consumer-dies), in about 3-4 s; one cut off from Redis, after a 30 s heartbeat.
 - **Batch dequeue** of up to 1000 items per round trip, each under its own ack ID.
 - **Deduplicated enqueue**: `EnqueueOnce` stores a job once per id within a dedup window.
-- **Job records and stats** in Redis, shared by every instance: completed and failed jobs with payloads, kept by count and age.
+- **Job records and inspection** in Redis, shared by every instance: completed and failed jobs with payloads, kept by count and age.
+- **[Queue pause](#queue-pause)**: `Pause` stops every consumer of a queue, in every process, until `Resume`.
+- **[Job cancel](#job-cancel)**: `CancelJob` asks to cancel a waiting or running job, from any process.
+- **[Workflows](#workflows)**: VarMQ workflows (a DAG of jobs across queues) run on Redis, in any process.
+- **[Instance reports](#instance-reports)**: each process can report its workers to Redis, for a dashboard such as vartop.
 - **Queue TTL**, refreshed on every enqueue.
 - **Thread-safe**: share one queue object across goroutines.
-- **Storage for [varmq](https://github.com/goptics/varmq)** queues.
+- **Storage for [VarMQ](https://github.com/goptics/varmq)** queues.
 
 ## Quick Start
 
@@ -48,7 +53,8 @@
 go get github.com/goptics/redisq
 ```
 
-Requires Go 1.26+ and Redis 6.0+.
+Requires Go 1.26+ and Redis 6.0+. With VarMQ, it requires VarMQ ≥ v1.11.0 and Go 1.27+ (see the [version table](https://varmq.goptics.org/start/installation/#versions)).
+An older VarMQ acknowledges a failed job instead of rejecting it, and has no queue pause or job cancel.
 
 ```go
 package main
@@ -83,7 +89,7 @@ func main() {
 | `Queue`         | `qs.NewQueue(key)`         | FIFO         |
 | `PriorityQueue` | `qs.NewPriorityQueue(key)` | Lowest first |
 
-Both support every API below: acks, dedup, batches, wakes, outcomes. `DistributedQueue`,
+Both support every API below: acks, dedup, batches, wakes, outcomes, pause and cancel. `DistributedQueue`,
 `DistributedPriorityQueue` and their constructors remain as deprecated aliases.
 
 ```go
@@ -113,19 +119,21 @@ qs = redisq.New(url, redisq.WithNamespace("app"))
 qs.NewQueue("orders")         // redisq:app:fifo:{orders}, ...
 ```
 
-A queue and its keys share one Redis Cluster hash slot. `{` and `}` are reserved: `New` panics on a namespace containing them, and a constructor on an empty queue key or one containing them.
+A queue's keys share one hash slot, so the queue key layout is slot-safe. Redis Cluster is still not supported (see [Trade-offs](#trade-offs)). `{` and `}` are reserved: `New` panics on a namespace containing them, and a constructor on an empty queue key or one containing them.
 
 > **Upgrading from 1.5.x or earlier:** those versions used the queue key as given (`orders`, `orders:idle`, ...). This version does not read those keys, so drain old queues (or move their items) before switching.
 
 ### Instance reports
 
-With varmq, a process can report itself (worker names, status, concurrency, processed counts, bound queues) to Redis, so a dashboard such as vartop lists live processes without calling them. A worker's start, stop, pause, resume or concurrency change is reported at once (varmq with `contract/v0.3.0`); load and counts follow the interval:
+With VarMQ, a process can report itself to Redis: worker names, status, concurrency, processed counts and bound queues. A dashboard such as vartop then lists live processes without calling them. A worker's start, stop, pause, resume or concurrency change is reported at once. Load and counts follow the interval:
 
 ```go
 varmq.InstanceID = "orders-api-1" // optional; default hostname. Read once, so set it first
 qs := redisq.New(url, redisq.WithNamespace("app"), redisq.WithInstanceReports(5*time.Second))
 defer qs.Close() // stops the reports and removes this process's record
 ```
+
+Turn reports on for one client per namespace: `Close` removes the process's shared record. An empty `varmq.InstanceID` means no reports.
 
 Each report overwrites one field of `redisq:app:{instances}` and its time in `redisq:app:{instances}:beats`, from the Redis clock. A process that stops without `Close` shows as lost after 3 intervals; its record is pruned after 5 minutes, and both keys expire when no process reports. The interval must be from 1s to 60s. Off by default.
 
@@ -160,8 +168,8 @@ queue.RequeueNackedItems()    // requeue expired jobs now; with a 0 visibility t
 queue.PrepareForFutureAck("job-456", item) // track an item under your own ack ID
 ```
 
-`Close` hands every job the queue object took and did not acknowledge back to the queue at once, so stop or
-drain your workers first (varmq 1.7+: `w.StopAndWait()`; before 1.7, `w.Stop()` waits). Jobs tracked with
+`Close` hands every job the queue object took and did not acknowledge back to the queue at once. So stop or
+drain your workers first (with VarMQ, `w.StopAndWait()`). Jobs tracked with
 `PrepareForFutureAck` get no heartbeat and `Close` doesn't hand them back: they wait for the visibility timeout.
 See [How It Works](#how-it-works).
 
@@ -181,7 +189,7 @@ An id stays taken for the whole window, even after its job is handled, removed o
 an id drop each other's jobs. A push of an id after its window drops that id's old Job Record, so a watch of the new run
 never sees the old outcome.
 
-### Job records and stats
+### Job records and inspection
 
 `Acknowledge` marks a job completed and `Reject` marks it failed for good (no requeue). Each, in one atomic
 script, counts the job, keeps its Job Record (item verbatim, start and finish times, attempts, and `Reject`'s reason as its `errors` entry)
@@ -199,17 +207,19 @@ queue.Jobs(ctx, contract.JobFailed, 0, 50) // newest first; pending in hand-out 
 ```
 
 Both queue types (and the deprecated `Distributed*` aliases) implement `contract.QueueInspector`
-(`github.com/goptics/varmq/contract`), which varmq's `Handler` serves as `GET /queues` and
-`GET /queues/{id}/jobs`. The layout is varmq's
-[`spec/redis-storage.md`](https://github.com/goptics/varmq/blob/main/spec/redis-storage.md) 1.0.0. Retention is set
+(`github.com/goptics/varmq/contract`), which VarMQ's `Handler` serves as `GET /queues` and
+`GET /queues/{id}/jobs`. The layout is VarMQ's
+[`spec/redis-storage.md`](https://github.com/goptics/varmq/blob/main/spec/redis-storage.md) 1.7.0. `GET /queues/{id}/jobs/{jobId}` returns 501:
+redisq does not implement `contract.JobReader` yet. `Handler` has no auth. Its GET routes return kept job payloads,
+and its PATCH routes pause, resume, stop and tune workers and cancel jobs and workflows. Put auth in front of all of it. Retention is set
 per queue object, so give every instance of a queue the same values. Records hold a copy of each payload, so
-retention bounds Redis memory. `Purge` deletes all of a queue's jobs, records and counters; a purged workflow task
+retention bounds Redis memory. `Purge` deletes all of a queue's jobs, records and counters. A purged workflow task
 ends `cancelled`, so its workflow goes on. Purge decodes every queued and processing item inside Redis to find
 workflow tasks, so a queue of millions blocks Redis while it runs.
 
 ### Job outcomes
 
-A producer waits on a job that any process runs. Jobs are varmq envelopes (`{"id": ...}`); the id is the job ID.
+A producer waits on a job that any process runs. Jobs are VarMQ envelopes (`{"id": ...}`); the id is the job ID.
 
 ```go
 cancel := q.WatchOutcome("job-0b7e9c2a", func(o contract.JobOutcome) {
@@ -220,12 +230,56 @@ defer cancel() // early stop only; after fn the watch ends by itself
 q.AcknowledgeResult(ackID, []byte(`{"total":42}`)) // Acknowledge + result JSON; invalid JSON: false, no change
 ```
 
-`Acknowledge`, `AcknowledgeResult`, `Reject` and `AcknowledgeCancelled`, and a pop that drops a cancelled job (see
-cancel below), publish the outcome on `<key>:done:<job id>` in the same script, kept record or not. A watch
+`Acknowledge`, `AcknowledgeResult`, `Reject` and `AcknowledgeCancelled` publish the outcome on `<key>:done:<job id>`
+in the same script, kept record or not. So does a pop that drops a cancelled job (see [Job cancel](#job-cancel)). A watch
 subscribes that channel on the queue object's one pub/sub connection, reads the Job Record right after, and again
 each sweep (1 s), so a job that ended before the watch, or a message lost in a reconnect, is still reported while
 its record is kept. `AcknowledgeResult` stores the result raw as the record's `result`, big integers intact.
 `Close` drops watchers without calling them (a delivery already under way may still call its fn).
+
+### Queue pause
+
+```go
+queue.Pause()  // every consumer, in every process, stops taking jobs
+queue.Paused() // true; this object's cached view, no Redis call
+stop := queue.OnPauseChange(func(paused bool) { fmt.Println("paused:", paused) })
+defer stop()
+queue.PauseRefusals() // this object's pops that Redis refused for the pause
+queue.Resume()        // consumers take jobs again; idle consumers are woken
+```
+
+`Pause` sets `<key>:paused` to the pause time. The flag has no expiry, so it survives restarts, and `Purge` keeps it.
+While the flag exists, every pop hands out nothing: plain or acknowledged, one item or a batch.
+Enqueue, `Acknowledge`, `Reject` and requeues go on as before. `Resume` deletes the flag and wakes idle consumers.
+
+Each queue object caches the flag for `Paused` and `OnPauseChange`. Its own calls, pop replies, the `<key>:control`
+channel and the 1 s sweep update the cache, so a lost message costs at most a second. `QueueStats` reports `paused`
+and `paused_at`. Upgrade every consumer before you pause a queue: an older version ignores the flag.
+A pause stops every consumer, in every process, until `Resume`. So authorize untrusted callers of `Pause` and `Resume`.
+
+### Job cancel
+
+```go
+err := queue.CancelJob("job-0b7e9c2a") // from any process; contract.ErrJobEnded if its record shows it ended
+
+stop := queue.OnCancel(func(jobID string) { /* stop the running job */ })
+defer stop()
+
+queue.AcknowledgeCancelled(ackID, "cancelled by user") // finish a job that stopped for a cancel
+```
+
+A waiting job is dropped by the pop that would hand it out. Its record and outcome are `cancelled`, and it never runs.
+A waiting workflow task is the exception: it is handed out and runs unless its workflow is cancelled. So cancel it
+with the workflow.
+
+A running job is announced on `<key>:control` to `OnCancel` callbacks. VarMQ then cancels the job's context. If the
+handler returns an error or panics, VarMQ finishes the job with `AcknowledgeCancelled`: as `Reject`, but with state
+`cancelled`. A workflow task ends through its workflow instead. If the handler finishes anyway, the job completes as usual. Storage never stops a running job itself.
+
+Each mark lives 24 hours in the sorted set `<key>:cancelled`, with its expiry as the score. With no marks, a pop costs
+one more `EXISTS`. `Purge` deletes the marks. Any ID without an ended record can be marked, even one not pushed yet.
+A later plain `Enqueue` of that ID is dropped if it is popped before the mark expires (`EnqueueOnce` clears the mark). Use job IDs that others cannot guess. Authorize
+and rate-limit untrusted callers of `CancelJob`.
 
 ### Batch dequeue
 
@@ -250,9 +304,9 @@ for {
 }
 ```
 
-### With varmq
+### With VarMQ
 
-redisq implements varmq's queue interfaces, outcome watching included:
+redisq implements VarMQ's queue interfaces, including outcome watching, pause, cancel and workflows:
 
 ```go
 // consumer process
@@ -265,18 +319,11 @@ job, _ := q.Add("https://example.com", 1)
 n, err := job.Result() // waits until any process finished it
 ```
 
-Cancel a job from any process with `CancelJob(id)`. A waiting job is dropped by the pop that would hand it out:
-record and outcome `cancelled`, never run. A waiting workflow task is the exception: it is handed out and runs unless
-its workflow is cancelled, so cancel it with the workflow. A running one is announced on `<key>:control`; varmq cancels its
-worker's context and finishes it with `AcknowledgeCancelled`. A job that already ended returns
-`contract.ErrJobEnded`. Each mark lives 24h in the sorted set `<key>:cancelled` (score: its expiry); with no marks a pop costs one
-`EXISTS` more. Any id can be marked, so authorize and rate-limit untrusted callers of `CancelJob`.
-
 See [`examples/varmq`](examples/varmq) for a provider/consumer setup.
 
 ### Workflows
 
-A varmq workflow is a DAG of jobs across queues. Every redisq queue can carry its tasks, and `WorkflowStore()` on any
+A VarMQ workflow is a DAG of jobs across queues. Every redisq queue can carry its tasks, and `WorkflowStore()` on any
 queue is the store of its Redis and namespace:
 
 ```go
@@ -288,12 +335,13 @@ wf.Add("thumb", varmq.NewResultPriorityQueue[int, string](thumb), 64).After(up)
 err := wf.Submit(ctx) // workers in any process run it; wf.WaitContext(ctx) for the end
 ```
 
-A task finishes in one script that settles its job and pushes the tasks it releases, so a crash never leaves a
-workflow between the two. The layout is varmq's `spec/redis-storage.md` 1.5.0 (`redisq:[ns:]wf:<id>`,
+A task finishes in one script that settles its job and pushes the tasks it releases. So a crash never leaves a
+workflow between the two. The layout is VarMQ's `spec/redis-storage.md` 1.5.0 (`redisq:[ns:]wf:<id>`,
 `redisq:[ns:]wf:index`). `WithWorkflowResultLimit` (default 64 KiB) and `WithWorkflowRetention` (default 7 days) set
 the store. Every consumer of a queue that carries workflow tasks must run this version. Anyone who can push to a
 task's queue can push a copy of that task, so treat push access as trusted. Don't use `SetExpiration` on a queue that
-carries workflow tasks: workflow pushes don't renew the expiry, and Submit refuses such a queue object. See [`examples/workflow`](examples/workflow).
+carries workflow tasks: workflow pushes don't renew the expiry, and Submit refuses such a queue object. See
+[`examples/workflow`](examples/workflow).
 
 ## How It Works
 
@@ -307,16 +355,16 @@ is always in the queue or pending, never only in a client.
 
 ![redisq acknowledgments and the visibility timeout](./assets/diagrams/redisq-ack.svg)
 
-varmq acknowledges a job even when its handler fails, so with varmq a job comes back this way only when it runs
-past the visibility timeout or its `Acknowledge` fails (Redis unreachable). Keep the timeout above your slowest
-job.
+VarMQ acknowledges or rejects every job it finishes: `Reject` on an error or a panic, so a failed job does not come
+back. With VarMQ, a job comes back this way only when it runs past the visibility timeout or its `Acknowledge` or
+`Reject` fails (Redis unreachable). Keep the timeout above your slowest job.
 
 ### Waking idle consumers
 
 A consumer (one that called `Subscribe`) that finds the queue empty joins the idle set `<key>:idle`. An enqueue pushes the job and,
 in the same script, wakes up to one idle consumer per waiting job, each on its own pub/sub channel. A consumer
 that took a job stays out of the idle set until its own `Len()` or dequeue finds the queue empty again, so wakes
-go to free consumers; a busy one pulls the next job itself when one finishes (varmq does). Every consumer also
+go to free consumers; a busy one pulls the next job itself when one finishes (VarMQ does). Every consumer also
 runs a nudge once a second: with jobs waiting it pulls, and with the queue empty it puts an idle consumer back in
 the idle set, in case a wake was lost.
 
@@ -377,21 +425,22 @@ once.
   connection (count them against Redis's `maxclients`); about once a second per key it also counts subscribers
   (`PUBSUB NUMSUB`) for the consumers holding jobs. Each pop that hands out jobs also
   writes the heartbeat. A dead consumer or a `Close` reads every pending ack ID once.
-- **One Redis server.** `New` uses a single-node client; Redis Cluster isn't supported. Workflow keys carry no
-  hashtag, so a workflow's queues must share one Redis anyway.
+- **One Redis server.** `New` uses a single-node client, so Redis Cluster isn't supported. Queue keys share a hash
+  slot, but workflow keys carry no hashtag, and wakes and presence count pub/sub subscribers on one node only.
 
 ## Delivery Guarantees
 
 go-redis re-sends a command whose reply was lost, so:
 
-| Call                                         | Guarantee     | On a lost reply                                                    |
-| -------------------------------------------- | ------------- | ------------------------------------------------------------------ |
-| `DequeueWithAckId`, `DequeueBatchWithAckIds` | At least once | Items come back on retry, the next call, or after a timeout        |
-| `Enqueue`                                    | At least once | May store the job twice; `false` is not proof                      |
-| `EnqueueOnce`                                | Once per id   | Stored once within the dedup window                                |
-| `Acknowledge`, `AcknowledgeResult`, `Reject` | Once          | The re-send finds the job finished: no second record or outcome    |
-| `Dequeue`                                    | At most once  | Item is gone                                                       |
-| `Remove`                                     | –             | May remove a second identical item                                 |
+| Call                                                                 | Guarantee     | On a lost reply                                                                 |
+| -------------------------------------------------------------------- | ------------- | ------------------------------------------------------------------------------- |
+| `DequeueWithAckId`, `DequeueBatchWithAckIds`                         | At least once | Items come back on retry, the next call, or after a timeout                     |
+| `Enqueue`                                                            | At least once | May store the job twice; `false` is not proof                                   |
+| `EnqueueOnce`                                                        | Once per id   | Stored once within the dedup window                                             |
+| `Acknowledge`, `AcknowledgeResult`, `Reject`, `AcknowledgeCancelled` | Once          | The re-send finds the job finished: no second record or outcome                 |
+| `CancelJob`                                                          | At least once | May announce the cancel twice; may return `ErrJobEnded` after it marked the job |
+| `Dequeue`                                                            | At most once  | Item is gone                                                                    |
+| `Remove`                                                             | –             | May remove a second identical item                                              |
 
 - Use globally unique ids with `EnqueueOnce` (UUID or nanoid, never a per-process counter).
 - Use `DequeueWithAckId` for jobs you can't lose.

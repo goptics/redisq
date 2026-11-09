@@ -1,8 +1,9 @@
 # redisq README diagrams: storyboard
 
 Four animated SVGs for the README, built from `gen_<slug>.py` + `<slug>.tpl.svg` with `kfu.py`
-(`make diagrams`). Facts cite the code on `docs/readme-explainers` (on top of `fix/wasted-wakes`, `ad8aa9a`)
-and, for consumer behaviour, varmq v1.9.0 (`$GOMODCACHE/github.com/goptics/varmq@v1.9.0`, written `varmq/…`).
+(`make diagrams`). Facts cite redisq `main` at `5903240` (#34) and, for consumer behaviour, varmq v1.9.0
+(`$GOMODCACHE/github.com/goptics/varmq@v1.9.0`, written `varmq/…`), except the `Reject` fact, which cites varmq
+`main` (`65f2a1f`, to ship as v1.11.0). redisq's README requires VarMQ ≥ v1.11.0; see "Changes" for what that moves.
 Every timeline below is simulated in its generator, and the invariants are `assert`s there.
 
 ## Shared vocabulary
@@ -26,22 +27,22 @@ Signals run along the top. Times that can't be shown at real speed carry a "time
 
 | Fact | Citation |
 |---|---|
-| A pop moves the item from the list head into `<key>:nacked`, sets its deadline in `<key>:timeouts` and renews the owner's heartbeat, in one script | `queue.go:481-501`, `queue.go:506`, `queue.go:516`, `queue.go:559-561`; batch: `queue.go:406-445` |
-| Deadline = Redis `TIME` + visibility timeout (default 5 min) | `queue.go:649-656`, `queue.go:83` |
-| `Acknowledge` deletes the pending entry and its deadline | `queue.go:353-373` |
-| Each Queue object sweeps once a second; the sweep requeues every item whose deadline passed, to the list front (`LPUSH`), push before delete, in one script | `queue.go:908-909`, `queue.go:827`, `queue.go:765-775` |
-| An enqueue pushes and wakes up to *n* idle consumers in one script, *n* = items waiting after the push | `distributed.go:9-11` |
-| Wake = `SPOP` a **random** member of `:idle`, `PUBLISH` to its channel; a member with no subscriber is skipped; nothing is sent when `:idle` is empty | `notification.go:52-64` |
-| A consumer joins `:idle` on `Subscribe`, when its `Len()` reads 0 (varmq calls it at job end and in its pull loop), when a pop finds nothing (a race), and at its nudge while the queue is empty, if its own last `Len()` or pop found no work | `notification.go:164-171`, `notification.go:45-47`, `notification.go:184-186`, `notification.go:74-77`, `queue.go:494-496`; `varmq/worker_pool.go:166`, `varmq/worker_eventloop.go:26` |
-| **Nudge**: once a second per consumer: items waiting → `SREM` itself and poke its own worker locally; queue empty → `SADD` itself to `:idle` only if its own last `Len()` or pop found no work (`Notification.idle`: a pop that returns a job clears it, so a busy consumer stays out) | `notification.go:74-77`, `notification.go:125-149`, `distributed.go:60`, `distributed.go:72`, `distributed.go:82` |
+| A pop moves the item from the list head into `<key>:nacked`, sets its deadline in `<key>:timeouts` and renews the owner's heartbeat, in one script | `queue.go:877-899`, `queue.go:905`, `queue.go:939`, `queue.go:986-988`; batch: `queue.go:755-798` |
+| Deadline = Redis `TIME` + visibility timeout (default 5 min) | `queue.go:1111-1117`, `queue.go:106` |
+| `Acknowledge` deletes the pending entry and its deadline | `queue.go:502-504, 671-672` |
+| Each Queue object sweeps once a second; the sweep requeues every item whose deadline passed, to the list front (`LPUSH`), push before delete, in one script | `queue.go:1420-1421`, `queue.go:1338`, `queue.go:1270-1282` |
+| An enqueue pushes and wakes up to *n* idle consumers in one script, *n* = items waiting after the push | `queue.go:386-389` |
+| Wake = `SPOP` a **random** member of `:idle`, `PUBLISH` to its channel; a member with no subscriber is skipped; nothing is sent when `:idle` is empty | `notification.go:56-66` |
+| A consumer joins `:idle` on `Subscribe`, when its `Len()` reads 0 (varmq calls it at job end and in its pull loop), when a pop finds nothing (a race), and at its nudge while the queue is empty, if its own last `Len()` or pop found no work | `notification.go:169-176`, `notification.go:47-49`, `notification.go:189-191`, `notification.go:76-79`, `queue.go:890-893`; `varmq/worker_pool.go:166`, `varmq/worker_eventloop.go:26` |
+| **Nudge**: once a second per consumer: items waiting → `SREM` itself and poke its own worker locally; queue empty → `SADD` itself to `:idle` only if its own last `Len()` or pop found no work (`Notification.idle`: a pop that returns a job clears it, so a busy consumer stays out) | `notification.go:76-79`, `notification.go:130-154`, `queue.go:249`, `queue.go:1020`, `queue.go:1163` |
 | A busy consumer ignores a wake or poke; a consumer with free slots pops while `Len() > 0`, one `DequeueWithAckId` per free slot (ack sources never batch); a finished job makes it check again | `varmq/worker_eventloop.go:26`, `varmq/worker_eventloop.go:185`, `varmq/source.go:125-136`, `varmq/worker_pool.go:151`, `varmq/source_manager.go:87-91` |
-| A requeue of *n* items wakes up to *n* idle consumers (distributed queues only) | sweep `queue.go:945`, Close `queue.go:1059`, `queue.go:950-956`, `distributed.go:29` |
-| Each pop that hands out items sets the owner's heartbeat to now + heartbeat timeout (default 30 s); its own sweep renews it and resets its presence mark | `queue.go:665-668`, `queue.go:85`, `queue.go:817-820` |
-| Presence: owner with a live heartbeat seen subscribed (mark 0) → a sweep that moves the shared clock and sees no subscriber sets mark = now → a later such sweep with now - mark ≥ 2.5 s finds it dead. Every queue object subscribes (`Queue.start`), plain ones included | `queue.go:814-815`, `queue.go:831-841`, `queue.go:891`, `queue.go:61-65` |
-| A dead owner (presence, or heartbeat expired) has all its pending items requeued (list front) and its heartbeat and mark dropped | `queue.go:830`, `queue.go:843-853` |
-| `DistributedQueue.Close`: leave `:idle`, requeue own pending items, drop own heartbeat and presence, wake | `distributed.go:89-94`, `notification.go:218-221`, `queue.go:1029-1061`, `queue.go:860-869` |
-| An `Acknowledge` after `Close` fails | `queue.go:355-357` |
-| varmq acknowledges a job whose handler failed or panicked | `varmq/main.go:61-79`, `varmq/worker_pool.go:127-131`, `varmq/job.go:291-330` |
+| A requeue of *n* items wakes up to *n* idle consumers (every queue) | sweep `queue.go:1467`, Close `queue.go:1621`, `queue.go:1477-1481` |
+| Each pop that hands out items sets the owner's heartbeat to now + heartbeat timeout (default 30 s); its own sweep renews it and resets its presence mark | `queue.go:1131-1134`, `queue.go:108`, `queue.go:1328-1331` |
+| Presence: owner with a live heartbeat seen subscribed (mark 0) → a sweep that moves the shared clock and sees no subscriber sets mark = now → a later such sweep with now - mark ≥ 2.5 s finds it dead. Every queue object subscribes (`Queue.start`) | `queue.go:1325-1326`, `queue.go:1342-1353`, `queue.go:1402`, `queue.go:79-85` |
+| A dead owner (presence, or heartbeat expired) has all its pending items requeued (list front) and its heartbeat and mark dropped | `queue.go:1341`, `queue.go:1354-1364` |
+| `Queue.Close`: leave `:idle`, requeue own pending items, drop own heartbeat and presence, wake | `queue.go:1591-1623`, `notification.go:223-226`, `queue.go:1371-1380` |
+| An `Acknowledge` after `Close` fails | `queue.go:526-529` |
+| VarMQ ≥ v1.11.0 rejects a job whose handler failed or panicked (`Reject`: final, no requeue); v1.9.0 acknowledged it | varmq `main` `job.go:580-604`, `job.go:626-637`; v1.9.0: `varmq/main.go:61-79`, `varmq/job.go:291-330` |
 
 ## 1. Ack and visibility timeout  (`redisq-ack.svg`)
 
@@ -61,23 +62,24 @@ Timeline (simulated; visibility timeout drawn as 4 s, labelled "5 min"; times no
   next poll pops B again (new ack ID, new deadline), consumer acks → pending empty
 Loop: D = derived: last ack + 1.5
 Invariants:
-  - an item is in exactly one of {list, pending, done} at every keyframe: pop and requeue are each one script — `queue.go:516`, `queue.go:767-775`
-  - the deadline bar spans exactly the visibility timeout from the pop — `queue.go:649-656`
-  - ack removes the entry and its deadline — `queue.go:353-373`
-  - B returns at the first sweep at or after its deadline (not at the deadline itself), to the list front — `queue.go:908-909`, `queue.go:827`, `queue.go:765`
+  - an item is in exactly one of {list, pending, done} at every keyframe: pop and requeue are each one script — `queue.go:939`, `queue.go:1272-1282`
+  - the deadline bar spans exactly the visibility timeout from the pop — `queue.go:1111-1117`
+  - ack removes the entry and its deadline — `queue.go:502-504, 671-672`
+  - B returns at the first sweep at or after its deadline (not at the deadline itself), to the list front — `queue.go:1420-1421`, `queue.go:1338`, `queue.go:1270`
   - B is delivered twice, A once; end: list and pending empty, consumer idle
-  - (no other requeue path fires: one live object, no Close, own sweep keeps its heartbeat alive — `queue.go:816-820`)
+  - (no other requeue path fires: one live object, no Close, own sweep keeps its heartbeat alive — `queue.go:1327-1331`)
 Why-labels: "no Acknowledge", "deadline passed"
 Still frame (reduced motion): B's deadline bar ~80% full, A acked
 Seam check: list empty, pending empty, consumer idle, no dots
 Builds on: none (introduces list, pending, deadline, sweep)
-README note: varmq acknowledges failed jobs too; under varmq a job reaches this path only by running past the timeout.
+README note: VarMQ rejects failed jobs (no requeue); under VarMQ a job reaches this path only by running past the
+timeout, or when its `Acknowledge` or `Reject` fails.
 
 ## 2. Waking idle consumers  (`redisq-wake.svg`)
 
 Question: when a job arrives, who is told, and why not a busy consumer?
 Actors: `Enqueue` (one script: `RPUSH` + wake); Redis box: queue, `:idle` set (chips C1, C2); consumers C1, C2
-(`DistributedQueue` + varmq worker, concurrency 1), each with its own wake channel and a nudge tick (once a
+(`Queue` + varmq worker, concurrency 1), each with its own wake channel and a nudge tick (once a
 second, fixed phase per consumer: C1 at .3 + k, C2 at .8 + k).
 States: chip in `:idle` or not; consumer idle / busy.
 Start state: queue empty, C1 and C2 idle, both chips in `:idle` (Subscribe added them; nudges keep them there).
@@ -90,10 +92,10 @@ Timeline (simulated):
   C1 finishes X → its `Len()` reads 0 → back in `:idle`; C2 finishes Y → back the same way
 Loop: D = ceil(max(last `:idle` change, last job end) + 1.5), whole seconds so the nudge pulses repeat
 Invariants:
-  - wakes per enqueue ≤ items waiting after the push and ≤ `:idle` members — `distributed.go:9-11`, `notification.go:57-60`
-  - SPOP removes the member before the PUBLISH — `notification.go:58`
+  - wakes per enqueue ≤ items waiting after the push and ≤ `:idle` members — `queue.go:386-389`, `notification.go:59-62`
+  - SPOP removes the member before the PUBLISH — `notification.go:60`
   - a nudge SREMs + pokes when items wait; with the queue empty it SADDs only a consumer whose own last `Len()` or
-    pop found no work — `notification.go:74-77`, `notification.go:140-146`
+    pop found no work — `notification.go:76-79`, `notification.go:145-151`
   - no consumer rejoins `:idle` while it runs a job; no wake or poke reaches a busy consumer — `varmq/worker_eventloop.go:26`
   - each job is popped through its own wake, under half a (drawn) second after its enqueue, not by a nudge
   - every job popped once; end: queue empty, both chips in `:idle`
@@ -125,17 +127,17 @@ Timeline (simulated):
   end: C1 idle in `:idle`, C2 gone → hold 1 s, cross-fade to the start state, "↻ replay"
 Loop: D = ceil(cross-fade end + .5), whole seconds so the nudge pulses repeat
 Invariants:
-  - only J1's push wakes (n ≥ 1 but `:idle` empty for J2, J3) — `distributed.go:9-11`, `notification.go:58-59`
-  - a woken consumer pops while it has a free slot and `Len() > 0`, one `DequeueWithAckId` per slot — `varmq/source.go:125-136`, `varmq/worker_eventloop.go:26`, `varmq/worker_eventloop.go:185`, `queue.go:481-501`
-  - C2 is full, so its nudges leave it out of `:idle`; at Close leave() finds it out, before the release, so wake(3) can only reach C1 — `notification.go:74-77`, `distributed.go:90-91`, `notification.go:218-221`
-  - all of C2's pending entries move back in one script, list order J3 J2 J1; heartbeat and presence dropped — `queue.go:860-869`, `queue.go:765`
+  - only J1's push wakes (n ≥ 1 but `:idle` empty for J2, J3) — `queue.go:386-389`, `notification.go:60-61`
+  - a woken consumer pops while it has a free slot and `Len() > 0`, one `DequeueWithAckId` per slot — `varmq/source.go:125-136`, `varmq/worker_eventloop.go:26`, `varmq/worker_eventloop.go:185`, `queue.go:877-899`
+  - C2 is full, so its nudges leave it out of `:idle`; at Close leave() finds it out, before the release, so wake(3) can only reach C1 — `notification.go:76-79`, `queue.go:1594-1596`, `notification.go:223-226`
+  - all of C2's pending entries move back in one script, list order J3 J2 J1; heartbeat and presence dropped — `queue.go:1371-1380`, `queue.go:1270`
   - Close → C1's pop involves no timer (well under a second)
-  - every job is acked once, by C1; C2's runs were wasted (at-least-once) — `queue.go:355-357`, `queue.go:1025-1028`
+  - every job is acked once, by C1; C2's runs were wasted (at-least-once) — `queue.go:526-529`, `queue.go:1583-1586`
 Why-labels: "acks after Close fail · runs again on C1"
 Still frame: jobs back in the list, wake on its way to C1
 Seam check: cross-fade proves only the reset (C2 is gone; the system does not return to its start)
 Builds on: 2, adds pending owners and `Close`
-README note: stop or drain workers before Close (varmq `w.Stop()`) so nothing runs twice.
+README note: stop or drain workers before Close (VarMQ `w.StopAndWait()`) so nothing runs twice.
 
 ## 4. Detecting a dead consumer  (`redisq-dead.svg`)
 
@@ -159,22 +161,21 @@ Timeline (simulated in real seconds; sweep phases fixed so the clock-move rule i
 Loop: D = derived from the scaled 31 s + tail
 Invariants:
   - presence: live heartbeat, seen subscribed (mark 0), then a clock-moving sweep with no subscriber sets the mark,
-    then a clock-moving sweep with now - mark ≥ 2.5 s and no own sweep or subscriber in between — `queue.go:814-815`, `queue.go:820`, `queue.go:831-841`, `queue.go:891`
-  - heartbeat = last renewal + 30 s; reaped at the first sweep at or after it, ticked or not — `queue.go:85`, `queue.go:665-668`, `queue.go:819`, `queue.go:830`
-  - a reap requeues all of C2's items (list front) and drops its heartbeat and mark; the distributed sweeper wakes — `queue.go:843-853`, `queue.go:945`, `distributed.go:29`
+    then a clock-moving sweep with now - mark ≥ 2.5 s and no own sweep or subscriber in between — `queue.go:1325-1326`, `queue.go:1331`, `queue.go:1342-1353`, `queue.go:1402`
+  - heartbeat = last renewal + 30 s; reaped at the first sweep at or after it, ticked or not — `queue.go:108`, `queue.go:1131-1134`, `queue.go:1330`, `queue.go:1341`
+  - a reap requeues all of C2's items (list front) and drops its heartbeat and mark; the sweeper wakes — `queue.go:1354-1364`, `queue.go:1467`, `queue.go:1479`
   - row A requeues before row B; row A's heartbeat is dropped at the reap, not left to run out
-  - a lost host's socket stays open to Redis until TCP notices (minutes), so its subscription still counts — `queue.go:801-802` **(inferred: Redis/TCP behaviour, not redisq code; no duration printed)**
+  - a lost host's socket stays open to Redis until TCP notices (minutes), so its subscription still counts — `queue.go:1310-1311` **(inferred: Redis/TCP behaviour, not redisq code; no duration printed)**
 Why-labels: "subscription gone", "socket still open: wait for heartbeat"
 Still frame: real t = 11 s: row A requeued and acked, row B still waiting on its heartbeat (before the fast-forward,
 clear of the clock readout's fades)
 Seam check: cross-fade proves only the reset
 Builds on: 3, adds death without Close
-README note: a plain `Queue` or `PriorityQueue` is detected the same way (it subscribes to its wake channel too)
-but gets no wake; its consumers find the items on their next poll.
+README note: every `Queue` and `PriorityQueue` is detected this way, and its requeue wakes idle consumers.
 
 Not animated, in the README text: the stall guard (no sweep moved the clock for over 2 s: Redis paused, failed
 over or restarted, or every process stalled → the next sweep moves every heartbeat and every running presence mark
-on by the whole gap, `queue.go:810-813`, `queue.go:882`), at-least-once caveats, timeouts, no redelivery limit,
+on by the whole gap, `queue.go:1321-1324`, `queue.go:1393`), at-least-once caveats, timeouts, no redelivery limit,
 cost per pop.
 
 ## As built
@@ -221,3 +222,10 @@ section's invariants; `make diagrams` rebuilds them.
     and `distributed.go` citations re-mapped.
 - Plain queues subscribe to their wake channel too, and `presenceGrace` went from 5 s to 2.5 s: row A now
   reaps at 4.3 s (2.5-5 s in general); the labels say "gone ≥ 2.5 s", since sweeps land a second apart.
+- Re-cited against redisq `5903240` (#33: one queue kind, so `distributed.go` is now only the deprecated
+  aliases and its citations moved to `queue.go`; #34: workflows). Labels say `Queue`, not `DistributedQueue`. The ack-on-fail fact is now
+  `Reject` (varmq `main`). Behaviour drawn is unchanged.
+  - Open: varmq `main` binds an ack source that batches (`batchAckSource`, `source.go:317`,
+    `DequeueBatchWithAckIds`), so with VarMQ ≥ v1.11.0 a wake with 3 free slots makes one batch pop, not 3
+    back-to-back `DequeueWithAckId` calls. Diagram 3 and its `varmq/…` citations still show v1.9.0
+    (`gen_close.py` `POP = 1`); a redraw with `POP = CONC` and re-cited varmq lines is left for later.
