@@ -15,7 +15,7 @@ func main() {
 	}()
 
 	redisQueue := redisq.New("redis://localhost:6375")
-	rq := redisQueue.NewDistributedPriorityQueue("scraping_priority_queue")
+	rq := redisQueue.NewPriorityQueue("scraping_priority_queue")
 
 	w := varmq.NewWorker(func(j varmq.Job[[]string]) {
 		data := j.Data()
@@ -25,13 +25,13 @@ func main() {
 		fmt.Printf("Scraped url: %s, id: %s\n", url, id)
 	}, 5)
 
-	// Using redisq adapter (you can use any adapter that implements IDistributedQueue)
-	q := w.WithDistributedPriorityQueue(rq)
+	// Any shared priority storage works here: redisq, sqliteq or your own
+	q := w.WithPriorityQueue(rq)
 
 	fmt.Println("pending jobs:", q.NumPending())
 	fmt.Println("listening...")
 
-	rq.Listen() // until SIGINT or SIGTERM
-	w.Stop()    // finish the jobs in progress
-	rq.Close()  // and hand any unacknowledged one to another consumer at once
+	rq.Listen()     // until SIGINT or SIGTERM
+	w.StopAndWait() // finish the jobs in progress
+	rq.Close()      // and hand any unacknowledged one to another consumer at once
 }
