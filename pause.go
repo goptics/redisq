@@ -39,12 +39,45 @@ wake(KEYS[3], ARGV[1], redis.call(ARGV[2], KEYS[2]))
 redis.call('PUBLISH', KEYS[4], 'resumed')
 return 1`)
 
+// hookSet is a set of callbacks (OnPauseChange, OnCancel).
+type hookSet[T any] struct {
+	mu sync.Mutex
+	m  map[*func(T)]struct{}
+}
+
+// add registers fn until stop.
+func (s *hookSet[T]) add(fn func(T)) (stop func()) {
+	h := &fn
+	s.mu.Lock()
+	if s.m == nil {
+		s.m = map[*func(T)]struct{}{}
+	}
+	s.m[h] = struct{}{}
+	s.mu.Unlock()
+
+	return func() {
+		s.mu.Lock()
+		delete(s.m, h)
+		s.mu.Unlock()
+	}
+}
+
+// snapshot returns the callbacks registered now.
+func (s *hookSet[T]) snapshot() []func(T) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fns := make([]func(T), 0, len(s.m))
+	for h := range s.m {
+		fns = append(fns, *h)
+	}
+	return fns
+}
+
 // pauseHooks are a Queue's OnPauseChange callbacks and what drives them:
 // every change of Queue.paused, and every "paused:" message, kicks
 // pauseLoop.
 type pauseHooks struct {
-	mu      sync.Mutex
-	hooks   map[*func(bool)]struct{}
+	hooks   hookSet[bool]
 	kick    chan struct{} // buffer 1: a kick while one waits is the same kick
 	loop    sync.Once     // starts pauseLoop on the first kick: no goroutine for a queue never paused
 	recheck atomic.Bool   // a "paused:" message came: read the key
@@ -73,7 +106,7 @@ func (q *Queue) Pause() error {
 // Idempotent.
 func (q *Queue) Resume() error {
 	keys := []string{q.getPausedKey(), q.queueKey, q.getIdleKey(), q.getControlKey()}
-	if err := resumeScript.Run(q.ctx, q.client, keys, q.queueKey+":wake:", q.lenCmd()).Err(); err != nil {
+	if err := resumeScript.Run(q.ctx, q.client, keys, q.wakePrefix, q.lenCmd()).Err(); err != nil {
 		return err
 	}
 	q.pauseHooks.gen.Add(1)
@@ -107,19 +140,7 @@ func (q *Queue) Paused() bool {
 // Calls come from one goroutine of this object, in order, so the last call
 // is the current state; a slow fn delays only later calls.
 func (q *Queue) OnPauseChange(fn func(paused bool)) (cancel func()) {
-	h := &fn
-	q.pauseHooks.mu.Lock()
-	if q.pauseHooks.hooks == nil {
-		q.pauseHooks.hooks = map[*func(bool)]struct{}{}
-	}
-	q.pauseHooks.hooks[h] = struct{}{}
-	q.pauseHooks.mu.Unlock()
-
-	return func() {
-		q.pauseHooks.mu.Lock()
-		delete(q.pauseHooks.hooks, h)
-		q.pauseHooks.mu.Unlock()
-	}
+	return q.pauseHooks.hooks.add(fn)
 }
 
 // observe applies p, read from Redis by a call that went out at gen g,
@@ -148,9 +169,10 @@ func (q *Queue) kickPause() {
 	}
 }
 
-// pauseLoop, one per Queue object from its first kick until Close, reads
-// the key after a "paused:" message and calls the hooks whenever the state
-// differs from what it last told them. Off the pub/sub reader and the
+// pauseLoop, one per Queue object from its first kick until Close (or the
+// sweep finds the client closed), reads the key after a "paused:" message
+// and calls the hooks whenever the state differs from what it last told
+// them. Off the pub/sub reader and the
 // sweep, so a slow hook never delays wakes or heartbeats.
 func (q *Queue) pauseLoop() {
 	told := false
@@ -174,14 +196,7 @@ func (q *Queue) pauseLoop() {
 		}
 		told = now
 
-		q.pauseHooks.mu.Lock()
-		fns := make([]func(bool), 0, len(q.pauseHooks.hooks))
-		for h := range q.pauseHooks.hooks {
-			fns = append(fns, *h)
-		}
-		q.pauseHooks.mu.Unlock()
-
-		for _, fn := range fns {
+		for _, fn := range q.pauseHooks.hooks.snapshot() {
 			fn(now)
 		}
 	}
@@ -191,7 +206,8 @@ func (q *Queue) pauseLoop() {
 // it was a control message. Messages are hints (spec 6.8), and an unknown
 // one is ignored. "resumed" is taken as is: a wrong one costs one refused
 // pop, which sets the flag back. "paused:" only makes pauseLoop read the
-// key, so forged ones never stop this consumer.
+// key, so forged ones never stop this consumer. "cancel:<id>" goes to the
+// OnCancel callbacks (see cancel.go).
 func (q *Queue) control(msg *redis.Message) bool {
 	if msg.Channel != q.getControlKey() {
 		return false
@@ -205,6 +221,8 @@ func (q *Queue) control(msg *redis.Message) bool {
 		q.pauseHooks.gen.Add(1)
 		q.pauseHooks.recheck.Store(true)
 		q.kickPause()
+	case strings.HasPrefix(msg.Payload, cancelPrefix):
+		q.cancelRequested(msg.Payload[len(cancelPrefix):])
 	}
 	return true
 }
@@ -222,7 +240,7 @@ func (q *Queue) getPausedKey() string {
 	return q.pausedKey
 }
 
-// getControlKey returns the pub/sub channel of pause and resume messages
+// getControlKey returns the pub/sub channel of pause, resume and cancel messages
 func (q *Queue) getControlKey() string {
 	return q.controlKey
 }

@@ -98,6 +98,40 @@ func TestPauseGatesEveryPop(t *testing.T) {
 	}
 }
 
+// The cancel gate runs after the pause gate: a paused pop neither hands out
+// nor drops a marked item; after Resume the pop drops it.
+func TestPauseKeepsCancelledItem(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		ctx := t.Context()
+		got, _ := watch(c.prod, "a")
+		require.NoError(t, c.cons.Pause())
+		require.True(t, c.push(envelope("a", `1`), 1))
+		require.NoError(t, c.prod.CancelJob("a"))
+
+		_, ok := rawPopOf(c.cons)
+		assert.False(t, ok)
+		_, ok, _ = ackPopOf(c.cons)
+		assert.False(t, ok)
+		n, _, err := batchPopOf(c.cons, make([]any, 2), make([]string, 2))
+		require.NoError(t, err)
+		assert.Zero(t, n)
+		assert.True(t, marked(t, c.cons, "a"), "mark stays")
+		assert.False(t, c.cons.client.HExists(ctx, c.cons.getJobsKey(), "a").Val(), "no record")
+		assert.Equal(t, 1, c.cons.Len())
+		select {
+		case o := <-got:
+			t.Fatalf("outcome while paused: %+v", o)
+		case <-time.After(300 * time.Millisecond):
+		}
+
+		require.NoError(t, c.cons.Resume())
+		_, ok, _ = ackPopOf(c.cons)
+		assert.False(t, ok)
+		assertDropped(t, c.cons, "a")
+		assert.Equal(t, contract.JobOutcome{ID: "a", State: contract.JobCancelled, Error: "cancelled"}, outcomeWithin(t, got, time.Second))
+	})
+}
+
 // A paused pop still hands back what an earlier run of the same call popped
 // (a go-redis re-send), and a refused pop leaves no reservation behind.
 func TestPauseGuardBeforeGate(t *testing.T) {
@@ -109,7 +143,7 @@ func TestPauseGuardBeforeGate(t *testing.T) {
 	// One batch call, run twice with the same reservation, a Pause between.
 	resv := fmt.Sprintf("%020d", q.ackSeq.Add(1))
 	run := func() []any {
-		r, err := listAckPop.Run(q.ctx, q.client, q.popKeys(), 2, q.vt(), q.ackPrefix, resv, "", 2, q.hbt(), q.ackPrefix).Slice()
+		r, err := listAckPop.Run(q.ctx, q.client, q.popKeys(), append([]any{2, q.vt(), q.ackPrefix, resv, "", 2}, append(q.cancelArgs(), q.hbt(), q.ackPrefix)...)...).Slice()
 		require.NoError(t, err)
 		return r
 	}
@@ -124,7 +158,7 @@ func TestPauseGuardBeforeGate(t *testing.T) {
 	ackID := q.ackIDOf(fmt.Sprintf("%020d", q.ackSeq.Add(1)), 1)
 	require.NoError(t, q.Resume())
 	one := func() any {
-		v, err := listAckPopOne.Run(q.ctx, q.client, q.popKeys(), q.vt(), ackID, "", q.hbt(), q.ackPrefix).Result()
+		v, err := listAckPopOne.Run(q.ctx, q.client, q.popKeys(), append([]any{q.vt(), ackID, ""}, append(q.cancelArgs(), q.hbt(), q.ackPrefix)...)...).Result()
 		require.NoError(t, err)
 		return v
 	}
@@ -194,10 +228,10 @@ func TestResumeWakesIdleConsumer(t *testing.T) {
 	woken := make(chan string, 10)
 	q.Subscribe(func(a string) { woken <- a })
 	require.NoError(t, q.Pause())
-	require.True(t, q.Queue.Enqueue("x")) // a plain push: no enqueue wake
+	require.NoError(t, q.client.RPush(q.ctx, q.queueKey, "x").Err()) // a raw push: no enqueue wake
 	assert.Equal(t, 1, q.Len())
 
-	require.NoError(t, q.Queue.client.SAdd(q.Queue.ctx, q.idleKey, q.id).Err()) // idle, as after an empty pop
+	require.NoError(t, q.client.SAdd(q.ctx, q.idleKey, q.id).Err()) // idle, as after an empty pop
 	require.NoError(t, q.Resume())
 	select {
 	case a := <-woken:
@@ -207,19 +241,25 @@ func TestResumeWakesIdleConsumer(t *testing.T) {
 	}
 }
 
-// The sweep still requeues and calls onRequeue on an unpaused queue (its
-// reply grew a third element).
+// The sweep still requeues and wakes an idle consumer on an unpaused queue
+// (its reply grew a third element).
 func TestPauseSweepStillRequeues(t *testing.T) {
 	q := pauseClient(t).NewQueue(newID())
 	q.SetVisibilityTimeout(time.Millisecond)
-	var requeued atomic.Int64
-	q.setOnRequeue(func(n int64) { requeued.Add(n) })
+	wake := q.client.Subscribe(q.ctx, q.wakePrefix+"w")
+	defer wake.Close()
+	_, err := wake.Receive(q.ctx)
+	require.NoError(t, err)
 	require.True(t, q.Enqueue("x"))
+	require.NoError(t, q.client.SAdd(q.ctx, q.idleKey, "w").Err()) // after the push's own wake
 	_, ok, _ := q.DequeueWithAckId()
 	require.True(t, ok)
 	time.Sleep(10 * time.Millisecond)
 	require.True(t, q.tick())
-	assert.EqualValues(t, 1, requeued.Load())
+	msg, err := wake.ReceiveTimeout(q.ctx, 2*time.Second)
+	require.NoError(t, err, "the requeue woke no one")
+	assert.Equal(t, "enqueued", msg.(*redis.Message).Payload)
+	assert.Equal(t, 1, q.Len())
 	assert.False(t, q.Paused())
 }
 

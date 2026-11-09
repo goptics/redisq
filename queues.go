@@ -36,8 +36,10 @@ func WithNamespace(ns string) Option {
 type Queues interface {
 	NewQueue(queueKey string) *Queue
 	NewPriorityQueue(queueKey string) *PriorityQueue
-	NewDistributedQueue(queueKey string) *DistributedQueue
-	NewDistributedPriorityQueue(queueKey string) *DistributedPriorityQueue
+	// Deprecated: use NewQueue; every queue is distributed since v1.6.0.
+	NewDistributedQueue(queueKey string) *Queue
+	// Deprecated: use NewPriorityQueue; every queue is distributed since v1.6.0.
+	NewDistributedPriorityQueue(queueKey string) *PriorityQueue
 	Close() error
 }
 
@@ -95,23 +97,25 @@ func (qs *queues) prefix() string {
 }
 
 func (qs *queues) NewQueue(queueKey string) *Queue {
-	q := newQueue(qs.client, qs.key("fifo", queueKey))
-	go q.drain()
-	return q
+	return newQueue(qs.client, qs.key("fifo", queueKey))
 }
 
 func (qs *queues) NewPriorityQueue(queueKey string) *PriorityQueue {
-	q := newPriorityQueue(qs.client, qs.key("prio", queueKey))
-	go q.drain()
-	return q
+	return newPriorityQueue(qs.client, qs.key("prio", queueKey))
 }
 
-func (qs *queues) NewDistributedQueue(queueKey string) *DistributedQueue {
-	return newDistributedQueue(qs.client, qs.key("fifo", queueKey))
+// NewDistributedQueue is NewQueue.
+//
+// Deprecated: use NewQueue; every queue is distributed since v1.6.0.
+func (qs *queues) NewDistributedQueue(queueKey string) *Queue {
+	return qs.NewQueue(queueKey)
 }
 
-func (qs *queues) NewDistributedPriorityQueue(queueKey string) *DistributedPriorityQueue {
-	return newDistributedPriorityQueue(qs.client, qs.key("prio", queueKey))
+// NewDistributedPriorityQueue is NewPriorityQueue.
+//
+// Deprecated: use NewPriorityQueue; every queue is distributed since v1.6.0.
+func (qs *queues) NewDistributedPriorityQueue(queueKey string) *PriorityQueue {
+	return qs.NewPriorityQueue(queueKey)
 }
 
 // Close stops instance reports, removing this process's record, then

@@ -24,14 +24,15 @@
   </p>
 
   <p>
-    Redis-backed FIFO and priority queues for Go, with acknowledgments, batch pops, consumers that hand unacknowledged jobs back when they close or die, and distributed variants that wake idle consumers.
+    Redis-backed FIFO and priority queues for Go, with acknowledgments, batch pops, consumers that hand unacknowledged jobs back when they close or die, wakes for idle consumers, and job outcomes any process can wait on.
   </p>
 </div>
 
 ## Features
 
 - **FIFO and priority queues** on Redis lists and sorted sets; lower priority number is served first.
-- **Distributed variants** that wake idle consumers, up to one per waiting job.
+- **Every queue distributed**: an enqueue wakes idle consumers, up to one per waiting job.
+- **Job outcomes**: `WatchOutcome` tells any process when a job completes or fails, with the worker's result.
 - **Acknowledgments** with a [visibility timeout](#acknowledgments-and-the-visibility-timeout) on Redis's clock.
 - **Fast handover**: a consumer that [closes](#when-a-consumer-closes) hands its unacknowledged jobs back at once; one that [dies](#when-a-consumer-dies), in about 3-4 s; one cut off from Redis, after a 30 s heartbeat.
 - **Batch dequeue** of up to 1000 items per round trip, each under its own ack ID.
@@ -39,7 +40,7 @@
 - **Job records and stats** in Redis, shared by every instance: completed and failed jobs with payloads, kept by count and age.
 - **Queue TTL**, refreshed on every enqueue.
 - **Thread-safe**: share one queue object across goroutines.
-- **Storage for [varmq](https://github.com/goptics/varmq)** persistent and distributed queues.
+- **Storage for [varmq](https://github.com/goptics/varmq)** queues.
 
 ## Quick Start
 
@@ -77,14 +78,13 @@ func main() {
 
 ### Queue types
 
-| Type                       | Constructor                           | Order        | Wakes idle consumers |
-| -------------------------- | ------------------------------------- | ------------ | :------------------: |
-| `Queue`                    | `qs.NewQueue(key)`                    | FIFO         |          –           |
-| `PriorityQueue`            | `qs.NewPriorityQueue(key)`            | Lowest first |          –           |
-| `DistributedQueue`         | `qs.NewDistributedQueue(key)`         | FIFO         |          ✅          |
-| `DistributedPriorityQueue` | `qs.NewDistributedPriorityQueue(key)` | Lowest first |          ✅          |
+| Type            | Constructor                | Order        |
+| --------------- | -------------------------- | ------------ |
+| `Queue`         | `qs.NewQueue(key)`         | FIFO         |
+| `PriorityQueue` | `qs.NewPriorityQueue(key)` | Lowest first |
 
-All types support the acknowledgment, dedup and batch APIs below.
+Both support every API below: acks, dedup, batches, wakes, outcomes. `DistributedQueue`,
+`DistributedPriorityQueue` and their constructors remain as deprecated aliases.
 
 ```go
 queue := qs.NewQueue("my-queue")
@@ -129,18 +129,18 @@ defer qs.Close() // stops the reports and removes this process's record
 
 Each report overwrites one field of `redisq:app:{instances}` and its time in `redisq:app:{instances}:beats`, from the Redis clock. A process that stops without `Close` shows as lost after 3 intervals; its record is pruned after 5 minutes, and both keys expire when no process reports. The interval must be from 1s to 60s. Off by default.
 
-### Distributed queue
+### Waking consumers
 
 ```go
-dq := qs.NewDistributedQueue("distributed-queue")
-defer dq.Close()
+q := qs.NewQueue("orders")
+defer q.Close()
 
 // Subscribing makes this instance a consumer that can be woken
-dq.Subscribe(func(action string) {
+q.Subscribe(func(action string) {
 	fmt.Println(action) // "enqueued"
 })
 
-dq.Enqueue("message") // wakes an idle consumer, if any
+q.Enqueue("message") // wakes an idle consumer, if any
 ```
 
 ### Acknowledgments
@@ -178,7 +178,8 @@ pq.EnqueueOnce("rebuild index", 1, "job-5f1d3e77")
 ```
 
 An id stays taken for the whole window, even after its job is handled, removed or purged, so producers that reuse
-an id drop each other's jobs.
+an id drop each other's jobs. A push of an id after its window drops that id's old Job Record, so a watch of the new run
+never sees the old outcome.
 
 ### Job records and stats
 
@@ -197,11 +198,32 @@ queue.QueueStats(ctx) // counts per Job State now, totals since the counters beg
 queue.Jobs(ctx, contract.JobFailed, 0, 50) // newest first; pending in hand-out order
 ```
 
-All four queue types implement `contract.QueueInspector` (`github.com/goptics/varmq/contract`), which varmq's
-`Handler` serves as `GET /queues` and `GET /queues/{id}/jobs`. The layout is varmq's
+Both queue types (and the deprecated `Distributed*` aliases) implement `contract.QueueInspector`
+(`github.com/goptics/varmq/contract`), which varmq's `Handler` serves as `GET /queues` and
+`GET /queues/{id}/jobs`. The layout is varmq's
 [`spec/redis-storage.md`](https://github.com/goptics/varmq/blob/main/spec/redis-storage.md) 1.0.0. Retention is set
 per queue object, so give every instance of a queue the same values. Records hold a copy of each payload, so
 retention bounds Redis memory. `Purge` deletes all of a queue's jobs, records and counters.
+
+### Job outcomes
+
+A producer waits on a job that any process runs. Jobs are varmq envelopes (`{"id": ...}`); the id is the job ID.
+
+```go
+cancel := q.WatchOutcome("job-0b7e9c2a", func(o contract.JobOutcome) {
+	fmt.Println(o.State, o.Error, string(o.Result)) // "completed", "failed" or "cancelled"
+})
+defer cancel() // early stop only; after fn the watch ends by itself
+
+q.AcknowledgeResult(ackID, []byte(`{"total":42}`)) // Acknowledge + result JSON; invalid JSON: false, no change
+```
+
+`Acknowledge`, `AcknowledgeResult`, `Reject` and `AcknowledgeCancelled`, and a pop that drops a cancelled job (see
+cancel below), publish the outcome on `<key>:done:<job id>` in the same script, kept record or not. A watch
+subscribes that channel on the queue object's one pub/sub connection, reads the Job Record right after, and again
+each sweep (1 s), so a job that ended before the watch, or a message lost in a reconnect, is still reported while
+its record is kept. `AcknowledgeResult` stores the result raw as the record's `result`, big integers intact.
+`Close` drops watchers without calling them (a delivery already under way may still call its fn).
 
 ### Batch dequeue
 
@@ -228,15 +250,24 @@ for {
 
 ### With varmq
 
-redisq implements varmq's persistent and distributed queue interfaces:
+redisq implements varmq's queue interfaces, outcome watching included:
 
 ```go
-rq := qs.NewDistributedPriorityQueue("jobs")
-dq := varmq.NewDistributedPriorityQueue[[]string](rq)
-defer dq.Close()
+// consumer process
+w := varmq.NewResultWorker(func(j varmq.Job[string]) (int, error) { return len(j.Data()), nil })
+w.WithPriorityQueue(qs.NewPriorityQueue("jobs"))
 
-dq.Add([]string{"https://example.com"}, 1)
+// producer process
+q := varmq.NewResultPriorityQueue[string, int](qs.NewPriorityQueue("jobs"))
+job, _ := q.Add("https://example.com", 1)
+n, err := job.Result() // waits until any process finished it
 ```
+
+Cancel a job from any process with `CancelJob(id)`. A waiting job is dropped by the pop that would hand it out:
+record and outcome `cancelled`, never run. A running one is announced on `<key>:control`; varmq cancels its
+worker's context and finishes it with `AcknowledgeCancelled`. A job that already ended returns
+`contract.ErrJobEnded`. Each mark lives 24h in the sorted set `<key>:cancelled` (score: its expiry); with no marks a pop costs one
+`EXISTS` more. Any id can be marked, so authorize and rate-limit untrusted callers of `CancelJob`.
 
 See [`examples/varmq`](examples/varmq) for a provider/consumer setup.
 
@@ -258,7 +289,7 @@ job.
 
 ### Waking idle consumers
 
-A distributed consumer that finds the queue empty joins the idle set `<key>:idle`. An enqueue pushes the job and,
+A consumer (one that called `Subscribe`) that finds the queue empty joins the idle set `<key>:idle`. An enqueue pushes the job and,
 in the same script, wakes up to one idle consumer per waiting job, each on its own pub/sub channel. A consumer
 that took a job stays out of the idle set until its own `Len()` or dequeue finds the queue empty again, so wakes
 go to free consumers; a busy one pulls the next job itself when one finishes (varmq does). Every consumer also
@@ -270,7 +301,7 @@ the idle set, in case a wake was lost.
 ### When a consumer closes
 
 `Close` moves every job the consumer took and did not acknowledge back to the front of the queue in one script;
-a distributed queue first leaves the idle set, then wakes idle consumers for the jobs. The handover takes no
+the queue first leaves the idle set, then wakes idle consumers for the jobs. The handover takes no
 timer, as when RabbitMQ requeues a closed channel's deliveries. An `Acknowledge` after `Close` fails, so a job still running on the closing
 consumer runs again on the next one: stop or drain workers before `Close`.
 
@@ -282,7 +313,7 @@ A consumer killed without `Close` (kill -9, OOM, a crash) can't hand anything ba
 out. Every ack pop that hands out a job sets the queue object's heartbeat in `<key>:heartbeats`, and its sweep
 renews it every second. Every queue object is also subscribed to its own wake channel, and Redis drops that
 subscription as soon as the process exits. Any process's sweep, including the first one of a restarted process,
-then requeues the dead consumer's jobs and, on a distributed queue, wakes up to one idle consumer per job. A
+then requeues the dead consumer's jobs and wakes up to one idle consumer per job. A
 process that is still sweeping is never taken for gone, so a second process on the key (a rolling deploy) keeps
 its running jobs:
 
@@ -295,8 +326,7 @@ its running jobs:
 | stays alive but a job hangs                                           | the visibility timeout (5 min)        |
 
 A process restarted alone after a crash gets its old jobs back about 3 s after it starts: its first sweep runs at
-once. Only a distributed queue wakes a consumer for requeued jobs. On a `Queue` or `PriorityQueue` they wait for a
-consumer's next pop; varmq's persistent queues pull only after a local `Add`, a start or a finished job.
+once.
 
 ![redisq detecting a dead consumer](./assets/diagrams/redisq-dead.svg)
 
@@ -315,6 +345,8 @@ consumer's next pop; varmq's persistent queues pull only after a local `Add`, a 
   job (paused, or marked idle by a `Len()` call from elsewhere while busy); the once-a-second nudge bounds the
   delay to about a second, at the cost of one Redis script per consumer per second. A consumer that stops pulling
   before the queue is empty isn't woken again, only nudged.
+- **Outcomes need the record or the message.** A job whose outcome message is lost (a reconnect) and whose Job
+  Record retention keeps none is never reported to its watchers: pair a watch with a timeout of your own.
 - **No retry limit or dead-letter queue.** A job that crashes every consumer that takes it keeps coming back
   after each crash, about 3-4 s later.
 - **Cost.** Every queue object, producers included, runs one sweep script a second and holds one pub/sub
@@ -332,7 +364,7 @@ go-redis re-sends a command whose reply was lost, so:
 | `DequeueWithAckId`, `DequeueBatchWithAckIds` | At least once | Items come back on retry, the next call, or after a timeout        |
 | `Enqueue`                                    | At least once | May store the job twice; `false` is not proof                      |
 | `EnqueueOnce`                                | Once per id   | Stored once within the dedup window                                |
-| `Acknowledge`, `Reject`                      | Once          | The re-send finds the job finished and does nothing                |
+| `Acknowledge`, `AcknowledgeResult`, `Reject` | Once          | The re-send finds the job finished: no second record or outcome    |
 | `Dequeue`                                    | At most once  | Item is gone                                                       |
 | `Remove`                                     | –             | May remove a second identical item                                 |
 

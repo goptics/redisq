@@ -30,20 +30,12 @@ type dedupCase struct {
 }
 
 var dedupCases = []dedupCase{
-	{"list", listPushOnce, func(qs Queues, key string) (*Queue, func(string, string) bool, func() int, func()) {
+	{"list", listPushWakeOnce, func(qs Queues, key string) (*Queue, func(string, string) bool, func() int, func()) {
 		q := qs.NewQueue(key)
 		return q, func(v, id string) bool { return q.EnqueueOnce(v, id) }, q.Len, func() { q.Close() }
 	}},
-	{"priority", zsetPushOnce, func(qs Queues, key string) (*Queue, func(string, string) bool, func() int, func()) {
+	{"priority", zsetPushWakeOnce, func(qs Queues, key string) (*Queue, func(string, string) bool, func() int, func()) {
 		q := qs.NewPriorityQueue(key)
-		return q.Queue, func(v, id string) bool { return q.EnqueueOnce(v, 1, id) }, q.Len, func() { q.Close() }
-	}},
-	{"distributed", listPushWakeOnce, func(qs Queues, key string) (*Queue, func(string, string) bool, func() int, func()) {
-		q := qs.NewDistributedQueue(key)
-		return q.Queue, func(v, id string) bool { return q.EnqueueOnce(v, id) }, q.Len, func() { q.Close() }
-	}},
-	{"distributed priority", zsetPushWakeOnce, func(qs Queues, key string) (*Queue, func(string, string) bool, func() int, func()) {
-		q := qs.NewDistributedPriorityQueue(key)
 		return q.Queue, func(v, id string) bool { return q.EnqueueOnce(v, 1, id) }, q.Len, func() { q.Close() }
 	}},
 }
@@ -155,10 +147,73 @@ func TestEnqueueOnceWindow(t *testing.T) {
 			assert.True(t, push("a", "w"))
 			assert.Equal(t, 3, size())
 
+			ctx := context.Background()
+			pttl := func(id string) time.Duration { return q.client.PTTL(ctx, q.queueKey+":dedup:"+id).Val() }
+			q.SetDedupWindow(time.Minute)
+			assert.True(t, push("a", "k"))
+			before := pttl("k")
+			require.Positive(t, before)
 			q.SetDedupWindow(0)
+			assert.True(t, push("a", "k"), "no window: a remembered id pushes")
+			assert.Equal(t, 5, size())
+			assert.LessOrEqual(t, pttl("k"), before, "nor refreshes the id")
+
 			assert.True(t, push("a", "z"))
 			assert.True(t, push("a", "z"))
-			assert.Equal(t, 5, size(), "no window: no dedupe")
+			assert.Equal(t, 7, size(), "no window: no dedupe")
+			q.SetDedupWindow(-time.Second)
+			assert.True(t, push("a", "n"))
+			assert.True(t, push("a", "n"))
+			assert.Equal(t, 9, size(), "a negative window: no dedupe")
+			assert.Zero(t, q.client.Exists(ctx, q.queueKey+":dedup:z", q.queueKey+":dedup:n").Val(), "no id key")
+		})
+	}
+}
+
+// lastArg records the last argument of each EVALSHA of script hash.
+type lastArg struct {
+	hash string
+	mx   sync.Mutex
+	args []any
+}
+
+func (h *lastArg) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h *lastArg) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+func (h *lastArg) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if a := cmd.Args(); len(a) > 1 && a[0] == "evalsha" && a[1] == h.hash {
+			h.mx.Lock()
+			h.args = append(h.args, a[len(a)-1])
+			h.mx.Unlock()
+		}
+		return next(ctx, cmd)
+	}
+}
+
+// EnqueueOnce sends a window under 1ms as 1ms, and none as 0.
+func TestEnqueueOnceWindowArg(t *testing.T) {
+	for _, c := range dedupCases {
+		t.Run(c.name, func(t *testing.T) {
+			qs := New(getTestRedisURL())
+			defer qs.Close()
+			client := qs.(*queues).client
+			delKeys(t, client, c.key())
+			defer delKeys(t, client, c.key())
+			require.NoError(t, c.script.Load(context.Background(), client).Err()) // so every push is an EVALSHA
+			h := &lastArg{hash: c.script.Hash()}
+			client.AddHook(h)
+			q, push, _, done := c.open(qs, c.key())
+			defer done()
+
+			for i, d := range []time.Duration{500 * time.Microsecond, 0, -time.Second, 2 * time.Second} {
+				q.SetDedupWindow(d)
+				require.True(t, push("a", fmt.Sprint("w", i)))
+			}
+			h.mx.Lock()
+			defer h.mx.Unlock()
+			assert.Equal(t, []any{int64(1), int64(0), int64(0), int64(2000)}, h.args)
 		})
 	}
 }
@@ -193,48 +248,30 @@ func TestEnqueueOnceFailedPushKeepsIdFree(t *testing.T) {
 
 // EnqueueOnce keeps the priority it is given.
 func TestEnqueueOnceKeepsPriority(t *testing.T) {
-	for _, c := range dedupCases {
-		if !strings.Contains(c.name, "priority") {
-			continue
-		}
-		t.Run(c.name, func(t *testing.T) {
-			qs := New(getTestRedisURL())
-			defer qs.Close()
-			delKeys(t, qs.(*queues).client, c.key())
-			defer delKeys(t, qs.(*queues).client, c.key())
-			var pq interface {
-				EnqueueOnce(any, int, string) bool
-				Dequeue() (any, bool)
-				Close() error
-			}
-			if c.name == "priority" {
-				pq = qs.NewPriorityQueue(c.key())
-			} else {
-				pq = qs.NewDistributedPriorityQueue(c.key()) // its own EnqueueOnce: the wake script
-			}
-			defer pq.Close()
+	qs := New(getTestRedisURL())
+	defer qs.Close()
+	key := "test_dedup_keeps_priority"
+	delKeys(t, qs.(*queues).client, key)
+	defer delKeys(t, qs.(*queues).client, key)
+	pq := qs.NewPriorityQueue(key)
+	defer pq.Close()
 
-			for i, p := range []int{3, 1, 2} {
-				require.True(t, pq.EnqueueOnce(fmt.Sprint(p), p, fmt.Sprint("id-", i)))
-			}
-			var got []string
-			for range 3 {
-				v, ok := pq.Dequeue()
-				require.True(t, ok)
-				got = append(got, string(v.([]byte)))
-			}
-			assert.Equal(t, []string{"1", "2", "3"}, got)
-		})
+	for i, p := range []int{3, 1, 2} {
+		require.True(t, pq.EnqueueOnce(fmt.Sprint(p), p, fmt.Sprint("id-", i)))
 	}
+	var got []string
+	for range 3 {
+		v, ok := pq.Dequeue()
+		require.True(t, ok)
+		got = append(got, string(v.([]byte)))
+	}
+	assert.Equal(t, []string{"1", "2", "3"}, got)
 }
 
-// A distributed EnqueueOnce wakes an idle consumer; a repeat publishes nothing
-// and leaves it idle.
+// EnqueueOnce wakes an idle consumer; a repeat publishes nothing and leaves
+// it idle.
 func TestEnqueueOnceWakesOnlyOnAPush(t *testing.T) {
 	for _, c := range dedupCases {
-		if !strings.HasPrefix(c.name, "distributed") {
-			continue
-		}
 		t.Run(c.name, func(t *testing.T) {
 			ctx := context.Background()
 			qs := New(getTestRedisURL())
@@ -242,21 +279,10 @@ func TestEnqueueOnceWakesOnlyOnAPush(t *testing.T) {
 			client := qs.(*queues).client
 			delKeys(t, client, c.key())
 			defer delKeys(t, client, c.key())
+			q, push, _, done := c.open(qs, c.key())
+			defer done()
+			n := q.Notification
 
-			var n *Notification
-			var push func() bool
-			var pop func() bool
-			if c.name == "distributed" {
-				q := qs.NewDistributedQueue(c.key())
-				defer q.Close()
-				n, push = q.Notification, func() bool { return q.EnqueueOnce("a", "x") }
-				pop = func() bool { _, ok := q.Dequeue(); return ok }
-			} else {
-				q := qs.NewDistributedPriorityQueue(c.key())
-				defer q.Close()
-				n, push = q.Notification, func() bool { return q.EnqueueOnce("a", 1, "x") }
-				pop = func() bool { _, ok := q.Dequeue(); return ok }
-			}
 			n.Subscribe(func(string) {}) // joins the idle set
 			// the consumer's own channel: only a PUBLISH reaches it, not the
 			// nudge loop's in-process broadcast
@@ -265,15 +291,16 @@ func TestEnqueueOnceWakesOnlyOnAPush(t *testing.T) {
 			_, err := wake.Receive(ctx)
 			require.NoError(t, err)
 
-			require.True(t, push())
+			require.True(t, push("a", "x"))
 			msg, err := wake.ReceiveTimeout(ctx, 2*time.Second)
 			require.NoError(t, err, "the push woke no one")
 			assert.Equal(t, "enqueued", msg.(*redis.Message).Payload)
 
-			require.True(t, pop())
+			_, ok := rawPopOf(q)
+			require.True(t, ok)
 			assert.Zero(t, n.len()) // back in the idle set
 			before := publishes(t, client)
-			require.True(t, push())
+			require.True(t, push("a", "x"))
 			assert.Equal(t, before, publishes(t, client), "a repeat publishes nothing")
 			assert.True(t, client.SIsMember(ctx, n.idleKey, n.id).Val(), "the consumer stays idle")
 		})

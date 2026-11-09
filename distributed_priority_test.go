@@ -18,11 +18,11 @@ func setupTestDistributedPriorityQueue(t *testing.T) (*DistributedPriorityQueue,
 
 	// Clear the queue before test
 	ctx := context.Background()
-	require.NoError(t, q.Queue.client.Del(ctx, q.Queue.queueKey).Err(), "Failed to clear test queue")
+	require.NoError(t, q.client.Del(ctx, q.queueKey).Err(), "Failed to clear test queue")
 
 	cleanup := func() {
 		q.Close() // first: it requeues what the test left pending
-		q.Queue.client.Del(ctx, q.Queue.queueKey)
+		q.client.Del(ctx, q.queueKey)
 		qs.Close()
 	}
 
@@ -96,7 +96,7 @@ func TestDistributedPriorityQueue(t *testing.T) {
 			notifications <- action
 		})
 		assert.Equal(t, 0, q.Len())
-		before := publishes(t, q.Queue.client)
+		before := publishes(t, q.client)
 
 		// Test concurrent enqueue
 		t.Run("concurrent_enqueue", func(t *testing.T) {
@@ -116,7 +116,7 @@ func TestDistributedPriorityQueue(t *testing.T) {
 			wg.Wait()
 
 			// One wake for the whole burst
-			assert.Equal(t, 1, publishes(t, q.Queue.client)-before)
+			assert.Equal(t, 1, publishes(t, q.client)-before)
 			assert.Equal(t, totalOperations, q.Len())
 		})
 	})

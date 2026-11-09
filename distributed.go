@@ -1,95 +1,11 @@
 package redisq
 
-import "github.com/redis/go-redis/v9"
+// DistributedQueue is Queue.
+//
+// Deprecated: use Queue; every queue is distributed since v1.6.0.
+type DistributedQueue = Queue
 
-// listPushWake pushes an item and wakes idle consumers in a single round
-// trip, up to one per waiting item, so a backlog wakes them all (see
-// Queue.enqueueWith for ARGV[1] and ARGV[2]; ARGV[3] is the wake channel
-// prefix), and counts the job as submitted in KEYS[3], :stats.
-const listPushWakeBody = `local n = redis.call('RPUSH', KEYS[1], ARGV[1])
-if tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
-redis.call('HINCRBY', KEYS[3], 'submitted', 1)
-return wake(KEYS[2], ARGV[3], n)`
-
-var (
-	listPushWake     = redis.NewScript(wakeFn + listPushWakeBody)
-	listPushWakeOnce = redis.NewScript(wakeFn + once(listPushWakeBody))
-)
-
-type DistributedQueue struct {
-	*Queue
-	*Notification
-}
-
-func newDistributedQueue(client *redis.Client, queueKey string) *DistributedQueue {
-	base := newQueue(client, queueKey)
-	q := &DistributedQueue{
-		Queue:        base,
-		Notification: newNotification(client, base.presence, queueKey, "LLEN", base.ackPrefix, base.control),
-	}
-	q.setOnRequeue(q.wake)
-	defer q.Start()
-
-	return q
-}
-
-func (q *DistributedQueue) Enqueue(item any) bool {
-	keys := []string{q.Notification.queueKey, q.idleKey, q.getStatsKey()}
-	return q.enqueueWith(listPushWake, keys, item, q.wakePrefix)
-}
-
-// EnqueueOnce is Enqueue for a job with an id (see Queue.EnqueueOnce). A
-// repeat wakes no one.
-func (q *DistributedQueue) EnqueueOnce(item any, id string) bool {
-	if id == "" || q.dedupWindow.Load() <= 0 {
-		return q.Enqueue(item)
-	}
-	keys := []string{q.Notification.queueKey, q.idleKey, q.getStatsKey()}
-	return q.enqueueOnceWith(listPushWakeOnce, keys, item, id, q.wakePrefix)
-}
-
-// Len returns the number of items in the queue; a consumer that finds it
-// empty joins the idle set.
-func (q *DistributedQueue) Len() int {
-	return q.Notification.len()
-}
-
-func (q *DistributedQueue) Dequeue() (any, bool) {
-	item, ok := q.Queue.Dequeue()
-
-	if ok {
-		q.idle.Store(false)
-	} else if !q.Paused() { // a paused miss stays out of :idle (spec 6.2)
-		q.markIdle()
-	}
-
-	return item, ok
-}
-
-// DequeueWithAckId pops one item; a consumer that finds the queue empty joins
-// the idle set in the same step.
-func (q *DistributedQueue) DequeueWithAckId() (any, bool, string) {
-	item, ok, ackID := q.Queue.dequeueOne(listAckPopOne, q.consumerID())
-	q.idle.Store(!ok && !q.Paused()) // a paused miss stays out of :idle (spec 6.2)
-	return item, ok, ackID
-}
-
-// DequeueBatchWithAckIds pops up to len(items) items (see
-// Queue.DequeueBatchWithAckIds); a consumer whose pop comes up short joins
-// the idle set in the same step.
-func (q *DistributedQueue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n, remaining int, err error) {
-	n, remaining, err = q.Queue.dequeueBatch(listAckPop, listAckPopOneLen, items, ackIDs, q.consumerID())
-	if err == nil {
-		q.idle.Store(remaining == 0 && n < min(len(items), len(ackIDs)) && !q.Paused()) // as the pop's idle rule
-	}
-	return n, remaining, err
-}
-
-// Close requeues the items this consumer has not acknowledged (see
-// Queue.Close) and wakes another consumer for them.
-func (q *DistributedQueue) Close() error {
-	q.leave()
-	err := q.Queue.Close()
-	q.Notification.Stop()
-	return err
-}
+// DistributedPriorityQueue is PriorityQueue.
+//
+// Deprecated: use PriorityQueue; every queue is distributed since v1.6.0.
+type DistributedPriorityQueue = PriorityQueue

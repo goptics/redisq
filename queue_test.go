@@ -3,6 +3,7 @@ package redisq
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goptics/varmq/contract"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -778,11 +780,25 @@ func TestSweeperStopsWhenClientClosed(t *testing.T) {
 	defer log.SetOutput(os.Stderr)
 
 	qs := New(getTestRedisURL())
-	_ = qs.NewQueue("test_sweeper_closed_client")
+	q := qs.NewQueue("test_sweeper_closed_client") // producer only: its nudge loop never runs a script
 	require.NoError(t, qs.Close())
 	time.Sleep(3500 * time.Millisecond)
 
 	assert.LessOrEqual(t, strings.Count(buf.String(), "Error requeueing"), 1)
+	assert.Error(t, q.Notification.ctx.Err(), "nudge loop and its ticker must stop too")
+	assert.Error(t, q.ctx.Err(), "pause loop waits on q.ctx")
+
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		assert.NoError(t, q.Close())
+		assert.NoError(t, q.Close())
+	}()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close hangs after the client closed")
+	}
 }
 
 // lockedBuffer collects log output written by other goroutines.
@@ -969,8 +985,7 @@ func TestScriptsUnderVerbatimReplication(t *testing.T) {
 			require.NoError(t, q.client.ZAdd(ctx, hb, redis.Z{Score: 1, Member: "dead"}, redis.Z{Score: now + 60, Member: "gone"}).Err())
 			require.NoError(t, q.client.ZAdd(ctx, pres, redis.Z{Score: now - 60, Member: "gone"}).Err())
 			require.NoError(t, q.client.HSet(ctx, q.getNackedItemKey(), "dead:1:0001", "x", "gone:1:0001", "z", q.ackPrefix+":1:0001", "y").Err())
-			keys := append(q.requeueKeys(), hb, hb+":clock", pres, q.getPausedKey())
-			require.NoError(t, q.tickScript.Run(ctx, q.client, keys, q.ackPrefix, q.hbt(), sweepGap.Seconds(), q.queueKey+":wake:", presenceGrace.Seconds()).Err())
+			require.NoError(t, q.tickScript.Run(ctx, q.client, q.tickKeys(), q.ackPrefix, q.hbt(), sweepGap.Seconds(), q.queueKey+":wake:", presenceGrace.Seconds()).Err())
 			require.NoError(t, q.release())
 			// The queue's own sweep may have moved the clock on in between;
 			// its next one counts then.
@@ -984,20 +999,20 @@ func TestScriptsUnderVerbatimReplication(t *testing.T) {
 		defer qs.Close()
 		q := qs.NewDistributedQueue("test_verbatim_wake")
 		defer q.Close()
-		delKeys(t, q.Queue.client, "test_verbatim_wake")
-		defer delKeys(t, q.Queue.client, "test_verbatim_wake")
-		require.NoError(t, q.Queue.client.SAdd(ctx, q.idleKey, "gone-1", "gone-2").Err())
+		delKeys(t, q.client, "test_verbatim_wake")
+		defer delKeys(t, q.client, "test_verbatim_wake")
+		require.NoError(t, q.client.SAdd(ctx, q.idleKey, "gone-1", "gone-2").Err())
 		assert.True(t, q.Enqueue("a"), "waking past consumers that are gone")
-		require.NoError(t, q.Queue.client.SAdd(ctx, q.idleKey, "gone-1", "gone-2").Err())
+		require.NoError(t, q.client.SAdd(ctx, q.idleKey, "gone-1", "gone-2").Err())
 		assert.True(t, q.EnqueueOnce("b", "x"), "the same with an id")
 
 		pq := qs.NewDistributedPriorityQueue("test_verbatim_wake_prio")
 		defer pq.Close()
-		delKeys(t, pq.Queue.client, "test_verbatim_wake_prio")
-		defer delKeys(t, pq.Queue.client, "test_verbatim_wake_prio")
-		require.NoError(t, pq.Queue.client.SAdd(ctx, pq.idleKey, "gone-1", "gone-2").Err())
+		delKeys(t, pq.client, "test_verbatim_wake_prio")
+		defer delKeys(t, pq.client, "test_verbatim_wake_prio")
+		require.NoError(t, pq.client.SAdd(ctx, pq.idleKey, "gone-1", "gone-2").Err())
 		assert.True(t, pq.Enqueue("a", 1), "priority: waking past consumers that are gone")
-		require.NoError(t, pq.Queue.client.SAdd(ctx, pq.idleKey, "gone-1", "gone-2").Err())
+		require.NoError(t, pq.client.SAdd(ctx, pq.idleKey, "gone-1", "gone-2").Err())
 		assert.True(t, pq.EnqueueOnce("b", 1, "x"), "priority: the same with an id")
 	})
 }
@@ -1424,6 +1439,1206 @@ func TestNewQueueRequeuesExpiredItems(t *testing.T) {
 			item, ok, _ := pop2()
 			require.True(t, ok)
 			assert.Equal(t, "job", string(item.([]byte)), "back before the sweep's first tick")
+		})
+	}
+}
+
+// cancelQueues are a producer and a consumer object of one queue kind on a
+// fresh key; push adds item at priority p (ignored for fifo), pushOnce is
+// EnqueueOnce.
+type cancelQueues struct {
+	prod, cons *Queue
+	push       func(item string, p int) bool
+	pushOnce   func(item, id string) bool
+}
+
+func eachCancelCase(t *testing.T, fn func(t *testing.T, c cancelQueues)) {
+	for _, kind := range []string{"list", "priority"} {
+		t.Run(kind, func(t *testing.T) {
+			qs := New(getTestRedisURL())
+			defer qs.Close()
+			key := newID()
+			var c cancelQueues
+			if kind == "list" {
+				p, q := qs.NewQueue(key), qs.NewQueue(key)
+				c = cancelQueues{p, q,
+					func(v string, _ int) bool { return p.Enqueue(v) },
+					func(v, id string) bool { return p.EnqueueOnce(v, id) }}
+			} else {
+				p, q := qs.NewPriorityQueue(key), qs.NewPriorityQueue(key)
+				c = cancelQueues{p.Queue, q.Queue,
+					func(v string, prio int) bool { return p.Enqueue(v, prio) },
+					func(v, id string) bool { return p.EnqueueOnce(v, 1, id) }}
+			}
+			defer c.prod.Close()
+			defer c.cons.Close()
+			fn(t, c)
+		})
+	}
+}
+
+// pops of q by kind, so the priority scripts run for a priority queue.
+func rawPopOf(q *Queue) (any, bool) {
+	if q.isPriority {
+		return (&PriorityQueue{q}).Dequeue()
+	}
+	return q.Dequeue()
+}
+
+func ackPopOf(q *Queue) (any, bool, string) {
+	if q.isPriority {
+		return (&PriorityQueue{q}).DequeueWithAckId()
+	}
+	return q.DequeueWithAckId()
+}
+
+func batchPopOf(q *Queue, items []any, ackIDs []string) (int, int, error) {
+	if q.isPriority {
+		return (&PriorityQueue{q}).DequeueBatchWithAckIds(items, ackIDs)
+	}
+	return q.DequeueBatchWithAckIds(items, ackIDs)
+}
+
+// record reads job id's Job Record from q.
+func record(t *testing.T, q *Queue, id string) map[string]any {
+	t.Helper()
+	s, err := q.client.HGet(t.Context(), q.getJobsKey(), id).Result()
+	require.NoError(t, err, "record of %s", id)
+	var r map[string]any
+	require.NoError(t, json.Unmarshal([]byte(s), &r))
+	return r
+}
+
+// assertDropped checks job id was dropped by a pop: record cancelled (no
+// started_at, no errors), indexed in :failed, mark gone, nothing counted.
+func assertDropped(t *testing.T, q *Queue, id string) {
+	t.Helper()
+	ctx := t.Context()
+	r := record(t, q, id)
+	assert.Equal(t, "cancelled", r["state"])
+	assert.Equal(t, id, r["id"])
+	assert.EqualValues(t, 1, r["attempts"])
+	assert.NotContains(t, r, "started_at")
+	assert.NotContains(t, r, "errors")
+	assert.NotZero(t, r["finished_at"])
+	assert.JSONEq(t, envelope(id, `1`), string(mustJSON(t, r["item"])))
+	_, err := q.client.ZScore(ctx, q.getFailedKey(), id).Result()
+	assert.NoError(t, err, "indexed in :failed")
+	assert.False(t, marked(t, q, id), "mark gone")
+	s := stats(t, q)
+	assert.Zero(t, s.Totals.Completed)
+	assert.Zero(t, s.Totals.Failed)
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	require.NoError(t, err)
+	return b
+}
+
+// A cancelled waiting job is never handed out, by any pop: dropped with
+// record and outcome cancelled, and the pop goes on with the next item,
+// under that item's own priority.
+func TestCancelWaitingJob(t *testing.T) {
+	pops := map[string]func(t *testing.T, q *Queue) (ids []string, ackID string){ // the ids handed out
+		"raw": func(t *testing.T, q *Queue) ([]string, string) {
+			v, ok := rawPopOf(q)
+			require.True(t, ok)
+			return []string{envID(t, v)}, ""
+		},
+		"single": func(t *testing.T, q *Queue) ([]string, string) {
+			v, ok, ackID := ackPopOf(q)
+			require.True(t, ok)
+			return []string{envID(t, v)}, ackID
+		},
+		"batch one": func(t *testing.T, q *Queue) ([]string, string) { // the lean batch script
+			items, ids := make([]any, 1), make([]string, 1)
+			n, _, err := batchPopOf(q, items, ids)
+			require.NoError(t, err)
+			require.Equal(t, 1, n)
+			return []string{envID(t, items[0])}, ids[0]
+		},
+	}
+	for name, pop := range pops {
+		t.Run(name, func(t *testing.T) {
+			eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+				got, _ := watch(c.prod, "a")
+				require.True(t, c.push(envelope("a", `1`), 1))
+				require.True(t, c.push(envelope("b", `1`), 5))
+				require.NoError(t, c.prod.CancelJob("a"))
+
+				ids, ackID := pop(t, c.cons)
+				assert.Equal(t, []string{"b"}, ids)
+				assertDropped(t, c.cons, "a")
+				assert.Equal(t, contract.JobOutcome{ID: "a", State: contract.JobCancelled, Error: "cancelled"}, outcomeWithin(t, got, time.Second))
+				assert.Zero(t, c.cons.Len())
+				assert.LessOrEqual(t, c.cons.GetNackedItemsCount(), 1, "only b")
+				if c.cons.isPriority {
+					assert.LessOrEqual(t, c.cons.client.HLen(t.Context(), c.cons.getPriorityKey()).Val(), int64(1))
+					if ackID != "" {
+						assert.Equal(t, "5", c.cons.client.HGet(t.Context(), c.cons.getPriorityKey(), ackID).Val(), "b's priority, not a's")
+					}
+				}
+			})
+		})
+	}
+}
+
+// A batch pop drops marked items and pops more in their place, keeping
+// order and each handed-out item's priority under its own ack ID.
+func TestCancelBatchRefills(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		for i, id := range []string{"a", "b", "c", "d", "e", "f"} {
+			require.True(t, c.push(envelope(id, `1`), i+1))
+		}
+		require.NoError(t, c.prod.CancelJob("a"))
+		require.NoError(t, c.prod.CancelJob("c"))
+
+		items, ackIDs := make([]any, 3), make([]string, 3)
+		n, remaining, err := batchPopOf(c.cons, items, ackIDs)
+		require.NoError(t, err)
+		require.Equal(t, 3, n)
+		assert.Equal(t, 1, remaining)
+		var got []string
+		for _, v := range items[:n] {
+			got = append(got, envID(t, v))
+		}
+		assert.Equal(t, []string{"b", "d", "e"}, got)
+		assertDropped(t, c.cons, "a")
+		assertDropped(t, c.cons, "c")
+		assert.Zero(t, c.cons.client.Exists(t.Context(), c.cons.getCancelledKey()).Val(), "last ZREM drops the key")
+		assert.Equal(t, 3, c.cons.GetNackedItemsCount())
+
+		if c.cons.isPriority {
+			ctx := t.Context()
+			prio := c.cons.client.HGetAll(ctx, c.cons.getPriorityKey()).Val()
+			assert.Equal(t, map[string]string{ackIDs[0]: "2", ackIDs[1]: "4", ackIDs[2]: "5"}, prio)
+		}
+		for _, id := range ackIDs[:n] {
+			require.True(t, c.cons.Acknowledge(id))
+		}
+	})
+}
+
+// With marks present, an item without an envelope id is handed out.
+func TestCancelUnparsableHandedOut(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		require.NoError(t, c.prod.CancelJob("zzz"))
+		require.True(t, c.push("raw bytes", 1))
+		require.True(t, c.push(`{"id":7}`, 1))
+		v, ok, _ := ackPopOf(c.cons)
+		require.True(t, ok)
+		assert.Equal(t, "raw bytes", string(v.([]byte)))
+		v, ok, _ = ackPopOf(c.cons)
+		require.True(t, ok)
+		assert.Equal(t, `{"id":7}`, string(v.([]byte)))
+	})
+}
+
+// luaDecodable matches Redis's Lua cjson on JSON Go reads; text that isn't
+// JSON passes.
+func TestLuaDecodable(t *testing.T) {
+	deep := func(n int) string { // nested n deep, the envelope included
+		return `{"id":"d","data":` + strings.Repeat("[", n-1) + strings.Repeat("]", n-1) + `}`
+	}
+	cases := []struct {
+		name, in string
+		want     bool
+	}{
+		{"plain", envelope("a", `1`), true},
+		{"pair", `{"id":"a","data":"\ud83d\ude00"}`, true},
+		{"upper pair", `{"data":"\uD83D\uDE00"}`, true},
+		{"escaped backslash", `{"data":"\\ud800"}`, true},
+		{"bmp", `{"data":"\u00e9\uffff\"\n"}`, true},
+		{"depth 1000", deep(1000), true},
+		{"brackets in a string", `{"data":"` + strings.Repeat("[", 1001) + `"}`, true},
+		{"lone high", `{"id":"a","data":"\ud800"}`, false},
+		{"lone high, top level", `"\udbff"`, false},
+		{"high, then text", `{"data":"\ud800x"}`, false},
+		{"high, then bmp", `{"data":"\ud800\u0041"}`, false},
+		{"high, high", `["\ud800\ud800"]`, false},
+		{"lone low", `{"data":"\udc00"}`, false},
+		{"upper lone low", `{"data":"\uDFFF"}`, false},
+		{"depth 1001", deep(1001), false},
+		{"text", "raw bytes", true},
+		{"text, deep", strings.Repeat("[", 1001), true},
+		{"text, lone escape", `say "\ud800`, true},
+		{"wide, shallow", `[` + strings.Repeat(`{"a":[1]},`, 2000) + `{}]`, true},
+		{"min pair", `"\ud800\udc00"`, true},
+		{"max pair", `"\udbff\udfff"`, true},
+		{"escaped quote, brackets in a string", `{"data":"\"` + strings.Repeat("[", 1001) + `"}`, true},
+		{"text, bad hex", `"\uzz00"`, true},
+		{"text, cut escape", `"\u12`, true},
+	}
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+	decode := redis.NewScript(`return pcall(cjson.decode, ARGV[1]) and 1 or 0`)
+	for _, c := range cases {
+		assert.Equal(t, c.want, luaDecodable([]byte(c.in)), c.name)
+		if json.Valid([]byte(c.in)) {
+			n, err := decode.Run(t.Context(), q.client, nil, c.in).Int()
+			require.NoError(t, err)
+			assert.Equal(t, c.want, n == 1, "%s: cjson decodes it", c.name)
+		}
+	}
+}
+
+// Enqueue and EnqueueOnce refuse JSON Redis Lua can't decode; at the depth
+// limit the pop's cancel gate still reads the id.
+func TestEnqueueRefusesLuaUndecodable(t *testing.T) {
+	nest := func(id string, n int) string {
+		return `{"id":"` + id + `","data":` + strings.Repeat("[", n-1) + strings.Repeat("]", n-1) + `}`
+	}
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		ctx := t.Context()
+		for _, v := range []string{`{"id":"s","data":"\ud800"}`, nest("s", 1001)} {
+			assert.False(t, c.push(v, 1))
+			assert.False(t, c.pushOnce(v, "s"))
+		}
+		assert.Zero(t, c.prod.client.Exists(ctx, c.prod.queueKey, c.prod.queueKey+":dedup:s").Val(), "nothing stored")
+
+		require.True(t, c.push(nest("k", 1000), 1))
+		require.NoError(t, c.prod.CancelJob("k"))
+		_, ok, _ := ackPopOf(c.cons)
+		assert.False(t, ok, "the gate read its id")
+		assert.Equal(t, "cancelled", record(t, c.cons, "k")["state"])
+		assert.True(t, c.push(`{"id":"w","data":[`+strings.Repeat(`{"a":[1]},`, 2000)+`{}]}`, 1), "wide, shallow")
+	})
+}
+
+// A pop that drops the last waiting item finds the queue empty. With no
+// record kept, the sweep can't catch up: the outcome comes from the pop's
+// PUBLISH alone, in every pop.
+func TestCancelOnlyItem(t *testing.T) {
+	pops := map[string]func(q *Queue) bool{ // reports whether an item came out
+		"raw":    func(q *Queue) bool { _, ok := rawPopOf(q); return ok },
+		"single": func(q *Queue) bool { _, ok, _ := ackPopOf(q); return ok },
+		"batch one": func(q *Queue) bool {
+			n, _, err := batchPopOf(q, make([]any, 1), make([]string, 1))
+			return err == nil && n > 0
+		},
+		"batch": func(q *Queue) bool { // want 2: the full batch script
+			q.popLen.Store(2)
+			n, _, err := batchPopOf(q, make([]any, 2), make([]string, 2))
+			return err == nil && n > 0
+		},
+	}
+	for name, pop := range pops {
+		t.Run(name, func(t *testing.T) {
+			eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+				c.cons.SetFailedRetention(0, 0)
+				got, _ := watch(c.prod, "a")
+				require.True(t, c.push(envelope("a", `1`), 1))
+				require.NoError(t, c.prod.CancelJob("a"))
+				assert.False(t, pop(c.cons))
+				assert.Zero(t, c.cons.client.HLen(t.Context(), c.cons.getJobsKey()).Val(), "no retention: no record")
+				assert.Equal(t, contract.JobOutcome{ID: "a", State: contract.JobCancelled, Error: "cancelled"}, outcomeWithin(t, got, time.Second))
+			})
+		})
+	}
+}
+
+// A job whose record shows it ended can't be cancelled; an unknown id is
+// marked, with a TTL; an empty id is an error.
+func TestCancelEndedAndUnknown(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		ctx := t.Context()
+		require.True(t, c.push(envelope("done", `1`), 1))
+		require.True(t, c.cons.Acknowledge(popAck(t, c.cons)))
+		assert.ErrorIs(t, c.prod.CancelJob("done"), contract.ErrJobEnded)
+
+		require.True(t, c.push(envelope("bad", `1`), 1))
+		require.True(t, c.cons.Reject(popAck(t, c.cons), "x"))
+		assert.ErrorIs(t, c.prod.CancelJob("bad"), contract.ErrJobEnded)
+
+		require.True(t, c.push(envelope("gone", `1`), 1))
+		require.NoError(t, c.prod.CancelJob("gone"))
+		_, ok, _ := ackPopOf(c.cons)
+		require.False(t, ok)
+		assert.ErrorIs(t, c.prod.CancelJob("gone"), contract.ErrJobEnded)
+		assert.False(t, marked(t, c.cons, "gone"), "an ended job is not marked")
+
+		require.NoError(t, c.prod.CancelJob("nobody"))
+		assert.True(t, marked(t, c.cons, "nobody"))
+		exp := c.cons.client.ZScore(ctx, c.cons.getCancelledKey(), "nobody").Val()
+		now := float64(c.cons.client.Time(ctx).Val().UnixMilli())
+		assert.InDelta(t, now+float64(cancelTTL.Milliseconds()), exp, 5000, "score: expiry in ms")
+		ttl := c.cons.client.PTTL(ctx, c.cons.getCancelledKey()).Val()
+		assert.Greater(t, ttl, 23*time.Hour, "backstop TTL")
+
+		assert.Error(t, c.prod.CancelJob(""))
+	})
+}
+
+// A running job's cancel reaches OnCancel in every process; the
+// consumer finishes it with AcknowledgeCancelled.
+func TestCancelRunningJob(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		ctx := t.Context()
+		var mu sync.Mutex
+		var seen []string
+		stop := c.cons.OnCancel(func(id string) {
+			mu.Lock()
+			seen = append(seen, id)
+			mu.Unlock()
+		})
+		calls := func() []string { mu.Lock(); defer mu.Unlock(); return append([]string(nil), seen...) }
+
+		got, _ := watch(c.prod, "r")
+		require.True(t, c.push(envelope("r", `1`), 1))
+		ackID := popAck(t, c.cons)
+		require.NoError(t, c.prod.CancelJob("r"))
+		require.NoError(t, c.prod.CancelJob("x1"))
+		require.NoError(t, c.prod.CancelJob("x2"))
+		require.Eventually(t, func() bool { return len(calls()) == 3 }, time.Second, 5*time.Millisecond)
+		assert.ElementsMatch(t, []string{"r", "x1", "x2"}, calls())
+
+		require.True(t, c.cons.AcknowledgeCancelled(ackID, "stopped"))
+		assert.Equal(t, contract.JobOutcome{ID: "r", State: contract.JobCancelled, Error: "stopped"}, outcomeWithin(t, got, time.Second))
+		r := record(t, c.cons, "r")
+		assert.Equal(t, "cancelled", r["state"])
+		assert.Contains(t, r, "started_at")
+		errs := r["errors"].([]any)
+		require.Len(t, errs, 1)
+		assert.Equal(t, "stopped", errs[0].(map[string]any)["error"])
+		_, err := c.cons.client.ZScore(ctx, c.cons.getFailedKey(), "r").Result()
+		assert.NoError(t, err, "indexed in :failed")
+		assert.Zero(t, c.cons.GetNackedItemsCount())
+		assert.False(t, marked(t, c.cons, "r"))
+		assert.EqualValues(t, 1, stats(t, c.cons).Totals.Failed, "counted as Reject")
+		assert.ErrorIs(t, c.prod.CancelJob("r"), contract.ErrJobEnded)
+
+		// a catch-up read of the record gives the same outcome
+		late, _ := watch(c.prod, "r")
+		assert.Equal(t, contract.JobOutcome{ID: "r", State: contract.JobCancelled, Error: "stopped"}, outcomeWithin(t, late, time.Second))
+
+		stop()
+		require.NoError(t, c.prod.CancelJob("x3"))
+		assert.Never(t, func() bool { return len(calls()) > 3 }, 200*time.Millisecond, 10*time.Millisecond, "no call after stop")
+	})
+}
+
+// A cancel message reaches OnCancel only while its job's mark is live: a
+// stale one (mark gone or expired) is dropped.
+func TestCancelStaleMessageDropped(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		ctx := t.Context()
+		var mu sync.Mutex
+		var seen []string
+		stop := c.cons.OnCancel(func(id string) {
+			mu.Lock()
+			seen = append(seen, id)
+			mu.Unlock()
+		})
+		defer stop()
+		calls := func() []string { mu.Lock(); defer mu.Unlock(); return append([]string(nil), seen...) }
+		publish := func(id string) {
+			require.NoError(t, c.prod.client.Publish(ctx, c.prod.getControlKey(), cancelPrefix+id).Err())
+		}
+		now := c.cons.client.Time(ctx).Val().UnixMilli()
+		mark := func(id string, exp int64) {
+			require.NoError(t, c.cons.client.ZAdd(ctx, c.cons.getCancelledKey(), redis.Z{Score: float64(exp), Member: id}).Err())
+		}
+
+		mark("x", now+time.Hour.Milliseconds())
+		publish("x") // first, so the subscription is known live
+		require.Eventually(t, func() bool { return len(calls()) == 1 }, time.Second, 5*time.Millisecond)
+
+		mark("old", now-1)
+		publish("none")
+		publish("old")
+		mark("y", now+time.Hour.Milliseconds())
+		publish("y")
+		require.Eventually(t, func() bool { return len(calls()) == 2 }, time.Second, 5*time.Millisecond)
+		assert.Never(t, func() bool { return len(calls()) > 2 }, 200*time.Millisecond, 10*time.Millisecond, "stale: no call")
+		assert.Equal(t, []string{"x", "y"}, calls())
+	})
+}
+
+// A stop that returns while the live check is under way calls nothing.
+func TestCancelStopDuringLiveCheck(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		require.NoError(t, cancelLiveScript.Load(t.Context(), c.cons.client).Err()) // so the check is an EVALSHA
+		h := &holdTick{hash: cancelLiveScript.Hash(), ran: make(chan struct{}), release: make(chan struct{})}
+		c.cons.client.AddHook(h)
+		var calls atomic.Int32
+		stop := c.cons.OnCancel(func(string) { calls.Add(1) })
+		h.armed.Store(true)
+
+		require.NoError(t, c.prod.CancelJob("j"))
+		select {
+		case <-h.ran: // the check replied live; the reply waits
+		case <-time.After(time.Second):
+			t.Fatal("no live check")
+		}
+		stop()
+		close(h.release)
+		assert.Never(t, func() bool { return calls.Load() > 0 }, 300*time.Millisecond, 10*time.Millisecond, "fn after stop")
+	})
+}
+
+// A live check that fails calls OnCancel anyway.
+func TestCancelCheckErrorCallsHook(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		ctx := t.Context()
+		var buf lockedBuffer
+		log.SetOutput(&buf)
+		defer log.SetOutput(os.Stderr)
+		var mu sync.Mutex
+		var seen []string
+		stop := c.cons.OnCancel(func(id string) { mu.Lock(); seen = append(seen, id); mu.Unlock() })
+		defer stop()
+
+		require.NoError(t, c.prod.client.Set(ctx, c.prod.getCancelledKey(), "x", 0).Err()) // ZSCORE: WRONGTYPE
+		t.Cleanup(func() { c.prod.client.Del(context.Background(), c.prod.getCancelledKey()) })
+		// publish again until the subscription is live
+		var pubErr error
+		require.Eventually(t, func() bool {
+			if pubErr = c.prod.client.Publish(ctx, c.prod.getControlKey(), cancelPrefix+"e").Err(); pubErr != nil {
+				return false
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			return len(seen) > 0
+		}, time.Second, 50*time.Millisecond, "no call on a failed check")
+		require.NoError(t, pubErr)
+		mu.Lock()
+		assert.Equal(t, "e", seen[0])
+		mu.Unlock()
+		assert.Contains(t, buf.String(), "Error checking cancel mark of e")
+	})
+}
+
+// A job that ends another way despite its mark drops the mark.
+func TestCancelFinishClearsMark(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		ctx := t.Context()
+		for _, finish := range []func(ackID string) bool{
+			c.cons.Acknowledge,
+			func(a string) bool { return c.cons.Reject(a, "x") },
+			func(a string) bool { return c.cons.AcknowledgeResult(a, []byte(`1`)) },
+		} {
+			require.True(t, c.push(envelope("m", `1`), 1))
+			ackID := popAck(t, c.cons)
+			require.NoError(t, c.prod.CancelJob("m"))
+			require.True(t, finish(ackID))
+			assert.False(t, marked(t, c.cons, "m"))
+			require.NoError(t, c.cons.client.HDel(ctx, c.cons.getJobsKey(), "m").Err()) // next round can mark it
+		}
+	})
+}
+
+// A watch that starts after a job was dropped gets the outcome from its
+// record.
+func TestCancelOutcomeCatchUp(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		require.True(t, c.push(envelope("a", `1`), 1))
+		require.True(t, c.push(envelope("b", `1`), 1))
+		require.NoError(t, c.prod.CancelJob("a"))
+		popAck(t, c.cons)
+
+		got, _ := watch(c.prod, "a")
+		assert.Equal(t, contract.JobOutcome{ID: "a", State: contract.JobCancelled, Error: "cancelled"}, outcomeWithin(t, got, time.Second))
+	})
+}
+
+// EnqueueOnce that pushes clears the mark, so the new job runs; a plain
+// Enqueue doesn't. Purge deletes the marks.
+func TestCancelReAddAndPurge(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		ctx := t.Context()
+		require.NoError(t, c.prod.CancelJob("n"))
+		require.True(t, c.pushOnce(envelope("n", `1`), "n"))
+		assert.False(t, marked(t, c.cons, "n"))
+		v, ok, _ := ackPopOf(c.cons)
+		require.True(t, ok)
+		assert.Equal(t, "n", envID(t, v))
+
+		require.NoError(t, c.prod.CancelJob("p"))
+		require.True(t, c.pushOnce(envelope("p", `1`), "p"))
+		require.NoError(t, c.prod.CancelJob("p"))
+		require.True(t, c.pushOnce(envelope("p", `2`), "p")) // dedupe hit: mark stays
+		assert.True(t, marked(t, c.cons, "p"))
+
+		c.prod.Purge()
+		assert.Zero(t, c.cons.client.Exists(ctx, c.cons.getCancelledKey()).Val())
+	})
+}
+
+// A plain Enqueue keeps the id's mark, so the pop drops the job.
+func TestCancelPlainEnqueueDropped(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		require.NoError(t, c.prod.CancelJob("n"))
+		require.True(t, c.push(envelope("n", `1`), 1))
+		_, ok, _ := ackPopOf(c.cons)
+		assert.False(t, ok)
+		assertDropped(t, c.cons, "n")
+	})
+}
+
+// A cancelled running job whose consumer dies is requeued, and the next pop
+// drops it, its attempts counted.
+func TestCancelRequeuedRunningJob(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		got, _ := watch(c.prod, "r")
+		require.True(t, c.push(envelope("r", `1`), 1))
+		_, ok, _ := ackPopOf(c.cons)
+		require.True(t, ok)
+		require.NoError(t, c.prod.CancelJob("r"))
+		require.NoError(t, c.cons.Close()) // requeues its job
+
+		_, ok, _ = ackPopOf(c.prod)
+		assert.False(t, ok, "dropped")
+		r := record(t, c.prod, "r")
+		assert.Equal(t, "cancelled", r["state"])
+		assert.EqualValues(t, 2, r["attempts"])
+		assert.NotContains(t, r, "started_at")
+		assert.False(t, marked(t, c.prod, "r"))
+		assert.Equal(t, contract.JobOutcome{ID: "r", State: contract.JobCancelled, Error: "cancelled"}, outcomeWithin(t, got, time.Second))
+	})
+}
+
+func TestCancelJobClosedQueue(t *testing.T) {
+	q, cleanup := setupTestQueue(t)
+	defer cleanup()
+	assert.ErrorIs(t, q.CancelJob(""), errEmptyJobID)
+	require.NoError(t, q.Close())
+	assert.ErrorIs(t, q.CancelJob("x"), errQueueClosed)
+}
+
+// With the dedupe off, a pushing EnqueueOnce still drops the id's cancel
+// mark and old record (spec 6.13, 6.14 Re-add).
+func TestEnqueueOnceNoWindowReAdd(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		c.prod.SetDedupWindow(0)
+		require.NoError(t, c.prod.CancelJob("m"))
+		require.True(t, c.pushOnce(envelope("m", `1`), "m"))
+		assert.False(t, marked(t, c.cons, "m"), "the re-add drops the mark")
+		v, ok, ackID := ackPopOf(c.cons)
+		require.True(t, ok, "the re-added job is not dropped")
+		assert.Equal(t, "m", envID(t, v))
+		require.True(t, c.cons.Acknowledge(ackID))
+
+		require.True(t, c.pushOnce(envelope("m", `2`), "m")) // re-add of a completed id
+		assert.Zero(t, c.prod.client.Exists(t.Context(), c.prod.queueKey+":dedup:m").Val(), "no id key")
+		assert.False(t, c.cons.client.HExists(t.Context(), c.cons.getJobsKey(), "m").Val(), "old record gone")
+		got, _ := watch(c.prod, "m")
+		c.prod.catchUp([]string{"m"})
+		require.NoError(t, c.prod.CancelJob("m"), "the waiting job is not ErrJobEnded")
+		_, ok, _ = ackPopOf(c.cons)
+		assert.False(t, ok, "dropped")
+		assert.Equal(t, contract.JobOutcome{ID: "m", State: contract.JobCancelled, Error: "cancelled"},
+			outcomeWithin(t, got, time.Second), "the old run's outcome is not reported")
+	})
+}
+
+// An expired mark counts as none: the pop hands the item out and removes
+// the mark. CancelJob and the sweep prune expired marks.
+func TestCancelExpiredMark(t *testing.T) {
+	eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+		ctx := t.Context()
+		key := c.cons.getCancelledKey()
+		past := float64(c.cons.client.Time(ctx).Val().UnixMilli() - 1000)
+		require.NoError(t, c.cons.client.ZAdd(ctx, key, redis.Z{Score: past, Member: "e"}).Err())
+		require.True(t, c.push(envelope("e", `1`), 1))
+		v, ok, _ := ackPopOf(c.cons)
+		require.True(t, ok)
+		assert.Equal(t, "e", envID(t, v))
+		assert.False(t, c.cons.client.HExists(ctx, c.cons.getJobsKey(), "e").Val(), "no cancelled record")
+		assert.Zero(t, c.cons.client.Exists(ctx, key).Val(), "the pop removed the expired mark")
+
+		require.NoError(t, c.cons.client.ZAdd(ctx, key, redis.Z{Score: past, Member: "old"}).Err())
+		require.NoError(t, c.prod.CancelJob("new"))
+		assert.Equal(t, []string{"new"}, c.cons.client.ZRange(ctx, key, 0, -1).Val(), "CancelJob prunes")
+
+		require.NoError(t, c.cons.client.ZAdd(ctx, key, redis.Z{Score: past, Member: "old"}).Err())
+		assert.Eventually(t, func() bool {
+			return c.cons.client.ZScore(ctx, key, "old").Err() == redis.Nil
+		}, 3*time.Second, 50*time.Millisecond, "the sweep prunes")
+		assert.True(t, marked(t, c.cons, "new"), "a live mark stays")
+	})
+}
+
+// A pop that drops marked items trims :failed to the failed retention at
+// once, not at the next minute's sweep trim.
+func TestCancelDropTrimsFailed(t *testing.T) {
+	pops := map[string]func(q *Queue){
+		"raw":       func(q *Queue) { rawPopOf(q) },
+		"single":    func(q *Queue) { ackPopOf(q) },
+		"batch one": func(q *Queue) { batchPopOf(q, make([]any, 1), make([]string, 1)) }, // the lean batch script
+		"batch": func(q *Queue) { // want 2: the full batch script
+			q.popLen.Store(2)
+			batchPopOf(q, make([]any, 2), make([]string, 2))
+		},
+	}
+	for name, pop := range pops {
+		t.Run(name, func(t *testing.T) {
+			eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+				ctx := t.Context()
+				c.cons.SetFailedRetention(2, time.Hour)
+				for i := range 5 {
+					id := fmt.Sprintf("c%d", i)
+					require.True(t, c.push(envelope(id, `1`), 1))
+					require.NoError(t, c.prod.CancelJob(id))
+				}
+				require.True(t, c.push(envelope("live", `1`), 1))
+
+				pop(c.cons)
+				assert.EqualValues(t, 2, c.cons.client.ZCard(ctx, c.cons.getFailedKey()).Val())
+				assert.EqualValues(t, 2, c.cons.client.HLen(ctx, c.cons.getJobsKey()).Val())
+			})
+		})
+	}
+}
+
+// One script call drops at most maxPop marked items; the script that ran
+// out of budget leaves the rest and keeps the consumer out of :idle, and
+// every pop call runs it again.
+func TestCancelDropBudget(t *testing.T) {
+	const marks = maxPop + 500
+	fill := func(t *testing.T, c cancelQueues) {
+		ctx := t.Context()
+		c.cons.Subscribe(func(string) {})
+		exp := float64(c.cons.client.Time(ctx).Val().UnixMilli() + time.Hour.Milliseconds())
+		z := make([]redis.Z, marks)
+		for i := range marks {
+			id := fmt.Sprintf("c%d", i)
+			require.True(t, c.push(envelope(id, `1`), 1))
+			z[i] = redis.Z{Score: exp, Member: id}
+		}
+		require.True(t, c.push(envelope("live", `1`), 1))
+		require.NoError(t, c.cons.client.ZAdd(ctx, c.cons.getCancelledKey(), z...).Err())
+	}
+	check := func(t *testing.T, q *Queue, dropped int64, idle bool) {
+		t.Helper()
+		ctx := t.Context()
+		assert.Equal(t, dropped, q.client.ZCard(ctx, q.getFailedKey()).Val())
+		assert.Equal(t, dropped, q.client.HLen(ctx, q.getJobsKey()).Val())
+		assert.Equal(t, idle, q.client.SIsMember(ctx, q.getIdleKey(), q.consumerID()).Val(), "idle")
+	}
+	extra := func(q *Queue) []string {
+		if q.isPriority {
+			return []string{q.getPriorityKey()}
+		}
+		return nil
+	}
+
+	// one batch call pops again after a spent budget, with the lean (want 1)
+	// and the full (want 2) script
+	for _, want := range []int64{1, 2} {
+		t.Run(fmt.Sprintf("batch want %d", want), func(t *testing.T) {
+			eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+				fill(t, c)
+				c.cons.popLen.Store(want)
+				items, ids := make([]any, 2), make([]string, 2)
+				n, remaining, err := batchPopOf(c.cons, items, ids)
+				require.NoError(t, err)
+				require.Equal(t, 1, n)
+				assert.Zero(t, remaining)
+				assert.Equal(t, "live", envID(t, items[0]))
+				check(t, c.cons, marks, true) // short of its slots with the queue empty
+				assert.Equal(t, "cancelled", record(t, c.cons, "c0")["state"])
+				assert.Equal(t, "cancelled", record(t, c.cons, fmt.Sprintf("c%d", marks-1))["state"])
+			})
+		})
+	}
+	t.Run("single", func(t *testing.T) {
+		eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+			fill(t, c)
+			q := c.cons
+			pop := listAckPopOne
+			if q.isPriority {
+				pop = zsetAckPopOne
+			}
+			ackID := q.ackIDOf(fmt.Sprintf("%020d", q.ackSeq.Add(1)), 1)
+			args := append([]any{q.vt(), ackID, q.consumerID()}, append(q.cancelArgs(), q.hbt(), q.ackPrefix)...)
+			r, err := pop.Run(t.Context(), q.client, q.popKeys(extra(q)...), args...).Result()
+			require.NoError(t, err)
+			assert.EqualValues(t, -1, r, "budget spent")
+			check(t, q, maxPop, false)
+
+			v, ok, _ := ackPopOf(q)
+			require.True(t, ok)
+			assert.Equal(t, "live", envID(t, v))
+			check(t, q, marks, false)
+		})
+	})
+	t.Run("single, one call", func(t *testing.T) {
+		eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+			fill(t, c)
+			v, ok, _ := ackPopOf(c.cons) // pops again after a spent budget
+			require.True(t, ok)
+			assert.Equal(t, "live", envID(t, v))
+			check(t, c.cons, marks, false)
+		})
+	})
+	t.Run("raw", func(t *testing.T) {
+		eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+			fill(t, c)
+			v, ok := rawPopOf(c.cons) // pops again after a spent budget
+			require.True(t, ok)
+			assert.Equal(t, "live", envID(t, v))
+			check(t, c.cons, marks, false)
+		})
+	})
+}
+
+// marked reports whether q's cancel marks hold id.
+func marked(t *testing.T, q *Queue, id string) bool {
+	t.Helper()
+	err := q.client.ZScore(t.Context(), q.getCancelledKey(), id).Err()
+	if err == redis.Nil {
+		return false
+	}
+	require.NoError(t, err)
+	return true
+}
+
+// envID is the envelope id of popped item v.
+func envID(t *testing.T, v any) string {
+	t.Helper()
+	var e struct {
+		ID string `json:"id"`
+	}
+	require.NoError(t, json.Unmarshal(v.([]byte), &e))
+	return e.ID
+}
+
+// outcomeCase opens a producer and a consumer object of one queue kind on
+// key, as two processes would.
+type outcomeCase struct {
+	name string
+	open func(qs Queues, key string) (prod, cons *Queue, push func(item string) bool)
+}
+
+var outcomeCases = []outcomeCase{
+	{"list", func(qs Queues, key string) (*Queue, *Queue, func(string) bool) {
+		p, c := qs.NewQueue(key), qs.NewQueue(key)
+		return p, c, func(v string) bool { return p.Enqueue(v) }
+	}},
+	{"priority", func(qs Queues, key string) (*Queue, *Queue, func(string) bool) {
+		p, c := qs.NewPriorityQueue(key), qs.NewPriorityQueue(key)
+		return p.Queue, c.Queue, func(v string) bool { return p.Enqueue(v, 1) }
+	}},
+}
+
+// eachOutcomeCase runs fn for both kinds on a fresh key.
+func eachOutcomeCase(t *testing.T, fn func(t *testing.T, prod, cons *Queue, push func(string) bool)) {
+	for _, c := range outcomeCases {
+		t.Run(c.name, func(t *testing.T) {
+			qs := New(getTestRedisURL())
+			defer qs.Close()
+			prod, cons, push := c.open(qs, newID())
+			defer prod.Close()
+			defer cons.Close()
+			fn(t, prod, cons, push)
+		})
+	}
+}
+
+// popAck pops the one waiting item from q and returns its ack ID.
+func popAck(t *testing.T, q *Queue) string {
+	t.Helper()
+	var ackID string
+	require.Eventually(t, func() bool {
+		var ok bool
+		if q.isPriority {
+			_, ok, ackID = (&PriorityQueue{q}).DequeueWithAckId()
+		} else {
+			_, ok, ackID = q.DequeueWithAckId()
+		}
+		return ok
+	}, 2*time.Second, 10*time.Millisecond)
+	return ackID
+}
+
+// watch watches id on q and returns the channel fn sends each call to.
+func watch(q *Queue, id string) (<-chan contract.JobOutcome, func()) {
+	got := make(chan contract.JobOutcome, 4)
+	cancel := q.WatchOutcome(id, func(o contract.JobOutcome) { got <- o })
+	return got, cancel
+}
+
+func outcomeWithin(t *testing.T, got <-chan contract.JobOutcome, d time.Duration) contract.JobOutcome {
+	t.Helper()
+	select {
+	case o := <-got:
+		return o
+	case <-time.After(d):
+		t.Fatal("no outcome")
+		return contract.JobOutcome{}
+	}
+}
+
+// watchGone asserts q no longer watches id: no entry, no subscription.
+func watchGone(t *testing.T, q *Queue, id string) {
+	t.Helper()
+	assert.Eventually(t, func() bool {
+		q.outcomes.mu.Lock()
+		_, held := q.outcomes.byID[id]
+		q.outcomes.mu.Unlock()
+		n, err := q.client.PubSubNumSub(context.Background(), q.donePrefix()+id).Result()
+		return !held && err == nil && n[q.donePrefix()+id] == 0
+	}, 2*time.Second, 20*time.Millisecond, "watch of %s still held", id)
+}
+
+func TestWatchOutcomeAcknowledge(t *testing.T) {
+	eachOutcomeCase(t, func(t *testing.T, prod, cons *Queue, push func(string) bool) {
+		got, _ := watch(prod, "j1")
+		require.True(t, push(envelope("j1", `{"a":1}`)))
+		require.True(t, cons.Acknowledge(popAck(t, cons)))
+
+		o := outcomeWithin(t, got, time.Second) // a message, well before the sweep
+		assert.Equal(t, contract.JobOutcome{ID: "j1", State: contract.JobCompleted}, o)
+		watchGone(t, prod, "j1") // the watch ends by itself after fn
+	})
+}
+
+func TestWatchOutcomeReject(t *testing.T) {
+	eachOutcomeCase(t, func(t *testing.T, prod, cons *Queue, push func(string) bool) {
+		got, _ := watch(prod, "j2")
+		require.True(t, push(envelope("j2", `1`)))
+		require.True(t, cons.Reject(popAck(t, cons), "boom"))
+
+		o := outcomeWithin(t, got, time.Second)
+		assert.Equal(t, contract.JobOutcome{ID: "j2", State: contract.JobFailed, Error: "boom"}, o)
+	})
+}
+
+// A result keeps its exact bytes, big integers included, in the outcome
+// and the record.
+func TestAcknowledgeResultKeepsBytes(t *testing.T) {
+	const result = `{"n":12345678901234567}`
+	eachOutcomeCase(t, func(t *testing.T, prod, cons *Queue, push func(string) bool) {
+		got, _ := watch(prod, "j3")
+		require.True(t, push(envelope("j3", `"x"`)))
+		require.True(t, cons.AcknowledgeResult(popAck(t, cons), []byte(result)))
+
+		o := outcomeWithin(t, got, time.Second)
+		assert.Equal(t, contract.JobCompleted, o.State)
+		assert.Equal(t, result, string(o.Result))
+
+		rec, err := cons.client.HGet(t.Context(), cons.getJobsKey(), "j3").Result()
+		require.NoError(t, err)
+		assert.Contains(t, rec, `"result":`+result)
+		out, ok := outcomeOf("j3", rec)
+		require.True(t, ok)
+		assert.Equal(t, result, string(out.Result))
+
+		s, err := cons.QueueStats(t.Context())
+		require.NoError(t, err)
+		assert.EqualValues(t, 1, s.Totals.Completed)
+	})
+}
+
+// Invalid JSON is refused and leaves the job processing; the script's own
+// check refuses what cjson can't decode before any write.
+func TestAcknowledgeResultInvalidJSON(t *testing.T) {
+	eachOutcomeCase(t, func(t *testing.T, prod, cons *Queue, push func(string) bool) {
+		require.True(t, push(envelope("j4", `1`)))
+		ackID := popAck(t, cons)
+		assert.False(t, cons.AcknowledgeResult(ackID, []byte(`{"n":`)))
+		assert.False(t, cons.AcknowledgeResult(ackID, nil))
+		assert.Equal(t, 1, cons.GetNackedItemsCount(), "still processing")
+
+		keys := []string{cons.getNackedItemKey(), cons.getTimeoutKey(), cons.getStartedKey(), cons.getAttemptsKey(), cons.getStatsKey(), cons.getJobsKey(), cons.getCompletedKey(), cons.getFailedKey(), cons.getPriorityKey()}
+		r, err := finishScript.Run(t.Context(), cons.client, keys, ackID, "completed", "", 10, 60000, `{bad`, cons.donePrefix()).Int()
+		require.NoError(t, err)
+		assert.Equal(t, -1, r)
+		assert.Equal(t, 1, cons.GetNackedItemsCount(), "still processing")
+		assert.Zero(t, cons.client.HLen(t.Context(), cons.getJobsKey()).Val(), "no record")
+
+		assert.True(t, cons.AcknowledgeResult(ackID, []byte(` [1, 2] `)))
+		assert.Zero(t, cons.GetNackedItemsCount())
+	})
+}
+
+// A job that ended before the watch is reported from its record.
+func TestWatchOutcomeCatchUp(t *testing.T) {
+	eachOutcomeCase(t, func(t *testing.T, prod, cons *Queue, push func(string) bool) {
+		require.True(t, push(envelope("j5", `1`)))
+		require.True(t, cons.Reject(popAck(t, cons), "late"))
+
+		got, _ := watch(prod, "j5")
+		o := outcomeWithin(t, got, time.Second)
+		assert.Equal(t, contract.JobOutcome{ID: "j5", State: contract.JobFailed, Error: "late"}, o)
+		watchGone(t, prod, "j5")
+	})
+}
+
+// A lost message is made up by the sweep's read of the record.
+func TestWatchOutcomeSweepCatchUp(t *testing.T) {
+	eachOutcomeCase(t, func(t *testing.T, prod, cons *Queue, push func(string) bool) {
+		got := make(chan contract.JobOutcome, 1)
+		addWatch(prod, "j6", func(o contract.JobOutcome) { got <- o }) // no subscribe, no catch-up
+		rec := `{"id":"j6","state":"completed","item":1,"finished_at":1,"attempts":1,"result":7}`
+		require.NoError(t, cons.client.HSet(t.Context(), cons.getJobsKey(), "j6", rec).Err()) // no PUBLISH
+
+		prod.sweepOutcomes()
+		o := outcomeWithin(t, got, time.Second)
+		assert.Equal(t, `7`, string(o.Result))
+		watchGone(t, prod, "j6")
+
+		addWatch(prod, "j6b", func(o contract.JobOutcome) { got <- o }) // left to the 1s sweep loop
+		rec = `{"id":"j6b","state":"failed","item":1,"finished_at":1,"attempts":1}`
+		require.NoError(t, cons.client.HSet(t.Context(), cons.getJobsKey(), "j6b", rec).Err())
+		assert.Equal(t, contract.JobOutcome{ID: "j6b", State: contract.JobFailed}, outcomeWithin(t, got, 3*time.Second))
+	})
+}
+
+// addWatch adds a watch of id to q as WatchOutcome does, but without its
+// subscribe and catch-up, so only a sweep (or a message) delivers it.
+func addWatch(q *Queue, id string, fn func(contract.JobOutcome)) {
+	o := &q.outcomes
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.byID == nil {
+		o.byID = map[string]map[*outcomeWatch]struct{}{}
+	}
+	if o.byID[id] == nil {
+		o.byID[id] = map[*outcomeWatch]struct{}{}
+	}
+	o.byID[id][&outcomeWatch{fn: fn}] = struct{}{}
+}
+
+// One sweep reads at most maxCatchUp watched ids; the next takes the rest.
+// A queue object without its sweep, so only these calls deliver.
+func TestSweepOutcomesCap(t *testing.T) {
+	qs := New(getTestRedisURL()).(*queues)
+	defer qs.Close()
+	q := newQueueBase(qs.client, "redisq:test:{"+newID()+"}")
+	defer q.cancel()
+	q.presence = q.client.Subscribe(q.ctx)
+	defer q.presence.Close()
+	defer q.client.Del(context.Background(), q.getJobsKey())
+
+	q.unwatch("none", &outcomeWatch{}) // no set: nothing to drop
+	const n = maxCatchUp + 100
+	var calls atomic.Int32
+	fields := make([]any, 0, 2*n)
+	for i := range n {
+		id := fmt.Sprintf("s%d", i)
+		fields = append(fields, id, `{"state":"completed"}`)
+		addWatch(q, id, func(contract.JobOutcome) { calls.Add(1) })
+	}
+	require.NoError(t, q.client.HSet(t.Context(), q.getJobsKey(), fields...).Err())
+
+	q.sweepOutcomes()
+	assert.Len(t, q.outcomes.byID, n-maxCatchUp, "one sweep reads maxCatchUp ids")
+	q.sweepOutcomes()
+	assert.Empty(t, q.outcomes.byID)
+	assert.Eventually(t, func() bool { return calls.Load() == n }, time.Second, 10*time.Millisecond)
+}
+
+// A record that isn't JSON or isn't final gives no outcome; a cancelled one
+// without errors gets error "cancelled".
+func TestOutcomeOf(t *testing.T) {
+	for _, rec := range []string{`{`, `[]`, `{"state":"processing"}`, `{"state":"pending"}`} {
+		_, ok := outcomeOf("x", rec)
+		assert.False(t, ok, rec)
+	}
+	out, ok := outcomeOf("x", `{"state":"cancelled"}`)
+	require.True(t, ok)
+	assert.Equal(t, contract.JobOutcome{ID: "x", State: contract.JobCancelled, Error: "cancelled"}, out)
+}
+
+// A done message that isn't JSON or isn't final calls nothing; the id comes
+// from the channel, not the payload.
+func TestWatchOutcomeIgnoresBadPayload(t *testing.T) {
+	eachOutcomeCase(t, func(t *testing.T, prod, cons *Queue, push func(string) bool) {
+		ctx := t.Context()
+		ch := prod.donePrefix() + "j"
+		got, _ := watch(prod, "j")
+		require.Eventually(t, func() bool {
+			n, err := cons.client.PubSubNumSub(ctx, ch).Result()
+			return err == nil && n[ch] == 1
+		}, 2*time.Second, 10*time.Millisecond, "subscribed")
+
+		for _, p := range []string{`{`, `{"state":"processing"}`, `{"id":"other","state":"completed","result":1}`} {
+			require.NoError(t, cons.client.Publish(ctx, ch, p).Err())
+		}
+		assert.Equal(t, contract.JobOutcome{ID: "j", State: contract.JobCompleted, Result: json.RawMessage(`1`)}, outcomeWithin(t, got, time.Second))
+		watchGone(t, prod, "j")
+	})
+}
+
+func TestWatchOutcomeCancel(t *testing.T) {
+	eachOutcomeCase(t, func(t *testing.T, prod, cons *Queue, push func(string) bool) {
+		got, cancel := watch(prod, "j7")
+		cancel()
+		cancel() // idempotent
+		watchGone(t, prod, "j7")
+		require.True(t, push(envelope("j7", `1`)))
+		require.True(t, cons.Acknowledge(popAck(t, cons)))
+
+		select {
+		case <-got:
+			t.Fatal("fn called after cancel")
+		case <-time.After(1500 * time.Millisecond): // past a sweep
+		}
+	})
+}
+
+func TestWatchOutcomeTwoWatchers(t *testing.T) {
+	eachOutcomeCase(t, func(t *testing.T, prod, cons *Queue, push func(string) bool) {
+		var a, b atomic.Int32
+		cancelA := prod.WatchOutcome("j8", func(contract.JobOutcome) { a.Add(1) })
+		prod.WatchOutcome("j8", func(contract.JobOutcome) { b.Add(1) })
+		require.True(t, push(envelope("j8", `1`)))
+		require.True(t, cons.Acknowledge(popAck(t, cons)))
+
+		require.Eventually(t, func() bool { return a.Load() == 1 && b.Load() == 1 }, time.Second, 10*time.Millisecond)
+		cancelA()                           // after fn: no-op
+		time.Sleep(1500 * time.Millisecond) // a sweep reads the record again
+		assert.EqualValues(t, 1, a.Load())
+		assert.EqualValues(t, 1, b.Load())
+		watchGone(t, prod, "j8")
+	})
+}
+
+// Cancelling one of two watchers before the job ends keeps the other's
+// entry and subscription: it still gets the outcome by message.
+func TestWatchOutcomeOneOfTwoCancelled(t *testing.T) {
+	eachOutcomeCase(t, func(t *testing.T, prod, cons *Queue, push func(string) bool) {
+		var a, b atomic.Int32
+		cancelA := prod.WatchOutcome("j9", func(contract.JobOutcome) { a.Add(1) })
+		prod.WatchOutcome("j9", func(contract.JobOutcome) { b.Add(1) })
+		cancelA()
+
+		prod.outcomes.mu.Lock()
+		_, held := prod.outcomes.byID["j9"]
+		prod.outcomes.mu.Unlock()
+		assert.True(t, held, "B's entry stays")
+		ch := prod.donePrefix() + "j9"
+		require.Eventually(t, func() bool { // SUBSCRIBE is not awaited
+			return prod.client.PubSubNumSub(t.Context(), ch).Val()[ch] == 1
+		}, time.Second, 10*time.Millisecond, "still subscribed")
+
+		require.True(t, push(envelope("j9", `1`)))
+		require.True(t, cons.Acknowledge(popAck(t, cons)))
+		require.Eventually(t, func() bool { return b.Load() == 1 }, time.Second, 10*time.Millisecond)
+		time.Sleep(1500 * time.Millisecond) // past a sweep
+		assert.Zero(t, a.Load(), "A cancelled")
+		assert.EqualValues(t, 1, b.Load())
+		watchGone(t, prod, "j9")
+	})
+}
+
+// A job without an envelope id publishes nothing; an empty id watches
+// nothing.
+func TestOutcomeWithoutJobID(t *testing.T) {
+	eachOutcomeCase(t, func(t *testing.T, prod, cons *Queue, push func(string) bool) {
+		ps := cons.client.PSubscribe(t.Context(), cons.donePrefix()+"*")
+		defer ps.Close()
+		_, err := ps.Receive(t.Context()) // subscribed
+		require.NoError(t, err)
+
+		called := make(chan struct{}, 1)
+		prod.WatchOutcome("", func(contract.JobOutcome) { called <- struct{}{} })()
+
+		require.True(t, push("raw bytes"))
+		require.True(t, cons.AcknowledgeResult(popAck(t, cons), []byte(`1`)))
+		require.True(t, push(`{"id":7}`)) // id not a string
+		require.True(t, cons.Reject(popAck(t, cons), "x"))
+
+		select {
+		case m := <-ps.Channel():
+			t.Fatalf("published %s", m.Channel)
+		case <-called:
+			t.Fatal("fn called for an empty id")
+		case <-time.After(300 * time.Millisecond):
+		}
+	})
+}
+
+// Retention that keeps no record still publishes the outcome.
+func TestOutcomePublishedWithoutRecord(t *testing.T) {
+	eachOutcomeCase(t, func(t *testing.T, prod, cons *Queue, push func(string) bool) {
+		cons.SetCompletedRetention(0, 0)
+		got, _ := watch(prod, "j9")
+		require.True(t, push(envelope("j9", `1`)))
+		require.True(t, cons.AcknowledgeResult(popAck(t, cons), []byte(`"r"`)))
+
+		o := outcomeWithin(t, got, time.Second)
+		assert.Equal(t, `"r"`, string(o.Result))
+		assert.Zero(t, cons.client.HLen(t.Context(), cons.getJobsKey()).Val())
+	})
+}
+
+// Close drops watchers without calling them; a watch after Close is a
+// no-op.
+func TestWatchOutcomeClose(t *testing.T) {
+	eachOutcomeCase(t, func(t *testing.T, prod, cons *Queue, push func(string) bool) {
+		got, cancel := watch(prod, "j10")
+		require.NoError(t, prod.Close())
+		cancel()
+		late, _ := watch(prod, "j10")
+
+		rec := `{"id":"j10","state":"completed","item":1,"finished_at":1,"attempts":1}`
+		require.NoError(t, cons.client.HSet(t.Context(), cons.getJobsKey(), "j10", rec).Err())
+		require.NoError(t, cons.client.Publish(t.Context(), cons.donePrefix()+"j10", `{"id":"j10","state":"completed"}`).Err())
+		select {
+		case <-got:
+			t.Fatal("fn called after Close")
+		case <-late:
+			t.Fatal("fn of a watch made after Close called")
+		case <-time.After(1500 * time.Millisecond):
+		}
+	})
+}
+
+// An id pushed again after its dedupe window drops the previous run's
+// record, so a watch of the new run waits for it; a dedupe hit keeps it.
+func TestEnqueueOnceDropsOldRecord(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		open func(qs Queues, key string) (prod, cons *Queue, pushOnce func(item, id string) bool)
+	}{
+		{"list", func(qs Queues, key string) (*Queue, *Queue, func(string, string) bool) {
+			p, c := qs.NewQueue(key), qs.NewQueue(key)
+			return p, c, func(v, id string) bool { return p.EnqueueOnce(v, id) }
+		}},
+		{"priority", func(qs Queues, key string) (*Queue, *Queue, func(string, string) bool) {
+			p, c := qs.NewPriorityQueue(key), qs.NewPriorityQueue(key)
+			return p.Queue, c.Queue, func(v, id string) bool { return p.EnqueueOnce(v, 1, id) }
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			qs := New(getTestRedisURL())
+			defer qs.Close()
+			prod, cons, pushOnce := c.open(qs, newID())
+			defer prod.Close()
+			defer cons.Close()
+			ctx := t.Context()
+			record := func() bool { return cons.client.HExists(ctx, cons.getJobsKey(), "x").Val() }
+			finished := func() int64 {
+				return cons.client.ZCard(ctx, cons.getCompletedKey()).Val() + cons.client.ZCard(ctx, cons.getFailedKey()).Val()
+			}
+
+			require.True(t, pushOnce(envelope("x", `1`), "x"))
+			require.True(t, cons.AcknowledgeResult(popAck(t, cons), []byte(`"old"`)))
+			require.True(t, record())
+
+			require.True(t, pushOnce(envelope("x", `2`), "x")) // dedupe hit
+			assert.True(t, record(), "a dedupe hit keeps the record")
+			assert.EqualValues(t, 1, finished())
+
+			require.NoError(t, cons.client.Del(ctx, cons.queueKey+":dedup:x").Err()) // the window passed
+			require.True(t, pushOnce(envelope("x", `3`), "x"))
+			assert.False(t, record(), "the push drops the old record")
+			assert.Zero(t, finished())
+
+			got, _ := watch(prod, "x")
+			select {
+			case o := <-got:
+				t.Fatalf("stale outcome %+v", o)
+			case <-time.After(1500 * time.Millisecond): // past a sweep
+			}
+
+			require.True(t, cons.AcknowledgeResult(popAck(t, cons), []byte(`"new"`)))
+			o := outcomeWithin(t, got, time.Second)
+			assert.Equal(t, `"new"`, string(o.Result))
 		})
 	}
 }
