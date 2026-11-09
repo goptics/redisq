@@ -1,9 +1,9 @@
 """redisq-wake.svg: two consumers wait in the :idle set; an enqueue wakes one, the busy one stays out of :idle,
 so the next enqueue wakes the free one at once.
 
-The timeline is simulated with heapq from the real rules: Enqueue = RPUSH + wake(n) (distributed.go:9-11,
-notification.go:54-67), nudge (notification.go:74-77, 125-149), varmq's busy gate (varmq/worker_eventloop.go:26),
-Len() marking a consumer idle (notification.go:45-47, 184-186), a pop clearing it (distributed.go:60, 72, 82), and
+The timeline is simulated with heapq from the real rules: Enqueue = RPUSH + wake(n) (queue.go:386-389,
+notification.go:56-66), nudge (notification.go:76-79, 130-154), varmq's busy gate (varmq/worker_eventloop.go:26),
+Len() marking a consumer idle (notification.go:47-49, 189-191), a pop clearing it (queue.go:249, 1020, 1163), and
 Len() at job end (varmq/worker_pool.go:151, 166). Facts and invariants: STORYBOARD.md, section 2. Line numbers are
 those of this branch, as in the storyboard.
 """
@@ -15,7 +15,7 @@ import kfu
 from kfu import at, bar, flash, kf, states
 
 CONS = ("C1", "C2")
-PHASE = {"C1": .3, "C2": .8}   # nudge ticks at phase + k (notification.go:126, a 1 s ticker per consumer)
+PHASE = {"C1": .3, "C2": .8}   # nudge ticks at phase + k (notification.go:131, a 1 s ticker per consumer)
 ENQ = [(.5, "X"), (1.85, "Y")]  # times the Enqueue script runs (RPUSH + wake); Y comes after C1's 1.3 nudge, and
                                 # its slowed wake and pop to C2 end before C2's 2.8 nudge, as they do in real time
                                 # (asserted in build: no event inside a flight)
@@ -68,7 +68,7 @@ def simulate():
     def push(t, kind, *a):
         heapq.heappush(ev, (round(t, 4), next(seq), kind, a))
 
-    queue, idle = [], set(CONS)          # start: Subscribe added both (notification.go:164-171)
+    queue, idle = [], set(CONS)          # start: Subscribe added both (notification.go:169-176)
     busy = {c: None for c in CONS}       # varmq busyWorkers per consumer (concurrency 1): set at dispatch
     free = {c: True for c in CONS}       # Notification.idle: its own last Len()/pop found no work for it
     picks = iter(SPOP_PICK)
@@ -109,7 +109,7 @@ def simulate():
             job = a[0]
             queue.append(job)
             n, before, woken = len(queue), set(idle), []
-            while len(woken) < n:                   # notification.go:57-62
+            while len(woken) < n:                   # notification.go:59-64
                 if not idle:
                     break
                 c = next(picks)
@@ -120,7 +120,7 @@ def simulate():
                 woken.append(c)                     # c is subscribed: PUBLISH returns 1
                 push(arrive, "signal", c, "wake")
             log["enq"].append((t, job, n, woken, before))
-        elif kind == "nudge":                       # notification.go:74-77, then poke when items wait (145-146)
+        elif kind == "nudge":                       # notification.go:76-79, then poke when items wait (150-151)
             c = a[0]
             n, was_busy = len(queue), busy[c] is not None
             if n > 0:
@@ -137,13 +137,13 @@ def simulate():
             signal(t, *a)
         elif kind == "pop":                         # DequeueWithAckId: LPOP into pending (queue.go popOneTail)
             c = a[0]
-            if not queue:                           # a race: the pop finds nothing → SADD (queue.go:494-496)
+            if not queue:                           # a race: the pop finds nothing → SADD (queue.go:890-893)
                 member(t, c, True, "pop-miss")
                 free[c] = True
                 busy[c] = None
                 continue
             job = queue.pop(0)
-            free[c] = False                         # a pop that returns a job clears the flag (distributed.go:72)
+            free[c] = False                         # a pop that returns a job clears the flag (queue.go:1020)
             busy[c] = job
             arrive = round(t + plen(pop_route(c)) / POP_V, 4)
             log["pop"].append((t, c, job, arrive))
@@ -172,14 +172,14 @@ def build():
 
     # ---- invariants (STORYBOARD.md section 2) ----
     for t, job, n, woken, before in log["enq"]:
-        # wakes per enqueue ≤ items waiting after the push and ≤ :idle members (distributed.go:9-11, notification.go:57-60)
+        # wakes per enqueue ≤ items waiting after the push and ≤ :idle members (queue.go:386-389, notification.go:59-62)
         assert len(woken) <= n and len(woken) <= len(before), (t, job, n, woken, before)
     for t, c, arrive, job in log["wake"]:
-        # SPOP removes the member before the PUBLISH (notification.go:58)
+        # SPOP removes the member before the PUBLISH (notification.go:60)
         assert any(mt == t and mc == c and not mi and why == "spop" for mt, mc, mi, why in log["member"]), (t, c)
     for t, c, n, was_busy, free, in_idle in log["nudge"]:
         # a nudge SREMs and pokes while items wait; with the queue empty it SADDs only a consumer whose own last
-        # Len() or pop found no work (notification.go:74-77)
+        # Len() or pop found no work (notification.go:76-79)
         if n > 0:
             assert not in_idle, (t, c, n)
         elif free:
@@ -303,7 +303,7 @@ def build():
         pulse(f"ring{c}", PHASE[c])
         pokes = [t for t, cc, n, *_ in log["nudge"] if cc == c and n > 0]
         if pokes:
-            # the poke is local (an in-process broadcast after the nudge script, notification.go:145-146): label it
+            # the poke is local (an in-process broadcast after the nudge script, notification.go:150-151): label it
             # inside the box, beside the nudge ring, on a box-coloured tag so it keeps contrast over the busy glow
             x = X0[c] + 136                                  # ring at X0 + 148, y 306 (wake.tpl.svg)
             E.append(f'<g id="poke{c}" class="a"><rect class="tag" x="{x - 78}" y="298" width="81" height="16" '
@@ -343,7 +343,7 @@ def pulse(name, phase, length=.6, peak=.9, grow=2.4):
 
 def desc(log):
     return (
-        "Two consumers, C1 and C2, each a DistributedQueue with a varmq worker running one job at a time, wait on "
+        "Two consumers, C1 and C2, each a Queue with a varmq worker running one job at a time, wait on "
         "one Redis list. At the start the queue is empty, both consumers are free, and both are members of the "
         ":idle set, which Subscribe joined them to. Every consumer runs a nudge once a second: when items wait it "
         "removes itself from :idle (SREM) and pokes its own worker, and when the queue is empty it adds itself back "

@@ -131,7 +131,7 @@
   <path class="edge" d="M440 341H800V322" marker-end="url(#arr)"/>
   <text class="m" x="508" y="328">pop: LPOP → pending</text>
 
-  <!-- consumers: DistributedQueue + varmq worker, concurrency 1; the nudge ring sits bottom-right, where the
+  <!-- consumers: Queue + varmq worker, concurrency 1; the nudge ring sits bottom-right, where the
        generator shows a local "nudge: poke" tag -->
   <rect class="box wk" x="600" y="224" width="160" height="96" rx="8"/>
   <rect id="glowC1" class="a glow" x="600" y="224" width="160" height="96" rx="8"/>

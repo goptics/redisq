@@ -17,7 +17,7 @@ POP = 1                   # items per pop call. varmq v1.9.0 pulls an ack source
                           # 185), so a wake pops once per free slot, back to back. varmq main after v1.9.0
                           # (worker_credit.go, 56a4e93) pops every free slot with one DequeueBatchWithAckIds: POP = CONC.
 ENQ = [("J1", .40), ("J2", .46), ("J3", .52)]   # Enqueue calls, back to back
-ENQ_FLY = .5              # producer → list; the RPUSH + wake script runs as the job lands (distributed.go:9-11)
+ENQ_FLY = .5              # producer → list; the RPUSH + wake script runs as the job lands (queue.go:386-389)
 WORK = {"J1": 2.6, "J2": 2.9, "J3": 3.2}         # run time of each job, wherever it runs
 C2_TICK0 = .8             # C2 nudges at .8 + k, its phase in diagram 2
 C1_START = 2.4            # C1 is built (its nudge ticker starts) and subscribes
@@ -29,7 +29,7 @@ POP_GAP = .05             # back-to-back pops of one pull loop, drawn
 POP_MOVE = .6             # list → pending row, drawn
 CHIP_IN, CHIP_OUT = .25, .15                     # a chip slides into / out of :idle, drawn
 STEPS_FOR = 1.3           # Close's step list stays this long after its last step (the wake)
-VT = 16.0                 # visibility timeout as drawn (default 5 min, queue.go:83)
+VT = 16.0                 # visibility timeout as drawn (default 5 min, queue.go:106)
 HOLD, XFADE = 1.0, .5     # end state held, then cross-fade to the start state
 DOT_V, WAKE_V = 520, 520  # px/s
 HORIZON = 30
@@ -120,11 +120,11 @@ class Sim:
         return True
 
     def length(self, t, m):
-        """Len() of a DistributedQueue: lenIdle, which SADDs a consumer that reads 0 (notification.go:45-47)."""
+        """Len() of a consumer Queue: lenIdle, which SADDs a consumer that reads 0 (notification.go:47-49)."""
         n = len(self.lst)
         if n == 0 and self.c[m]["consumer"]:
             self.sadd(t, m, "Len() = 0")
-            self.c[m]["free"] = True                 # notification.go:184-186
+            self.c[m]["free"] = True                 # notification.go:189-191
         return n
 
     def set_busy(self, t, m, d):
@@ -135,7 +135,7 @@ class Sim:
 
     # -- Redis scripts --
     def wake(self, t, count, why):
-        """wake(count): SPOP a member, PUBLISH to its channel, until count woken or :idle is empty (notification.go:52-64)."""
+        """wake(count): SPOP a member, PUBLISH to its channel, until count woken or :idle is empty (notification.go:56-66)."""
         woken, spopped = 0, []
         while woken < count and self.idle:
             assert len(self.idle) == 1, ("SPOP is random: the drawing relies on one member", t, self.idle)
@@ -160,7 +160,7 @@ class Sim:
             used = {p["row"] for p in self.pending.values()}
             row = max(r for r in range(3) if r not in used)                       # drawn row: lowest free
             self.pending[job] = dict(owner=m, row=row, t=t, seq=st["seq"])
-            st["beat"] = True                                                    # queue.go:559-561
+            st["beat"] = True                                                    # beat() in the pop (queue.go:1131-1134)
             slot = st["slots"].index(None)
             st["slots"][slot] = job
             self.set_busy(t, m, +1)
@@ -175,7 +175,7 @@ class Sim:
             self.at_(arrive + WORK[job], "job_end", m, slot, job)
         if POP > 1 and not self.lst and len(got) < want and st["consumer"]:     # batch idle rule (queue.go popHead)
             self.sadd(t, m, "short pop")
-        st["free"] = POP > 1 and not self.lst and len(got) < want                # distributed.go:72, 82
+        st["free"] = POP > 1 and not self.lst and len(got) < want                # queue.go:1020, 1163
         self.say(t, f"{m} pops {got} ({why}) -> pending {self.owners()}, list {self.lst}")
 
     def owners(self):
@@ -264,7 +264,7 @@ class Sim:
     def on_release(self, t, m):
         ids = sorted((p["seq"], j) for j, p in self.pending.items() if p["owner"] == m)   # table.sort: pop order
         for _, j in ids:
-            self.lst.insert(0, j)                                                # LPUSH each (queue.go:765)
+            self.lst.insert(0, j)                                                # LPUSH each (queue.go:1270)
         for _, j in ids:
             p = self.pending.pop(j)
             x = SLOT_X[self.lst.index(j)]
@@ -274,7 +274,7 @@ class Sim:
                               at(t + REL, x, LIST_Y, 1)]
             self.where[j].append((t, "list"))
             self.entries.append(dict(owner=m, row=p["row"], t=p["t"], end=t, how="release"))
-        self.c[m]["beat"] = False                    # ZREM heartbeat + presence (queue.go:860-869)
+        self.c[m]["beat"] = False                    # ZREM heartbeat + presence (queue.go:1371-1380)
         self.mark["release"] = (t, [j for _, j in ids], list(self.lst))
         self.say(t, f"{m} release script: LPUSH {[j for _, j in ids]} -> list {self.lst}; heartbeat, presence dropped")
         self.at_(t + REL, "release_wake", m, len(ids))
@@ -302,9 +302,9 @@ class Sim:
         r = next(r for r in self.runs if r["c"] == m and r["slot"] == slot and r["job"] == job and r["end"] is None)
         r["end"] = t
         if st["closed"]:
-            self.failed_acks.append((t, m, job))     # Acknowledge after Close fails (queue.go:355-357)
+            self.failed_acks.append((t, m, job))     # Acknowledge after Close fails (queue.go:526-529)
         else:
-            p = self.pending.pop(job)                # Acknowledge: HDEL + ZREM (queue.go:353-373)
+            p = self.pending.pop(job)                # Acknowledge: HDEL + ZREM (queue.go:502-504, 671-672)
             assert p["owner"] == m, (job, p, m)
             self.acks.append((t, m, job))
             self.items[job] += [at(t, ROW_X, ROW_Y[p["row"]], 1), at(t + .3, ROW_X, ROW_Y[p["row"]], 0)]
@@ -358,7 +358,7 @@ def consumer_svg(m, used_labels):
     for k, name in enumerate(STATES[m]):
         cls = "a m st st-on" if name in ("Close()",) else "a m st"
         g.append(f'    <text id="st-{m}-{k}" class="{cls}" x="922" y="{y0 + 17}">{name}</text>')
-    g.append(f'    <text class="m" x="754" y="{y0 + 34}" style="text-anchor:start">DistributedQueue · 3 slots</text>')
+    g.append(f'    <text class="m" x="754" y="{y0 + 34}" style="text-anchor:start">Queue · 3 slots</text>')
     for s in range(CONC):
         y = y0 + 51 + 16 * s
         g.append(f'    <rect class="track" x="786" y="{y - 2}" width="136" height="4" rx="2"/>')
@@ -403,7 +403,7 @@ def build():
     # ---------------- invariants (STORYBOARD.md section 3) ----------------
     close, (rel_t, rel_ids, rel_list) = s.mark["close"], s.mark["release"]
     wake_t, woken, spopped = s.mark["close_wake"]
-    # only J1's push wakes: n >= 1 every time, but :idle is empty for J2, J3 (distributed.go:9-11, notification.go:58-59)
+    # only J1's push wakes: n >= 1 every time, but :idle is empty for J2, J3 (queue.go:386-389, notification.go:60-61)
     assert s.push_wakes == [("J1", 1, 1), ("J2", 2, 0), ("J3", 3, 0)], s.push_wakes
     # a woken consumer pops while it has a free slot and Len() > 0: C2's one wake → J1-J3, one pop call per POP items.
     # varmq v1.9.0: ack sources never batch (source.go:127 maxBatch() == 1, source.go:136 Next → DequeueWithAckId;
@@ -415,15 +415,15 @@ def build():
     landed = {j: s.where[j][0][0] for j, _ in ENQ}                              # RPUSH instants
     assert s.wakes[0][1] == "C2" and s.wakes[0][0] + travel(WAKE_PATH["C2"], WAKE_V) > max(landed.values()), \
         "the whole burst is in the list before C2's wake arrives"
-    # full C2's nudge leaves it out of :idle (notification.go:74-77), so it is not there at Close; leave() runs
-    # before the release all the same (distributed.go:90-91, notification.go:218-221)
+    # full C2's nudge leaves it out of :idle (notification.go:76-79), so it is not there at Close; leave() runs
+    # before the release all the same (queue.go:1594-1596, notification.go:223-226)
     t_stay, busy_stay = s.mark["nudge-stays-C2"]
     assert busy_stay == CONC and t_stay < close, (t_stay, busy_stay)
     assert "C2" not in s.mark["idle_at_close"] and not s.mark["left"] and close < rel_t
     assert not [t for t, member, _ in s.idle_log["C2"] if member], "C2 never rejoins :idle while it holds jobs"
     assert all(t < close for t in s.c["C2"]["ticks"]), "no C2 nudge after Close"
     # the release: all of C2's entries in one script, LPUSH in pop order → J3 J2 J1 from the head; beat dropped
-    assert rel_ids == ["J1", "J2", "J3"] and rel_list == ["J3", "J2", "J1"], (rel_ids, rel_list)   # queue.go:860-869, 747
+    assert rel_ids == ["J1", "J2", "J3"] and rel_list == ["J3", "J2", "J1"], (rel_ids, rel_list)   # queue.go:1371-1380, 1270
     assert not s.c["C2"]["beat"]
     assert [e["how"] for e in s.entries if e["owner"] == "C2"] == ["release"] * 3
     # wake(3) can only reach C1: :idle == {C1} when it runs; woken 1, the second SPOP finds nothing
