@@ -12,6 +12,10 @@ type queues struct {
 	client    *redis.Client
 	namespace string
 
+	wf            *workflowStore // shared by every queue (see workflow.go)
+	wfResultLimit int            // WithWorkflowResultLimit; 0 = default
+	wfRetention   time.Duration  // WithWorkflowRetention; 0 = default
+
 	reportEvery time.Duration // WithInstanceReports; 0 = off
 	stopReports func()
 	reportsDone chan struct{}
@@ -69,6 +73,7 @@ func New(url string, options ...Option) Queues {
 	opts.DialerRetries = 1 // one dial attempt; a URL can't set this
 
 	qs.client = redis.NewClient(opts)
+	qs.wf = newWorkflowStore(qs)
 	if qs.reportEvery > 0 {
 		qs.startReports()
 	}
@@ -97,11 +102,11 @@ func (qs *queues) prefix() string {
 }
 
 func (qs *queues) NewQueue(queueKey string) *Queue {
-	return newQueue(qs.client, qs.key("fifo", queueKey))
+	return newQueue(qs.client, qs.key("fifo", queueKey), qs.wf)
 }
 
 func (qs *queues) NewPriorityQueue(queueKey string) *PriorityQueue {
-	return newPriorityQueue(qs.client, qs.key("prio", queueKey))
+	return newPriorityQueue(qs.client, qs.key("prio", queueKey), qs.wf)
 }
 
 // NewDistributedQueue is NewQueue.

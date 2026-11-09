@@ -56,10 +56,12 @@ type Queue struct {
 	rawKeys               []string                    // what Dequeue's scripts take
 	closeOnce             sync.Once
 	outcomes              outcomeWatchers // WatchOutcome watchers (see outcome.go)
+	wf                    *workflowStore  // the namespace's workflow store; nil for a queue made without one
 }
 
-func newQueue(c *redis.Client, queueKey string) *Queue {
+func newQueue(c *redis.Client, queueKey string, wf *workflowStore) *Queue {
 	q := newQueueBase(c, queueKey)
+	q.wf = wf
 	q.tickScript, q.releaseScript = listTick, listRelease
 	q.start()
 	return q
@@ -126,7 +128,10 @@ func (q *Queue) getVisibilityTimeout() time.Duration {
 	return time.Duration(q.visibilityTimeout.Load())
 }
 
-// SetExpiration sets the expiration time for the Queue
+// SetExpiration sets the expiration time for the Queue: each push of this
+// object renews it. Workflow pushes (Submit, promotions, Purge releases)
+// don't, so a workflow refuses a task on a queue object with an
+// expiration: an expired task would leave its workflow running forever.
 func (q *Queue) SetExpiration(expiration time.Duration) {
 	q.expiration.Store(int64(expiration))
 }
@@ -448,16 +453,6 @@ func (q *Queue) Len() int {
 	return q.Notification.len()
 }
 
-// Purge deletes all of the queue's jobs and job data in one step: waiting
-// and processing items (an Acknowledge or Reject of a purged item then does
-// nothing), deadlines, start times, attempt counts, Job Records, the :stats
-// counters, cancel marks, and a priority queue's sequence and priorities.
-// Consumer state stays (the idle set, heartbeats, presence), and so do
-// EnqueueOnce ids, which expire on their own (see EnqueueOnce).
-func (q *Queue) Purge() {
-	q.client.Del(q.ctx, append(q.requeueKeys(), q.getJobsKey(), q.getCompletedKey(), q.getFailedKey(), q.getStatsKey(), q.getCancelledKey())...)
-}
-
 func (q *Queue) Values() []any {
 	results, err := q.client.LRange(q.ctx, q.queueKey, 0, -1).Result()
 	if err != nil {
@@ -533,6 +528,18 @@ func (q *Queue) finish(ackID, state, reason string, result []byte) bool {
 		return false
 	}
 
+	keys, args := q.finishArgs(ackID, state, reason, result)
+	r, err := finishScript.Run(q.ctx, q.client, keys, args...).Int()
+	if err != nil {
+		log.Printf("Error finishing item as %s: %v", state, err)
+		return false
+	}
+	return r >= 0 // -1: result is not JSON
+}
+
+// finishArgs are finishScript's KEYS and ARGV (settleFn's too) for ending
+// ackID's job in state.
+func (q *Queue) finishArgs(ackID, state, reason string, result []byte) ([]string, []any) {
 	this, other := q.getCompletedKey(), q.getFailedKey()
 	keep, age := q.keepCompleted.Load(), q.keepCompletedAge.Load()
 	if state != "completed" {
@@ -540,12 +547,7 @@ func (q *Queue) finish(ackID, state, reason string, result []byte) bool {
 		keep, age = q.keepFailed.Load(), q.keepFailedAge.Load()
 	}
 	keys := []string{q.getNackedItemKey(), q.getTimeoutKey(), q.getStartedKey(), q.getAttemptsKey(), q.getStatsKey(), q.getJobsKey(), this, other, q.getPriorityKey(), q.getCancelledKey()}
-	r, err := finishScript.Run(q.ctx, q.client, keys, ackID, state, reason, keep, time.Duration(age).Milliseconds(), result, q.donePrefix()).Int()
-	if err != nil {
-		log.Printf("Error finishing item as %s: %v", state, err)
-		return false
-	}
-	return r >= 0 // -1: result is not JSON
+	return keys, []any{ackID, state, reason, keep, time.Duration(age).Milliseconds(), result, q.donePrefix()}
 }
 
 // SetCompletedRetention sets how many completed Job Records the queue keeps
@@ -567,12 +569,39 @@ func (q *Queue) SetFailedRetention(most int, age time.Duration) {
 }
 
 // envIDFn defines envid(v): the envelope id of item v, or empty when v is not
-// a JSON object with a string id. Items are only decoded, never re-encoded:
-// cjson.encode rounds numbers to 14 digits.
+// a JSON object with a string id, and the decoded envelope (nil when v is
+// not JSON). Items are only decoded, never re-encoded: cjson.encode rounds
+// numbers to 14 digits.
+//
+// It also defines wftag(e, id) (spec 3): whether envelope e, with id, holds
+// workflow fields a Submit could write: wf a workflow ID, task a task name,
+// undo absent, null (Go reads it as false) or a boolean, and id
+// wf:<wf>:<task> (":undo" appended for undo true). Mirrors varmq's taskTag.matches; anything else is a plain job
+// and no wf: key is built from it. Go's encoding/json matches keys without
+// case (and folds "ſ" to s, "K" to k), cjson does not: an envelope with
+// any such variant of id, wf, task or undo (wffold) reads differently in
+// varmq, so it is never a workflow item here and a cancel mark drops it.
 const envIDFn = `local function envid(v)
 	local ok, e = pcall(cjson.decode, v)
-	if ok and type(e) == 'table' and type(e.id) == 'string' then return e.id end
-	return ''
+	if ok and type(e) == 'table' and type(e.id) == 'string' then return e.id, e end
+	return '', (ok and e or nil)
+end
+local function wfname(s, n)
+	return type(s) == 'string' and #s >= 1 and #s <= n and string.find(s, '^[A-Za-z0-9_.%-]+$') ~= nil
+end
+local function wffold(k)
+	if type(k) ~= 'string' then return nil end
+	return string.lower((string.gsub(string.gsub(k, '\197\191', 's'), '\226\132\170', 'k')))
+end
+local function wftag(e, id)
+	if type(e) ~= 'table' or e.wf == nil then return false end
+	for k in pairs(e) do
+		local f = wffold(k)
+		if (f == 'id' or f == 'wf' or f == 'task' or f == 'undo') and k ~= f then return false end
+	end
+	if e.undo ~= nil and e.undo ~= cjson.null and type(e.undo) ~= 'boolean' then return false end
+	if not wfname(e.wf, 128) or e.wf == 'index' or not wfname(e.task, 64) then return false end
+	return id == 'wf:' .. e.wf .. ':' .. e.task .. (e.undo == true and ':undo' or '')
 end
 `
 
@@ -628,8 +657,14 @@ end
 // not (spec 6.13).
 //
 // The Job ID is the envelope id, else the ack ID. Record and outcome come
-// from recordFn.
-var finishScript = redis.NewScript(deadlineFn + envIDFn + asJSONFn + trimFn + recordFn + `if ARGV[6] ~= '' and not pcall(cjson.decode, ARGV[6]) then return -1 end
+// from recordFn. The body is settleFn's settlejob(), shared with FinishTask.
+var finishScript = redis.NewScript(settleFn + `return settlejob()`)
+
+// settleFn defines settlejob(), finishScript's body over KEYS[1..10] and
+// ARGV[1..7] (see finishScript), so FinishTask settles a workflow item with
+// the same code. It brings deadlineFn, envIDFn, asJSONFn, trimFn, recordFn.
+const settleFn = deadlineFn + envIDFn + asJSONFn + trimFn + recordFn + `local function settlejob()
+if ARGV[6] ~= '' and not pcall(cjson.decode, ARGV[6]) then return -1 end
 local item = redis.call('HGET', KEYS[1], ARGV[1])
 if not item then return 0 end
 local started = tonumber(redis.call('HGET', KEYS[3], ARGV[1]))
@@ -661,7 +696,9 @@ else
 end
 trim(KEYS[7], KEYS[6], keep, age, now)
 if env ~= '' then redis.call('PUBLISH', ARGV[7] .. env, outcome(env, ARGV[2], err, res)) end
-return 1`)
+return 1
+end
+`
 
 // trimScript trims both Job States (see trimFn), so an idle queue's records
 // still age out. KEYS: jobs, completed, failed. ARGV: most completed kept,
@@ -1399,6 +1436,9 @@ func (q *Queue) sweep() {
 		q.sweepOutcomes()
 		if i%60 == 0 { // ponytail: a minute is fine against hour-long ages
 			q.trim()
+			if q.wf != nil {
+				q.wf.trimIndex(q.ctx)
+			}
 		}
 	}
 }

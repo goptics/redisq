@@ -4,14 +4,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -2641,4 +2647,1096 @@ func TestEnqueueOnceDropsOldRecord(t *testing.T) {
 			assert.Equal(t, `"new"`, string(o.Result))
 		})
 	}
+}
+
+// wfTest is three queues of one fresh namespace and its workflow store:
+// a (fifo), b (prio) and c (fifo).
+type wfTest struct {
+	t     *testing.T
+	qs    Queues
+	store *workflowStore
+	a, c  *Queue
+	b     *PriorityQueue
+}
+
+func newWFTest(t *testing.T, opts ...Option) *wfTest {
+	qs := New(getTestRedisURL(), append([]Option{WithNamespace(newID())}, opts...)...)
+	e := &wfTest{t: t, qs: qs, store: qs.(*queues).wf, a: qs.NewQueue("a"), b: qs.NewPriorityQueue("b"), c: qs.NewQueue("c")}
+	t.Cleanup(func() {
+		e.a.Close()
+		e.b.Close()
+		e.c.Close()
+		qs.Close()
+	})
+	return e
+}
+
+func (e *wfTest) all() []*Queue { return []*Queue{e.a, e.b.Queue, e.c} }
+
+// tk is one task of a test plan: queue q (*Queue or *PriorityQueue), deps,
+// policy, priority and an undo queue (nil: none). data is its JSON data,
+// the name as a string when empty.
+type tk struct {
+	name   string
+	q      any
+	deps   []string
+	always bool
+	prio   int
+	undo   any
+	data   string
+}
+
+func idOf(q any) string {
+	if pq, ok := q.(*PriorityQueue); ok {
+		return pq.queueKey
+	}
+	return q.(*Queue).queueKey
+}
+
+// wfEnvelope is the envelope varmq writes for task (undo: its undo).
+func wfEnvelope(wf, task string, undo bool, data string) []byte {
+	id, u := "wf:"+wf+":"+task, ""
+	if undo {
+		id, u = id+":undo", `,"undo":true`
+	}
+	return fmt.Appendf(nil, `{"id":%q,"status":"Created","data":%s,"enqueued_at":1762228800000,"wf":%q,"task":%q%s}`, id, data, wf, task, u)
+}
+
+func wfPlan(id string, failFast, undoOnCancel bool, tasks ...tk) contract.WorkflowPlan {
+	p := contract.WorkflowPlan{ID: id, FailFast: failFast, UndoOnCancel: undoOnCancel, Hash: "hash-" + id}
+	for _, x := range tasks {
+		data := x.data
+		if data == "" {
+			data = strconv.Quote(x.name)
+		}
+		jid := "wf:" + id + ":" + x.name
+		tp := contract.TaskPlan{Name: x.name, JobID: jid, QueueID: idOf(x.q), Queue: x.q, Priority: x.prio,
+			HasPriority: x.prio != 0, Deps: x.deps, Always: x.always, Item: wfEnvelope(id, x.name, false, data)}
+		if x.undo != nil {
+			tp.Undo = &contract.UndoPlan{JobID: jid + ":undo", QueueID: idOf(x.undo), Queue: x.undo,
+				Item: wfEnvelope(id, x.name, true, `{"big":12345678901234567890}`)}
+		}
+		p.Tasks = append(p.Tasks, tp)
+	}
+	return p
+}
+
+// wfPopped is one workflow item a test consumer took.
+type wfPopped struct {
+	q        *Queue
+	ack      string
+	raw      []byte
+	wf, task string
+	undo     bool
+}
+
+func wfPop(t *testing.T, q *Queue) (wfPopped, bool) {
+	t.Helper()
+	var v any
+	var ok bool
+	var ack string
+	if q.isPriority {
+		v, ok, ack = (&PriorityQueue{q}).DequeueWithAckId()
+	} else {
+		v, ok, ack = q.DequeueWithAckId()
+	}
+	if !ok {
+		return wfPopped{}, false
+	}
+	var env struct {
+		WF   string `json:"wf"`
+		Task string `json:"task"`
+		Undo bool   `json:"undo"`
+	}
+	require.NoError(t, json.Unmarshal(v.([]byte), &env))
+	return wfPopped{q, ack, v.([]byte), env.WF, env.Task, env.Undo}, true
+}
+
+// label is "task" or "task:undo".
+func (p wfPopped) label() string {
+	if p.undo {
+		return p.task + ":undo"
+	}
+	return p.task
+}
+
+// finish ends p as a varmq worker does: pre-run check first (not runnable:
+// cancelled, unrun), else run's outcome. It reports whether p ran.
+func (e *wfTest) finish(p wfPopped, run func(p wfPopped) (contract.Outcome, []byte)) bool {
+	e.t.Helper()
+	end := contract.TaskEnd{Workflow: p.wf, Task: p.task, Undo: p.undo, Outcome: contract.OutcomeCancelled, Reason: "workflow cancelled"}
+	ok, err := e.store.Runnable(e.t.Context(), p.wf, p.task, p.undo)
+	if !errors.Is(err, contract.ErrWorkflowNotFound) {
+		require.NoError(e.t, err)
+	}
+	if ok {
+		end.Outcome, end.Result = run(p)
+		end.Reason = ""
+		if end.Outcome != contract.OutcomeCompleted {
+			end.Reason = p.label() + " broke"
+		}
+	}
+	_, done := p.q.FinishTask(p.ack, end)
+	require.True(e.t, done)
+	return ok
+}
+
+// drain pops and finishes every item of the test queues until they stay
+// empty; it returns the labels of the items that ran, in run order.
+func (e *wfTest) drain(run func(p wfPopped) (contract.Outcome, []byte)) []string {
+	e.t.Helper()
+	var ran []string
+	for more := true; more; {
+		more = false
+		for _, q := range e.all() {
+			for p, ok := wfPop(e.t, q); ok; p, ok = wfPop(e.t, q) {
+				more = true
+				if e.finish(p, run) {
+					ran = append(ran, p.label())
+				}
+			}
+		}
+	}
+	return ran
+}
+
+// completeAll completes every task, its result `"<label>"`.
+func completeAll(p wfPopped) (contract.Outcome, []byte) {
+	return contract.OutcomeCompleted, []byte(strconv.Quote(p.label()))
+}
+
+// failing completes every task but those named, which fail.
+func failing(names ...string) func(wfPopped) (contract.Outcome, []byte) {
+	return func(p wfPopped) (contract.Outcome, []byte) {
+		if slices.Contains(names, p.label()) {
+			return contract.OutcomeFailed, nil
+		}
+		return completeAll(p)
+	}
+}
+
+func (e *wfTest) record(id string) contract.WorkflowRecord {
+	e.t.Helper()
+	r, err := e.store.Record(e.t.Context(), id)
+	require.NoError(e.t, err)
+	return r
+}
+
+func taskStates(r contract.WorkflowRecord) map[string]contract.JobState {
+	m := map[string]contract.JobState{}
+	for _, t := range r.Tasks {
+		m[t.Name] = t.State
+		if t.Undo != nil {
+			m[t.Name+":undo"] = t.Undo.State
+		}
+	}
+	return m
+}
+
+// A DAG across a fifo, a priority and another fifo queue runs in
+// dependency order; results, records, items and counters are as submitted.
+func TestWorkflowDAGAcrossQueues(t *testing.T) {
+	e := newWFTest(t)
+	ctx := t.Context()
+	p := wfPlan("dag", false, true,
+		tk{name: "a", q: e.a, data: `{"n":12345678901234567890}`},
+		tk{name: "b", q: e.b, deps: []string{"a"}, prio: 3},
+		tk{name: "c", q: e.c, deps: []string{"a"}},
+		tk{name: "d", q: e.a, deps: []string{"b", "c"}},
+	)
+	require.NoError(t, e.store.Submit(ctx, p))
+	require.NoError(t, e.store.Submit(ctx, p), "same plan again: success")
+	assert.EqualValues(t, 1, e.a.client.LLen(ctx, e.a.queueKey).Val(), "root pushed once")
+
+	q := p
+	q.Hash = "other"
+	assert.ErrorIs(t, e.store.Submit(ctx, q), contract.ErrWorkflowExists)
+
+	// The root's item is the submitted bytes, and nothing else is queued.
+	a, ok := wfPop(t, e.a)
+	require.True(t, ok)
+	assert.Equal(t, string(p.Tasks[0].Item.([]byte)), string(a.raw))
+	for _, q := range []*Queue{e.b.Queue, e.c} {
+		_, ok := wfPop(t, q)
+		assert.False(t, ok, "dependents wait in the workflow")
+	}
+	run, err := e.store.Runnable(ctx, "dag", "a", false)
+	require.NoError(t, err)
+	assert.True(t, run)
+	pushed, ok := e.a.FinishTask(a.ack, contract.TaskEnd{Workflow: "dag", Task: "a", Outcome: contract.OutcomeCompleted, Result: []byte(`{"url":"s3://x"}`)})
+	require.True(t, ok)
+	assert.Equal(t, []string{e.b.queueKey, e.c.queueKey}, pushed)
+
+	res, err := e.store.DepResult(ctx, "dag", "a")
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"url":"s3://x"}`, string(res))
+	_, err = e.store.DepResult(ctx, "dag", "b")
+	assert.ErrorIs(t, err, contract.ErrNoResult, "not ended yet")
+
+	ran := e.drain(completeAll)
+	assert.Equal(t, []string{"b", "c", "d"}, ran)
+
+	r := e.record("dag")
+	assert.Equal(t, contract.WorkflowCompleted, r.State)
+	assert.NotZero(t, r.CreatedAt)
+	assert.GreaterOrEqual(t, r.FinishedAt, r.CreatedAt)
+	assert.True(t, r.UndoOnCancel)
+	require.Len(t, r.Tasks, 4)
+	assert.Equal(t, contract.TaskRecord{Name: "d", State: contract.JobCompleted, Deps: []string{"b", "c"},
+		QueueID: e.a.queueKey, JobID: "wf:dag:d", ResultSize: len(`"d"`)}, r.Tasks[3])
+	assert.Equal(t, e.b.queueKey, r.Tasks[1].QueueID)
+
+	// Each task left a completed record in its queue and was counted.
+	assert.Equal(t, []any{"2", "2"}, e.a.client.HMGet(ctx, e.a.getStatsKey(), "submitted", "completed").Val(), "a and d")
+	rec := e.b.client.HGet(ctx, e.b.getJobsKey(), "wf:dag:b").Val()
+	assert.Contains(t, rec, `"result":"b"`)
+
+	// A late copy of an ended task settles and changes nothing.
+	require.True(t, e.a.Enqueue(wfEnvelope("dag", "a", false, "1")))
+	late, ok := wfPop(t, e.a)
+	require.True(t, ok)
+	pushed, ok = e.a.FinishTask(late.ack, contract.TaskEnd{Workflow: "dag", Task: "a", Outcome: contract.OutcomeFailed, Reason: "late"})
+	require.True(t, ok)
+	assert.Empty(t, pushed)
+	assert.Equal(t, r, e.record("dag"))
+
+	ttl := e.a.client.PTTL(ctx, e.store.key("dag")).Val()
+	assert.Greater(t, ttl, 6*24*time.Hour, "ended: expires after the retention")
+	_, err = e.store.Record(ctx, "nope")
+	assert.ErrorIs(t, err, contract.ErrWorkflowNotFound)
+}
+
+// B fails under an Always D: absorbed, so the workflow completes and D
+// sees B failed.
+func TestWorkflowDiamondAlways(t *testing.T) {
+	e := newWFTest(t)
+	require.NoError(t, e.store.Submit(t.Context(), wfPlan("diamond", false, true,
+		tk{name: "A", q: e.a},
+		tk{name: "B", q: e.b, deps: []string{"A"}},
+		tk{name: "C", q: e.c, deps: []string{"A"}},
+		tk{name: "D", q: e.a, deps: []string{"B", "C"}, always: true},
+	)))
+	var bErr, cErr error
+	ran := e.drain(func(p wfPopped) (contract.Outcome, []byte) {
+		if p.task == "D" {
+			_, bErr = e.store.DepResult(t.Context(), "diamond", "B")
+			_, cErr = e.store.DepResult(t.Context(), "diamond", "C")
+		}
+		return failing("B")(p)
+	})
+	assert.ElementsMatch(t, []string{"A", "B", "C", "D"}, ran)
+	assert.ErrorIs(t, bErr, contract.ErrDepFailed)
+	assert.NoError(t, cErr)
+	r := e.record("diamond")
+	assert.Equal(t, contract.WorkflowCompleted, r.State, "B's failure is absorbed by Always D")
+	assert.Equal(t, contract.JobFailed, r.Tasks[1].State)
+	assert.Equal(t, "B broke", r.Tasks[1].Reason)
+	assert.Equal(t, contract.JobCompleted, r.Tasks[3].State)
+}
+
+// FailFast: the first unabsorbed failure cancels every waiting task but the
+// failed task's Always dependents; a queued task not yet started is
+// stopped by the pre-run check.
+func TestWorkflowFailFast(t *testing.T) {
+	e := newWFTest(t)
+	require.NoError(t, e.store.Submit(t.Context(), wfPlan("ff", true, true,
+		tk{name: "a", q: e.a},
+		tk{name: "b", q: e.c},
+		tk{name: "c", q: e.a, deps: []string{"a"}},
+		tk{name: "e", q: e.b, deps: []string{"a"}, always: true},
+		tk{name: "d", q: e.c, deps: []string{"b"}},
+	)))
+	ran := e.drain(failing("a"))
+	assert.Equal(t, []string{"a", "e"}, ran, "b was queued, stopped unrun")
+	r := e.record("ff")
+	assert.Equal(t, contract.WorkflowFailed, r.State)
+	assert.Equal(t, map[string]contract.JobState{"a": contract.JobFailed, "b": contract.JobCancelled,
+		"c": contract.JobCancelled, "e": contract.JobCompleted, "d": contract.JobCancelled}, taskStates(r))
+}
+
+// A failure compensates in saga order: b's undo first, then a's; the undo
+// envelope is pushed byte for byte. A failed undo ends compensation_failed
+// with its reason.
+func TestWorkflowUndo(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		fail  []string
+		state contract.WorkflowState
+	}{
+		{"compensated", []string{"c"}, contract.WorkflowCompensated},
+		{"undo fails", []string{"c", "b:undo"}, contract.WorkflowCompensationFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newWFTest(t)
+			p := wfPlan("saga", false, true,
+				tk{name: "a", q: e.a, undo: e.b},
+				tk{name: "b", q: e.c, deps: []string{"a"}, undo: e.c},
+				tk{name: "c", q: e.a, deps: []string{"b"}},
+			)
+			require.NoError(t, e.store.Submit(t.Context(), p))
+			var undoRaw []byte
+			ran := e.drain(func(p wfPopped) (contract.Outcome, []byte) {
+				if p.label() == "a:undo" {
+					undoRaw = p.raw
+				}
+				return failing(tc.fail...)(p)
+			})
+			assert.Equal(t, []string{"a", "b", "c", "b:undo", "a:undo"}, ran)
+			assert.Equal(t, string(p.Tasks[0].Undo.Item.([]byte)), string(undoRaw), "undo envelope verbatim")
+			r := e.record("saga")
+			assert.Equal(t, tc.state, r.State)
+			assert.Equal(t, idOf(e.b), r.Tasks[0].Undo.QueueID)
+			assert.Equal(t, "wf:saga:a:undo", r.Tasks[0].Undo.JobID)
+			if tc.state == contract.WorkflowCompensationFailed {
+				assert.Equal(t, contract.JobFailed, r.Tasks[1].Undo.State)
+				assert.Equal(t, "b:undo broke", r.Tasks[1].Undo.Reason)
+				assert.Equal(t, contract.JobCompleted, r.Tasks[0].Undo.State, "a failed undo does not stop the others")
+			}
+			assert.Nil(t, r.Tasks[2].Undo)
+		})
+	}
+}
+
+// Cancel cancels waiting tasks at once and queued ones at their pre-run
+// check; compensation follows undo_on_cancel unless Cancel overrides it.
+func TestWorkflowCancel(t *testing.T) {
+	no := false
+	for _, tc := range []struct {
+		name  string
+		undo  *bool
+		state contract.WorkflowState
+		ran   []string
+	}{
+		{"with undo", nil, contract.WorkflowCompensated, []string{"a:undo"}},
+		{"without undo", &no, contract.WorkflowCancelled, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newWFTest(t)
+			ctx := t.Context()
+			require.NoError(t, e.store.Submit(ctx, wfPlan("cx", false, true,
+				tk{name: "a", q: e.a, undo: e.c},
+				tk{name: "b", q: e.b, deps: []string{"a"}},
+				tk{name: "c", q: e.c},
+				tk{name: "d", q: e.a, deps: []string{"b"}},
+			)))
+			a, ok := wfPop(t, e.a)
+			require.True(t, ok)
+			require.True(t, e.finish(a, completeAll))
+
+			require.NoError(t, e.store.Cancel(ctx, "cx", tc.undo))
+			require.NoError(t, e.store.Cancel(ctx, "cx", nil), "again: no change")
+			r := e.record("cx")
+			assert.Equal(t, contract.WorkflowRunning, r.State, "b and c still queued")
+			assert.Equal(t, contract.JobCancelled, r.Tasks[3].State)
+			assert.Equal(t, tc.undo == nil, r.UndoOnCancel)
+
+			assert.Equal(t, tc.ran, e.drain(completeAll))
+			r = e.record("cx")
+			assert.Equal(t, tc.state, r.State)
+			assert.Equal(t, contract.JobCancelled, r.Tasks[1].State)
+			assert.Equal(t, "workflow cancelled", r.Tasks[1].Reason)
+			assert.ErrorIs(t, e.store.Cancel(ctx, "nope", nil), contract.ErrWorkflowNotFound)
+		})
+	}
+}
+
+// A Cancel after an unabsorbed failure keeps that failure's compensation,
+// even with undo off.
+func TestWorkflowCancelAfterFailure(t *testing.T) {
+	e := newWFTest(t)
+	ctx := t.Context()
+	require.NoError(t, e.store.Submit(ctx, wfPlan("cf", false, false,
+		tk{name: "a", q: e.a, undo: e.c}, tk{name: "b", q: e.b}, tk{name: "c", q: e.c})))
+	for _, q := range []*Queue{e.a, e.b.Queue} {
+		p, ok := wfPop(t, q)
+		require.True(t, ok)
+		require.True(t, e.finish(p, failing("b")))
+	}
+	no := false
+	require.NoError(t, e.store.Cancel(ctx, "cf", &no))
+	assert.Equal(t, []string{"a:undo"}, e.drain(completeAll), "c stopped unrun, then a undone")
+	r := e.record("cf")
+	assert.Equal(t, contract.WorkflowCompensated, r.State)
+	assert.Equal(t, contract.JobCancelled, r.Tasks[2].State)
+}
+
+// A FinishTask whose reply was lost, re-sent, changes nothing and names
+// every push-target queue; a consumer that crashed before finishing has
+// its item requeued and run elsewhere. Either way b is pushed and runs once.
+func TestWorkflowLostFinish(t *testing.T) {
+	end := contract.TaskEnd{Workflow: "cr", Task: "a", Outcome: contract.OutcomeCompleted}
+	t.Run("reply lost", func(t *testing.T) {
+		e := newWFTest(t)
+		require.NoError(t, e.store.Submit(t.Context(), wfPlan("cr", false, true,
+			tk{name: "a", q: e.a, undo: e.c}, tk{name: "b", q: e.b, deps: []string{"a"}})))
+		a, ok := wfPop(t, e.a)
+		require.True(t, ok)
+		pushed, ok := e.a.FinishTask(a.ack, end)
+		require.True(t, ok)
+		assert.Equal(t, []string{e.b.queueKey}, pushed)
+		pushed, ok = e.a.FinishTask(a.ack, end)
+		require.True(t, ok)
+		assert.Equal(t, []string{e.a.queueKey, e.c.queueKey, e.b.queueKey}, pushed, "every push-target queue")
+		assert.Equal(t, []string{"b"}, e.drain(completeAll))
+	})
+	t.Run("crash before finish", func(t *testing.T) {
+		e := newWFTest(t)
+		require.NoError(t, e.store.Submit(t.Context(), wfPlan("cr", false, true,
+			tk{name: "a", q: e.a}, tk{name: "b", q: e.b, deps: []string{"a"}})))
+		crashed := e.qs.NewQueue("a")
+		a, ok := wfPop(t, crashed)
+		require.True(t, ok)
+		require.NoError(t, crashed.Close(), "requeues a")
+		assert.Equal(t, []string{"a", "b"}, e.drain(completeAll))
+		assert.Equal(t, contract.WorkflowCompleted, e.record("cr").State)
+		// The crashed consumer's late finish finds nothing to do.
+		_, ok = e.a.FinishTask(a.ack, end)
+		assert.True(t, ok)
+		assert.Empty(t, e.drain(completeAll))
+	})
+}
+
+// Purge cancels the workflow tasks it removes, queued or processing, and
+// pushes what that releases after the delete, even into the purged queue.
+func TestWorkflowPurgeCancels(t *testing.T) {
+	e := newWFTest(t)
+	ctx := t.Context()
+	require.NoError(t, e.store.Submit(ctx, wfPlan("p1", false, true,
+		tk{name: "a", q: e.a}, tk{name: "b", q: e.b, deps: []string{"a"}})))
+	require.NoError(t, e.store.Submit(ctx, wfPlan("p2", false, true,
+		tk{name: "a", q: e.a}, tk{name: "x", q: e.c}, tk{name: "b", q: e.a, deps: []string{"a", "x"}, always: true})))
+	require.True(t, e.a.Enqueue(`{"id":"wf:p1:zz","wf":"p1","task":"zz"}`), "a foreign task of p1: plain job")
+	held, ok := wfPop(t, e.a) // p1's a, processing
+	require.True(t, ok)
+	require.Equal(t, "p1", held.wf)
+
+	e.a.Purge()
+	r := e.record("p1")
+	assert.Equal(t, contract.WorkflowFailed, r.State, "a purge before Cancel counts as a failure")
+	assert.Equal(t, map[string]contract.JobState{"a": contract.JobCancelled, "b": contract.JobCancelled}, taskStates(r))
+	assert.Equal(t, "queue purged", r.Tasks[0].Reason)
+	_, done := e.a.FinishTask(held.ack, contract.TaskEnd{Workflow: "p1", Task: "a", Outcome: contract.OutcomeCompleted})
+	assert.True(t, done, "a finish of a purged item does nothing")
+
+	r = e.record("p2")
+	assert.Equal(t, contract.JobCancelled, r.Tasks[0].State)
+	assert.Equal(t, contract.JobWaiting, r.Tasks[2].State, "b waits for x")
+	assert.Equal(t, []string{"x", "b"}, e.drain(completeAll), "b pushed into a after the purge")
+	assert.Equal(t, contract.WorkflowCompleted, e.record("p2").State, "a's cancel is absorbed by Always b")
+
+	// A priority queue: its members carry the sequence prefix.
+	require.NoError(t, e.store.Submit(ctx, wfPlan("p3", false, true,
+		tk{name: "a", q: e.b, prio: 2}, tk{name: "b", q: e.c, deps: []string{"a"}, always: true})))
+	e.b.Purge()
+	r = e.record("p3")
+	assert.Equal(t, contract.JobCancelled, r.Tasks[0].State)
+	assert.Equal(t, []string{"b"}, e.drain(completeAll))
+	assert.Equal(t, contract.WorkflowCompleted, e.record("p3").State)
+
+	// A queue with no workflow item purges in one call.
+	require.True(t, e.c.Enqueue("plain"))
+	e.c.Purge()
+	assert.Zero(t, e.c.client.LLen(ctx, e.c.queueKey).Val())
+}
+
+// Listing pages wf:index newest first, ties by ID, with a state filter.
+func TestWorkflowListing(t *testing.T) {
+	e := newWFTest(t)
+	ctx := t.Context()
+	for _, id := range []string{"w1", "w2", "w3", "w4", "w5"} {
+		require.NoError(t, e.store.Submit(ctx, wfPlan(id, false, true, tk{name: "a", q: e.a})))
+	}
+	// Fix the times: w5 newest, w2 and w3 tied.
+	for id, at := range map[string]float64{"w1": 100, "w2": 200, "w3": 200, "w4": 300, "w5": 400} {
+		require.NoError(t, e.a.client.ZAdd(ctx, e.store.indexKey(), redis.Z{Score: at, Member: id}).Err())
+	}
+	// w4 completes.
+	for p, ok := wfPop(t, e.a); ok; p, ok = wfPop(t, e.a) {
+		out := contract.OutcomeFailed
+		if p.wf == "w4" {
+			out = contract.OutcomeCompleted
+		}
+		_, done := e.a.FinishTask(p.ack, contract.TaskEnd{Workflow: p.wf, Task: p.task, Outcome: out})
+		require.True(t, done)
+	}
+	ids := func(state contract.WorkflowState, offset, limit int) []string {
+		keys, err := e.store.WorkflowKeys(ctx, state, offset, limit)
+		require.NoError(t, err)
+		var out []string
+		for _, k := range keys {
+			out = append(out, k.ID)
+		}
+		return out
+	}
+	assert.Equal(t, []string{"w5", "w4", "w2", "w3", "w1"}, ids("", 0, 10))
+	assert.Equal(t, []string{"w4", "w2"}, ids("", 1, 2))
+	assert.Equal(t, []string{"w3"}, ids("", 3, 1), "tie across the page edge")
+	assert.Equal(t, []string{"w5", "w2", "w3", "w1"}, ids(contract.WorkflowFailed, 0, 10))
+	assert.Equal(t, []string{"w3", "w1"}, ids(contract.WorkflowFailed, 2, 5))
+	assert.Empty(t, ids(contract.WorkflowRunning, 0, 10))
+	assert.Empty(t, ids("", 0, 0))
+	assert.Equal(t, []string{"w2", "w3", "w1"}, ids("", 2, math.MaxInt), "no overflow")
+
+	recs, err := e.store.Workflows(ctx, contract.WorkflowCompleted, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, recs, 1)
+	assert.Equal(t, "w4", recs[0].ID)
+	keys, err := e.store.WorkflowKeys(ctx, contract.WorkflowCompleted, 0, 1)
+	require.NoError(t, err)
+	assert.Equal(t, []contract.WorkflowKey{{ID: "w4", CreatedAt: 300}}, keys)
+
+	// A gone hash is skipped; the index trim drops old entries.
+	require.NoError(t, e.a.client.Del(ctx, e.store.key("w5")).Err())
+	assert.Equal(t, []string{"w4", "w2"}, ids("", 0, 2))
+	e.store.trimIndex(ctx)
+	assert.Equal(t, []string{"w4", "w3", "w2", "w1"}, e.a.client.ZRevRange(ctx, e.store.indexKey(), 0, -1).Val(),
+		"all older than the retention; only w5, whose hash is gone, leaves")
+}
+
+// Submit refuses a plan with no task, a bad ID or name, a queue of another
+// scope, or an item that is not an envelope.
+func TestWorkflowSubmitRefuses(t *testing.T) {
+	e := newWFTest(t)
+	ctx := t.Context()
+	other := New(getTestRedisURL(), WithNamespace(newID()))
+	defer other.Close()
+	foreign := other.NewQueue("a")
+	defer foreign.Close()
+
+	assert.Error(t, e.store.Submit(ctx, contract.WorkflowPlan{ID: "empty"}))
+	assert.Error(t, e.store.Submit(ctx, wfPlan("index", false, false, tk{name: "a", q: e.a})))
+	assert.Error(t, e.store.Submit(ctx, wfPlan("ok", false, false, tk{name: "a:b", q: e.a})))
+	assert.ErrorIs(t, e.store.Submit(ctx, wfPlan("ok", false, false, tk{name: "a", q: foreign})), contract.ErrScopeMismatch)
+	assert.ErrorIs(t, e.store.Submit(ctx, wfPlan("ok", false, false, tk{name: "a", q: e.a, undo: foreign})), contract.ErrScopeMismatch)
+	p := wfPlan("ok", false, false, tk{name: "a", q: e.a})
+	p.Tasks[0].Item = []byte("not json")
+	assert.Error(t, e.store.Submit(ctx, p))
+	assert.Zero(t, e.a.client.Exists(ctx, e.store.key("ok")).Val())
+
+	assert.Equal(t, e.store.ScopeID(), e.b.ScopeID())
+	assert.NotEqual(t, e.store.ScopeID(), foreign.ScopeID())
+	assert.Same(t, e.store, e.a.WorkflowStore())
+	assert.Nil(t, newQueueBase(e.a.client, "x").WorkflowStore(), "no store: untyped nil")
+}
+
+// A result over the limit fails the task; one that is not JSON is
+// dropped; a task at the limit keeps its result.
+func TestWorkflowResults(t *testing.T) {
+	e := newWFTest(t, WithWorkflowResultLimit(8))
+	require.NoError(t, e.store.Submit(t.Context(), wfPlan("res", false, true,
+		tk{name: "big", q: e.a}, tk{name: "small", q: e.a}, tk{name: "bad", q: e.a},
+		tk{name: "next", q: e.c, deps: []string{"big"}, always: true})))
+	e.drain(func(p wfPopped) (contract.Outcome, []byte) {
+		switch p.task {
+		case "big":
+			return contract.OutcomeCompleted, []byte(`"0123456789"`)
+		case "bad":
+			return contract.OutcomeCompleted, []byte(`{nope`)
+		}
+		return contract.OutcomeCompleted, []byte(`[[[12]]]`) // exactly the limit
+	})
+	r := e.record("res")
+	assert.Equal(t, contract.WorkflowCompleted, r.State, "big's failure is absorbed by Always next")
+	assert.Equal(t, contract.JobFailed, r.Tasks[0].State)
+	assert.Equal(t, contract.ErrResultTooLarge.Error(), r.Tasks[0].Reason)
+	assert.Equal(t, contract.JobCompleted, r.Tasks[1].State)
+	assert.Equal(t, 8, r.Tasks[1].ResultSize)
+	assert.Equal(t, contract.JobCompleted, r.Tasks[2].State)
+	assert.Zero(t, r.Tasks[2].ResultSize)
+	_, err := e.store.DepResult(t.Context(), "res", "big")
+	assert.ErrorIs(t, err, contract.ErrDepFailed)
+}
+
+// A workflow that ended and expired: a late item is settled with no
+// workflow step; the pre-run check reports it gone.
+func TestWorkflowExpired(t *testing.T) {
+	e := newWFTest(t, WithWorkflowRetention(50*time.Millisecond))
+	ctx := t.Context()
+	require.NoError(t, e.store.Submit(ctx, wfPlan("gone", false, true, tk{name: "a", q: e.a})))
+	a, ok := wfPop(t, e.a)
+	require.True(t, ok)
+	require.True(t, e.finish(a, completeAll))
+	require.Eventually(t, func() bool { return e.a.client.Exists(ctx, e.store.key("gone")).Val() == 0 }, 2*time.Second, 10*time.Millisecond)
+
+	require.True(t, e.a.Enqueue(wfEnvelope("gone", "a", false, "1")), "a redelivered copy")
+	a, ok = wfPop(t, e.a)
+	require.True(t, ok)
+	_, err := e.store.Runnable(ctx, "gone", "a", false)
+	assert.ErrorIs(t, err, contract.ErrWorkflowNotFound)
+	pushed, ok := e.a.FinishTask(a.ack, contract.TaskEnd{Workflow: "gone", Task: "a", Outcome: contract.OutcomeCancelled})
+	assert.True(t, ok)
+	assert.Empty(t, pushed)
+	assert.Zero(t, e.a.GetNackedItemsCount(), "settled")
+}
+
+// A workflow item in a queue its workflow does not use, or naming a task
+// it does not have, is settled with no workflow step.
+func TestWorkflowForeignItem(t *testing.T) {
+	e := newWFTest(t)
+	require.NoError(t, e.store.Submit(t.Context(), wfPlan("fx", false, true,
+		tk{name: "a", q: e.a}, tk{name: "b", q: e.a, deps: []string{"a"}})))
+	require.True(t, e.c.Enqueue(wfEnvelope("fx", "a", false, "1")))
+	p, ok := wfPop(t, e.c)
+	require.True(t, ok)
+	pushed, ok := e.c.FinishTask(p.ack, contract.TaskEnd{Workflow: "fx", Task: "a", Outcome: contract.OutcomeCompleted})
+	assert.True(t, ok)
+	assert.Empty(t, pushed)
+	assert.Equal(t, contract.JobPending, e.record("fx").Tasks[0].State)
+
+	require.True(t, e.a.Enqueue(`{"id":"x"}`))
+	p, ok = wfPop(t, e.a) // the real a first
+	require.True(t, ok)
+	q, ok := wfPop(t, e.a)
+	require.True(t, ok)
+	_, ok = e.a.FinishTask(q.ack, contract.TaskEnd{Workflow: "bad id!", Task: "a", Outcome: contract.OutcomeCompleted})
+	assert.True(t, ok, "invalid tag: settled as a plain job")
+	assert.Equal(t, []string{"b"}, func() []string {
+		require.True(t, e.finish(p, completeAll))
+		return e.drain(completeAll)
+	}())
+}
+
+// The cancel pop gate hands out a valid workflow item and keeps its mark;
+// an item with crafted workflow fields is checked as a plain job.
+func TestCancelGateWorkflowItem(t *testing.T) {
+	e := newWFTest(t)
+	q := e.a
+	items := map[string]string{
+		"wf:w:a":      string(wfEnvelope("w", "a", false, "1")),
+		"wf:w:a:undo": string(wfEnvelope("w", "a", true, "1")),
+		"wf:w:b":      `{"id":"wf:w:b","wf":"w"}`,                           // no task
+		"wf:w:c":      `{"id":"wf:w:c","wf":"w","task":"c","undo":"yes"}`,   // undo not a bool
+		"wf:x:d":      `{"id":"wf:x:d","wf":"w","task":"d"}`,                // id names another workflow
+		"wf:w:e:undo": `{"id":"wf:w:e:undo","wf":"w","task":"e"}`,           // undo id without undo
+		"wf:index:f":  `{"id":"wf:index:f","wf":"index","task":"f"}`,        // reserved ID
+		"wf:w:g":      `{"id":"wf:w:g","wf":null,"task":"g"}`,               // null wf
+		"wf:w:h":      `{"id":"wf:w:h","wf":"w","task":"h","WF":""}`,        // Go reads WF: a plain job there
+		"wf:w:i":      `{"id":"wf:w:i","wf":"w","task":"i","tas\u212a":""}`, // Kelvin sign k: Go folds it
+		"wf:w:j":      `{"id":"wf:w:j","wf":"w","task":"j","ID":"x"}`,       // Go reads ID
+		"wf:w:k":      `{"id":"wf:w:k","wf":"w","task":"k","undo":null}`,    // null undo: Go reads false, valid
+	}
+	for id, v := range items {
+		require.NoError(t, q.CancelJob(id))
+		require.True(t, q.Enqueue(v))
+	}
+	var got []string
+	for p, ok := wfPop(t, q); ok; p, ok = wfPop(t, q) {
+		got = append(got, envID(t, p.raw))
+	}
+	assert.ElementsMatch(t, []string{"wf:w:a", "wf:w:a:undo", "wf:w:k"}, got)
+	assert.True(t, marked(t, q, "wf:w:a"), "a handed-out workflow item keeps its mark")
+	assert.False(t, marked(t, q, "wf:w:b"))
+}
+
+// Two varmq worker processes, each serving part of the queues, and a
+// producer process run one workflow end to end (examples/workflow).
+func TestWorkflowTwoProcesses(t *testing.T) {
+	if _, err := exec.LookPath("go"); testing.Short() || err != nil {
+		t.Skip("builds examples/workflow with the go tool")
+	}
+	bin := filepath.Join(t.TempDir(), "workflow")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = filepath.Join("examples", "workflow")
+	out, err := build.CombinedOutput()
+	if err != nil && strings.Contains(string(out), "requires go >=") {
+		t.Skipf("examples/workflow needs a newer go: %s", out) // CI on go.mod's go with GOTOOLCHAIN=local
+	}
+	require.NoError(t, err, string(out))
+
+	env := append(os.Environ(), "REDIS_URL="+getTestRedisURL(), "REDIS_NS="+newID())
+	var logs [2]bytes.Buffer
+	var workers []*exec.Cmd
+	stop := func() {
+		for _, w := range workers {
+			_ = w.Process.Signal(syscall.SIGTERM)
+			_ = w.Wait()
+		}
+		workers = nil
+	}
+	defer stop()
+	for i, queues := range []string{"upload,thumb", "email,unsend"} {
+		w := exec.Command(bin, "worker", queues)
+		w.Env, w.Stdout, w.Stderr = env, &logs[i], &logs[i]
+		require.NoError(t, w.Start())
+		workers = append(workers, w)
+	}
+
+	submit := exec.Command(bin, "submit")
+	submit.Env = env
+	res, err := submit.Output()
+	require.NoError(t, err, string(res))
+	var rec contract.WorkflowRecord
+	require.NoError(t, json.Unmarshal(res, &rec), string(res))
+	assert.Equal(t, contract.WorkflowCompleted, rec.State)
+	require.Len(t, rec.Tasks, 4)
+	for _, tr := range rec.Tasks {
+		assert.Equal(t, contract.JobCompleted, tr.State, tr.Name)
+	}
+	assert.Equal(t, contract.JobWaiting, rec.Tasks[3].Undo.State, "completed: the undo never ran")
+	assert.Positive(t, rec.Tasks[1].ResultSize)
+
+	stop()
+	assert.Contains(t, logs[0].String(), "upload photo.png")
+	assert.Contains(t, logs[0].String(), "thumb 512")
+	assert.Contains(t, logs[1].String(), "email to ann@example.com with s3://bucket/photo.png@64px", "results cross processes")
+	assert.NotContains(t, logs[1].String(), "undo")
+}
+
+// Guards: bad options, bad IDs, unknown outcomes, closed queues, queues
+// without a store, and errors from a closed client.
+func TestWorkflowGuards(t *testing.T) {
+	assert.Panics(t, func() { New(getTestRedisURL(), WithWorkflowResultLimit(0)) })
+	assert.Panics(t, func() { New(getTestRedisURL(), WithWorkflowRetention(0)) })
+
+	e := newWFTest(t)
+	ctx := t.Context()
+	for _, id := range []string{"", "index", "a:b"} {
+		assert.ErrorIs(t, e.store.Cancel(ctx, id, nil), contract.ErrWorkflowNotFound)
+		_, err := e.store.Record(ctx, id)
+		assert.ErrorIs(t, err, contract.ErrWorkflowNotFound)
+		_, err = e.store.Runnable(ctx, id, "a", false)
+		assert.ErrorIs(t, err, contract.ErrWorkflowNotFound)
+	}
+	yes := true
+	require.NoError(t, e.store.Submit(ctx, wfPlan("g", false, false, tk{name: "a", q: e.a, undo: e.c})))
+	require.NoError(t, e.store.Cancel(ctx, "g", &yes))
+	assert.True(t, e.record("g").UndoOnCancel, "Cancel's undo overrides the plan's")
+	run, err := e.store.Runnable(ctx, "g", "bad name!", false)
+	assert.NoError(t, err)
+	assert.False(t, run)
+
+	a, ok := wfPop(t, e.a)
+	require.True(t, ok)
+	_, ok = e.a.FinishTask(a.ack, contract.TaskEnd{Workflow: "g", Task: "a", Outcome: "odd"})
+	assert.False(t, ok, "unknown outcome")
+
+	// A queue without a store: plain finishes and purge, no scope.
+	bare := newQueueBase(e.a.client, e.a.queueKey)
+	assert.Empty(t, bare.ScopeID())
+	_, ok = bare.FinishTask(a.ack, contract.TaskEnd{Workflow: "g", Task: "a", Outcome: contract.OutcomeCompleted})
+	assert.True(t, ok)
+	bare.Purge()
+	assert.Zero(t, e.a.client.Exists(ctx, e.a.getStatsKey()).Val())
+
+	// Closed queue and closed client.
+	closed := e.qs.NewQueue("z")
+	require.NoError(t, closed.Close())
+	_, ok = closed.FinishTask("x", contract.TaskEnd{Workflow: "g", Task: "a", Outcome: contract.OutcomeCompleted})
+	assert.False(t, ok)
+	qs := New(getTestRedisURL(), WithNamespace(newID()))
+	q := qs.NewQueue("a")
+	defer q.Close()
+	store := qs.(*queues).wf
+	require.NoError(t, qs.Close())
+	assert.Error(t, store.Submit(ctx, wfPlan("g", false, false, tk{name: "a", q: q})))
+	assert.Error(t, store.Cancel(ctx, "g", nil))
+	_, err = store.Record(ctx, "g")
+	assert.Error(t, err)
+	_, err = store.Runnable(ctx, "g", "a", false)
+	assert.Error(t, err)
+	_, err = store.Workflows(ctx, "", 0, 10)
+	assert.Error(t, err)
+	_, ok = q.FinishTask("x", contract.TaskEnd{Workflow: "g", Task: "a", Outcome: contract.OutcomeCompleted})
+	assert.False(t, ok)
+	q.Purge()                             // logs the error
+	store.trimIndex(context.Background()) // logs the error
+
+	// A meta that is not JSON: reads fail, listings skip it.
+	require.NoError(t, e.a.client.HSet(ctx, e.store.key("g"), "meta", "{nope").Err())
+	_, err = e.store.Record(ctx, "g")
+	assert.Error(t, err)
+	_, err = e.store.Runnable(ctx, "g", "a", false)
+	assert.Error(t, err)
+	_, err = e.store.DepResult(ctx, "g", "a")
+	assert.Error(t, err)
+	recs, err := e.store.Workflows(ctx, "", 0, 10)
+	require.NoError(t, err)
+	assert.Empty(t, recs)
+
+	// A workflow key of the wrong type: listing and purge report the error.
+	require.NoError(t, e.a.client.Set(ctx, e.store.key("g"), "x", 0).Err())
+	_, err = e.store.WorkflowKeys(ctx, "", 0, 10)
+	assert.Error(t, err)
+	require.True(t, e.a.Enqueue(`{"id":"wf:g:a","wf":"g","task":"a"}`))
+	assert.Error(t, e.a.purge())
+}
+
+// Purge of a queue holding items of more workflows than Lua can unpack at
+// once; listing through more same-millisecond entries than one chunk; a
+// too-deep item.
+func TestWorkflowScale(t *testing.T) {
+	e := newWFTest(t)
+	ctx := t.Context()
+
+	pipe := e.a.client.Pipeline()
+	for i := range 9000 {
+		pipe.RPush(ctx, e.a.queueKey, wfEnvelope(fmt.Sprintf("gone%d", i), "a", false, "1"))
+	}
+	_, err := pipe.Exec(ctx)
+	require.NoError(t, err)
+	require.NoError(t, e.a.purge())
+	assert.Zero(t, e.a.client.LLen(ctx, e.a.queueKey).Val())
+
+	pipe = e.a.client.Pipeline()
+	var want []string
+	for i := range 450 {
+		id := fmt.Sprintf("t%03d", i)
+		want = append(want, id)
+		pipe.HSet(ctx, e.store.key(id), "meta", `{"state":"running","created_at":5,"tasks":[]}`)
+		pipe.ZAdd(ctx, e.store.indexKey(), redis.Z{Score: 5, Member: id})
+	}
+	_, err = pipe.Exec(ctx)
+	require.NoError(t, err)
+	keys, err := e.store.WorkflowKeys(ctx, "", 0, 1000)
+	require.NoError(t, err)
+	var got []string
+	for _, k := range keys {
+		got = append(got, k.ID)
+	}
+	assert.Equal(t, want, got, "every tie once, by ID")
+	keys, err = e.store.WorkflowKeys(ctx, contract.WorkflowRunning, 440, 5)
+	require.NoError(t, err)
+	assert.Len(t, keys, 5)
+	// A filter reads at most 10000 + limit entries: t000..t449 (oldest)
+	// sit past that many newer ones.
+	pipe = e.a.client.Pipeline()
+	for i := range 10100 {
+		id := fmt.Sprintf("n%05d", i)
+		pipe.HSet(ctx, e.store.key(id), "meta", `{"state":"completed","created_at":9,"tasks":[]}`)
+		pipe.ZAdd(ctx, e.store.indexKey(), redis.Z{Score: 9, Member: id})
+	}
+	_, err = pipe.Exec(ctx)
+	require.NoError(t, err)
+	keys, err = e.store.WorkflowKeys(ctx, contract.WorkflowRunning, 0, 5)
+	require.NoError(t, err)
+	assert.Empty(t, keys, "running ones lie past the scan cap")
+
+	// Items Redis's cjson can't decode are refused at Submit: as a task, as
+	// a waiting task, as an undo; nothing is written.
+	deep := strings.Repeat("[", 1100) + strings.Repeat("]", 1100)
+	for i, p := range []contract.WorkflowPlan{
+		wfPlan("bad1", false, false, tk{name: "a", q: e.a, data: deep}),
+		wfPlan("bad2", false, false, tk{name: "a", q: e.a}, tk{name: "b", q: e.a, deps: []string{"a"}, data: `"\ud800"`}),
+		wfPlan("bad3", false, false, tk{name: "a", q: e.a, undo: e.c}),
+	} {
+		if i == 2 {
+			p.Tasks[0].Undo.Item = wfEnvelope("bad3", "a", true, `"\udc00x"`)
+		}
+		assert.ErrorContains(t, e.store.Submit(ctx, p), "cjson", p.ID)
+		assert.Zero(t, e.a.client.Exists(ctx, e.store.key(p.ID)).Val(), p.ID)
+	}
+	assert.Zero(t, e.a.client.LLen(ctx, e.a.queueKey).Val())
+}
+
+// Every pop path, FIFO and priority, hands out a marked valid workflow item
+// and drops a marked plain one.
+func TestCancelGateWorkflowItemEveryPop(t *testing.T) {
+	pops := map[string]func(q *Queue) []string{
+		"raw": func(q *Queue) []string {
+			var got []string
+			for v, ok := rawPopOf(q); ok; v, ok = rawPopOf(q) {
+				got = append(got, string(v.([]byte)))
+			}
+			return got
+		},
+		"single": func(q *Queue) []string {
+			var got []string
+			for v, ok, _ := ackPopOf(q); ok; v, ok, _ = ackPopOf(q) {
+				got = append(got, string(v.([]byte)))
+			}
+			return got
+		},
+		"lean batch": func(q *Queue) []string {
+			var got []string
+			for {
+				q.popLen.Store(1)
+				items, ids := make([]any, 4), make([]string, 4)
+				n, _, err := batchPopOf(q, items, ids)
+				if err != nil || n == 0 {
+					return got
+				}
+				for _, v := range items[:n] {
+					got = append(got, string(v.([]byte)))
+				}
+			}
+		},
+		"batch": func(q *Queue) []string {
+			items, ids := make([]any, 4), make([]string, 4)
+			n, _, _ := batchPopOf(q, items, ids)
+			var got []string
+			for _, v := range items[:n] {
+				got = append(got, string(v.([]byte)))
+			}
+			return got
+		},
+	}
+	for name, pop := range pops {
+		t.Run(name, func(t *testing.T) {
+			eachCancelCase(t, func(t *testing.T, c cancelQueues) {
+				task := string(wfEnvelope("w", "a", false, "1"))
+				require.NoError(t, c.prod.CancelJob("wf:w:a"))
+				require.NoError(t, c.prod.CancelJob("plain"))
+				require.True(t, c.push(envelope("plain", `1`), 1))
+				require.True(t, c.push(task, 1))
+				assert.Equal(t, []string{task}, pop(c.cons))
+				assert.True(t, marked(t, c.cons, "wf:w:a"))
+				assert.False(t, marked(t, c.cons, "plain"))
+			})
+		})
+	}
+}
+
+// Consumers on four objects finish a wide workflow at once: each task runs
+// once, the join after all of them once; concurrent Submits of one plan
+// push its root once. Also: 261 tasks (more than one wfload chunk), no TTL
+// while running.
+func TestWorkflowConcurrent(t *testing.T) {
+	e := newWFTest(t)
+	ctx := t.Context()
+	tasks := []tk{{name: "root", q: e.a}}
+	var mid []string
+	for i := range 260 {
+		name := fmt.Sprintf("m%03d", i)
+		mid = append(mid, name)
+		tasks = append(tasks, tk{name: name, q: e.a, deps: []string{"root"}})
+	}
+	tasks = append(tasks, tk{name: "join", q: e.c, deps: mid})
+	p := wfPlan("wide", false, false, tasks...)
+
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Go(func() { assert.NoError(t, e.store.Submit(ctx, p)) })
+	}
+	wg.Wait()
+	assert.EqualValues(t, 1, e.a.client.LLen(ctx, e.a.queueKey).Val(), "root pushed once")
+	assert.EqualValues(t, -1, e.a.client.PTTL(ctx, e.store.key("wide")).Val(), "running: no TTL")
+
+	var mu sync.Mutex
+	runs := map[string]int{}
+	for range 4 {
+		wg.Go(func() {
+			qs := New(getTestRedisURL(), WithNamespace(strings.TrimPrefix(strings.TrimSuffix(e.store.prefix, ":"), "redisq:")))
+			defer qs.Close()
+			store := qs.(*queues).wf
+			mine := []*Queue{qs.NewQueue("a"), qs.NewQueue("c")}
+			defer mine[0].Close()
+			defer mine[1].Close()
+			idle := 0
+			for idle < 20 {
+				got := false
+				for _, q := range mine {
+					if p, ok := wfPop(t, q); ok {
+						got = true
+						end := contract.TaskEnd{Workflow: p.wf, Task: p.task, Outcome: contract.OutcomeCompleted, Result: []byte(`1`)}
+						if run, err := store.Runnable(ctx, p.wf, p.task, false); err == nil && run {
+							mu.Lock()
+							runs[p.task]++
+							mu.Unlock()
+						} else {
+							end.Outcome = contract.OutcomeCancelled
+						}
+						_, ok := q.FinishTask(p.ack, end)
+						assert.True(t, ok)
+					}
+				}
+				if got {
+					idle = 0
+				} else {
+					idle++
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+		})
+	}
+	wg.Wait()
+	r := e.record("wide")
+	assert.Equal(t, contract.WorkflowCompleted, r.State)
+	assert.Len(t, runs, 262)
+	for name, n := range runs {
+		assert.Equal(t, 1, n, name)
+	}
+	assert.Equal(t, contract.JobCompleted, r.Tasks[261].State)
+}
+
+// FinishTask applies a workflow step only for the settled item's own task;
+// a script that misses a queue in KEYS changes nothing and asks to reread.
+func TestWorkflowFinishChecks(t *testing.T) {
+	e := newWFTest(t)
+	ctx := t.Context()
+	require.NoError(t, e.store.Submit(ctx, wfPlan("fc", false, false,
+		tk{name: "a", q: e.a}, tk{name: "b", q: e.a}, tk{name: "c", q: e.c, deps: []string{"a"}})))
+	a, ok := wfPop(t, e.a)
+	require.True(t, ok)
+	require.Equal(t, "a", a.task)
+	pushed, ok := e.a.FinishTask(a.ack, contract.TaskEnd{Workflow: "fc", Task: "b", Outcome: contract.OutcomeFailed})
+	assert.True(t, ok)
+	assert.Empty(t, pushed)
+	assert.Equal(t, map[string]contract.JobState{"a": contract.JobPending, "b": contract.JobPending, "c": contract.JobWaiting},
+		taskStates(e.record("fc")), "a settled alone; b untouched")
+
+	r, err := wfCancelScript.Run(ctx, e.a.client, []string{e.store.key("fc")}, "", "", int64(1000)).Int64Slice()
+	require.NoError(t, err)
+	assert.Equal(t, []int64{2}, r, "no queues in KEYS: reread")
+	assert.Equal(t, contract.WorkflowRunning, e.record("fc").State)
+	calls := 0
+	assert.ErrorIs(t, reread(func() error { calls++; return errReread }), errReread)
+	assert.Equal(t, wfTries, calls)
+
+	// An unreadable workflow (another writer's bad t:) settles items alone.
+	require.NoError(t, e.a.client.HSet(ctx, e.store.key("fc"), "t:b", "{nope").Err())
+	b, ok := wfPop(t, e.a)
+	require.True(t, ok)
+	_, ok = e.a.FinishTask(b.ack, contract.TaskEnd{Workflow: "fc", Task: "b", Outcome: contract.OutcomeCompleted})
+	assert.True(t, ok)
+	assert.Zero(t, e.a.GetNackedItemsCount())
+	assert.ErrorContains(t, e.store.Cancel(ctx, "fc", nil), "unreadable")
+}
+
+// Review round 3: a long chain fails without overflowing Lua's call depth;
+// a re-sent applying Purge changes nothing; Submit refuses a queue with an
+// expiration or a key that isn't UTF-8; trimIndex runs once a minute.
+func TestWorkflowRobust(t *testing.T) {
+	e := newWFTest(t)
+	ctx := t.Context()
+
+	const n = 21000
+	tasks := []tk{{name: "c0", q: e.a}}
+	for i := 1; i < n; i++ {
+		tasks = append(tasks, tk{name: fmt.Sprintf("c%d", i), q: e.a, deps: []string{fmt.Sprintf("c%d", i-1)}})
+	}
+	require.NoError(t, e.store.Submit(ctx, wfPlan("chain", false, false, tasks...)))
+	assert.Equal(t, []string{"c0"}, e.drain(failing("c0")))
+	r := e.record("chain")
+	assert.Equal(t, contract.WorkflowFailed, r.State)
+	assert.Equal(t, contract.JobCancelled, r.Tasks[n-1].State)
+
+	// The applying run sets its once-key; a re-send with it returns at once.
+	require.NoError(t, e.store.Submit(ctx, wfPlan("rs", false, false,
+		tk{name: "a", q: e.a}, tk{name: "b", q: e.a, deps: []string{"a"}, always: true})))
+	once := e.a.queueKey + ":purge:test"
+	require.NoError(t, e.a.client.Set(ctx, once, "1", time.Minute).Err())
+	keys := append(e.a.requeueKeys(), e.a.getJobsKey(), e.a.getCompletedKey(), e.a.getFailedKey(), e.a.getStatsKey(), e.a.getCancelledKey(), once)
+	got, err := wfPurgeScript.Run(ctx, e.a.client, keys, len(keys)-1, 0, "", "fifo", 1000).Slice()
+	require.NoError(t, err)
+	assert.Equal(t, []any{int64(1)}, got)
+	assert.EqualValues(t, 1, e.a.client.LLen(ctx, e.a.queueKey).Val(), "re-send: nothing deleted")
+	e.a.Purge()
+	assert.Equal(t, map[string]contract.JobState{"a": contract.JobCancelled, "b": contract.JobPending}, taskStates(e.record("rs")))
+	assert.EqualValues(t, 1, e.a.client.LLen(ctx, e.a.queueKey).Val(), "b pushed after the delete")
+
+	exp := e.qs.NewQueue("exp")
+	defer exp.Close()
+	exp.SetExpiration(time.Hour)
+	assert.ErrorContains(t, e.store.Submit(ctx, wfPlan("x1", false, false, tk{name: "a", q: exp})), "expiration")
+	bad := e.qs.NewQueue("caf\xe9")
+	defer bad.Close()
+	assert.ErrorContains(t, e.store.Submit(ctx, wfPlan("x2", false, false, tk{name: "a", q: bad})), "UTF-8")
+
+	e.store.trimmedAt.Store(time.Now().UnixMilli())
+	require.NoError(t, e.a.client.ZAdd(ctx, e.store.indexKey(), redis.Z{Score: 1, Member: "old"}).Err())
+	e.store.trimIndex(ctx)
+	assert.EqualValues(t, 1, e.a.client.ZScore(ctx, e.store.indexKey(), "old").Val(), "trimmed under a minute ago: skipped")
+	e.store.trimmedAt.Store(0)
+	e.store.trimIndex(ctx)
+	assert.Equal(t, redis.Nil, e.a.client.ZScore(ctx, e.store.indexKey(), "old").Err())
 }
