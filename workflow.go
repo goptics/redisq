@@ -115,8 +115,8 @@ func (q *Queue) ScopeID() string {
 	return q.wf.scope
 }
 
-// WorkflowStore is the workflow store of this queue's Redis and namespace,
-// nil (an untyped nil) for a queue made without one.
+// WorkflowStore is the same store as Queues.WorkflowStore(); for varmq
+// (contract.WorkflowAcknowledgeable). nil (untyped) for a queue made without one.
 func (q *Queue) WorkflowStore() contract.WorkflowStore {
 	if q.wf == nil {
 		return nil

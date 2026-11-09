@@ -40,6 +40,7 @@ Requires `github.com/goptics/varmq/contract` v0.6.0 and VarMQ ≥ v1.11.0 (#33, 
 - A purged workflow task or undo ends `cancelled` in the same script, so its workflow goes on (spec 6.6) (#34)
 - Workflows, as varmq's `spec/redis-storage.md` 1.5.0 (6.9 to 6.12, 7.3): every queue implements `contract.WorkflowAcknowledgeable` (`ScopeID`, `WorkflowStore`, `FinishTask`) (#34)
 - `WorkflowStore()` is the store of the queue's Redis and namespace (`contract.WorkflowStore`, `WorkflowInspector`, `WorkflowKeyLister`), so VarMQ workers in any process run one DAG across redisq queues (#34)
+- `Queues.WorkflowStore()` is the client's one workflow store; pass it to `varmq.NewWorkflow`. `Queue.WorkflowStore()` returns the same store, for varmq (#NN)
 - Keys `redisq:[ns:]wf:<id>` (hash: `meta`, `t:`/`s:`/`n:`/`i:`/`r:`/`e:`/`u:` per task) and `redisq:[ns:]wf:index` (#34)
 - Submit, FinishTask, Cancel and Purge are one script each. FinishTask settles the item as `Acknowledge`/`Reject` (record, stats, outcome) and pushes what the end releases in the same step (#34)
 - A re-sent finish changes nothing and names every push-target queue. Results over the limit fail the task; undo envelopes are pushed byte for byte (#34)

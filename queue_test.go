@@ -3219,6 +3219,29 @@ func TestWorkflowSubmitRefuses(t *testing.T) {
 	assert.Nil(t, newQueueBase(e.a.client, "x").WorkflowStore(), "no store: untyped nil")
 }
 
+// Queues.WorkflowStore is the store every queue of the client returns, and
+// runs a workflow across them through the calls varmq's NewWorkflow
+// (ScopeID, Submit) and OpenWorkflow (Record, Cancel) make.
+func TestQueuesWorkflowStore(t *testing.T) {
+	e := newWFTest(t)
+	ctx := t.Context()
+	store := e.qs.WorkflowStore()
+	assert.Same(t, e.store, store)
+	for _, q := range e.all() {
+		assert.Same(t, store, q.WorkflowStore())
+		assert.Equal(t, store.ScopeID(), q.ScopeID())
+	}
+	assert.Nil(t, (&queues{}).WorkflowStore(), "no store: untyped nil")
+
+	require.NoError(t, store.Submit(ctx, wfPlan("qs", false, true,
+		tk{name: "a", q: e.a}, tk{name: "b", q: e.b, deps: []string{"a"}})))
+	assert.Equal(t, []string{"a", "b"}, e.drain(completeAll))
+	r, err := store.Record(ctx, "qs")
+	require.NoError(t, err)
+	assert.Equal(t, contract.WorkflowCompleted, r.State)
+	require.NoError(t, store.Cancel(ctx, "qs", nil), "ended: no change")
+}
+
 // A result over the limit fails the task; one that is not JSON is
 // dropped; a task at the limit keeps its result.
 func TestWorkflowResults(t *testing.T) {

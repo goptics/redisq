@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/goptics/varmq/contract"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -44,6 +45,9 @@ type Queues interface {
 	NewDistributedQueue(queueKey string) *Queue
 	// Deprecated: use NewPriorityQueue; every queue is distributed since v1.6.0.
 	NewDistributedPriorityQueue(queueKey string) *PriorityQueue
+	// WorkflowStore is the one workflow store of this client's Redis and
+	// namespace, shared by all its queues. Pass it to varmq.NewWorkflow.
+	WorkflowStore() contract.WorkflowStore
 	Close() error
 }
 
@@ -107,6 +111,14 @@ func (qs *queues) NewQueue(queueKey string) *Queue {
 
 func (qs *queues) NewPriorityQueue(queueKey string) *PriorityQueue {
 	return newPriorityQueue(qs.client, qs.key("prio", queueKey), qs.wf)
+}
+
+// WorkflowStore is the client's workflow store; nil (untyped) if none.
+func (qs *queues) WorkflowStore() contract.WorkflowStore {
+	if qs.wf == nil {
+		return nil
+	}
+	return qs.wf
 }
 
 // NewDistributedQueue is NewQueue.

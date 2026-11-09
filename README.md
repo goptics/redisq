@@ -323,13 +323,13 @@ See [`examples/varmq`](examples/varmq) for a provider/consumer setup.
 
 ### Workflows
 
-A VarMQ workflow is a DAG of jobs across queues. Every redisq queue can carry its tasks, and `WorkflowStore()` on any
-queue is the store of its Redis and namespace:
+A VarMQ workflow is a DAG of jobs across queues. Every redisq queue can carry its tasks, and `qs.WorkflowStore()` is the
+one store of the client's Redis and namespace:
 
 ```go
 upload, thumb := qs.NewQueue("upload"), qs.NewPriorityQueue("thumb")
 
-wf := varmq.NewWorkflow(upload.WorkflowStore(), varmq.WithWorkflowID("upload-1"))
+wf := varmq.NewWorkflow(qs.WorkflowStore(), varmq.WithWorkflowID("upload-1"))
 up := wf.Add("upload", varmq.NewResultQueue[string, string](upload), "photo.png")
 wf.Add("thumb", varmq.NewResultPriorityQueue[int, string](thumb), 64).After(up)
 err := wf.Submit(ctx) // workers in any process run it; wf.WaitContext(ctx) for the end
