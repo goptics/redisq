@@ -17,9 +17,7 @@ import (
 // The method sets varmq's IDedupQueue and IDedupPriorityQueue look for.
 var (
 	_ interface{ EnqueueOnce(any, string) bool }      = (*Queue)(nil)
-	_ interface{ EnqueueOnce(any, string) bool }      = (*DistributedQueue)(nil)
 	_ interface{ EnqueueOnce(any, int, string) bool } = (*PriorityQueue)(nil)
-	_ interface{ EnqueueOnce(any, int, string) bool } = (*DistributedPriorityQueue)(nil)
 )
 
 // dedupCase is a queue kind and the script its EnqueueOnce runs.

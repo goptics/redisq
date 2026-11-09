@@ -11,10 +11,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func setupTestDistributedPriorityQueue(t *testing.T) (*DistributedPriorityQueue, func()) {
+func setupTestDistributedPriorityQueue(t *testing.T) (*PriorityQueue, func()) {
 	redisURL := getTestRedisURL()
 	qs := New(redisURL)
-	q := qs.NewDistributedPriorityQueue(testQueueKey)
+	q := qs.NewPriorityQueue(testQueueKey)
 
 	// Clear the queue before test
 	ctx := context.Background()
@@ -142,7 +142,7 @@ func TestDistributedPriorityQueueNoNotifyOnFailedEnqueue(t *testing.T) {
 	qs := New(getTestRedisURL())
 	defer qs.Close()
 
-	dpq := qs.NewDistributedPriorityQueue("test_failed_enqueue_notify")
+	dpq := qs.NewPriorityQueue("test_failed_enqueue_notify")
 	defer dpq.Close()
 
 	got := make(chan string, 1)

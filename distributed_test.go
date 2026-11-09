@@ -13,10 +13,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func setupTestDistributedQueue(t *testing.T) (*DistributedQueue, func()) {
+func setupTestDistributedQueue(t *testing.T) (*Queue, func()) {
 	redisURL := getTestRedisURL()
 	qs := New(redisURL)
-	q := qs.NewDistributedQueue(testQueueKey)
+	q := qs.NewQueue(testQueueKey)
 
 	// Clear the queue before test
 	ctx := context.Background()
@@ -111,7 +111,7 @@ func TestDistributedQueueSweeperRequeues(t *testing.T) {
 	defer qs.Close()
 
 	key := "test_sweeper_queue"
-	dq := qs.NewDistributedQueue(key)
+	dq := qs.NewQueue(key)
 	defer dq.Close()
 	defer dq.client.Del(context.Background(), key, dq.getNackedItemKey(), dq.getTimeoutKey())
 
@@ -242,13 +242,13 @@ func TestEnqueueOntoBacklogWakesAllIdle(t *testing.T) {
 
 	var consumers []chan string
 	for range 3 {
-		c := qs.NewDistributedQueue(key)
+		c := qs.NewQueue(key)
 		defer c.Close()
 		got := make(chan string, 10)
 		c.Subscribe(func(action string) { got <- action }) // idle
 		consumers = append(consumers, got)
 	}
-	producer := qs.NewDistributedQueue(key)
+	producer := qs.NewQueue(key)
 	defer producer.Close()
 	full := producer.queueKey
 	defer producer.client.Del(ctx, full, full+":idle")
@@ -272,9 +272,9 @@ func TestEmptyDequeueMarksConsumerIdle(t *testing.T) {
 	defer qs.Close()
 	ctx := context.Background()
 
-	dq := qs.NewDistributedQueue("test_empty_dequeue_list")
+	dq := qs.NewQueue("test_empty_dequeue_list")
 	defer dq.Close()
-	dpq := qs.NewDistributedPriorityQueue("test_empty_dequeue_prio")
+	dpq := qs.NewPriorityQueue("test_empty_dequeue_prio")
 	defer dpq.Close()
 
 	for _, c := range []struct {
@@ -300,8 +300,8 @@ func TestEmptyDequeueMarksConsumerIdle(t *testing.T) {
 // reads 0 instead of failing.
 func TestDistributedQueueClosed(t *testing.T) {
 	qs := New(getTestRedisURL())
-	dq := qs.NewDistributedQueue("test_closed_dq")
-	dpq := qs.NewDistributedPriorityQueue("test_closed_dpq")
+	dq := qs.NewQueue("test_closed_dq")
+	dpq := qs.NewPriorityQueue("test_closed_dpq")
 	dpq.Subscribe(func(string) {}) // a consumer, so its nudge loop runs
 
 	require.NoError(t, dq.Close())
@@ -331,11 +331,11 @@ var heartbeatCases = []struct {
 	open func(qs Queues, key string) (distQueue, *Queue, func(string) bool)
 }{
 	{"list", func(qs Queues, key string) (distQueue, *Queue, func(string) bool) {
-		q := qs.NewDistributedQueue(key)
+		q := qs.NewQueue(key)
 		return q, q, func(v string) bool { return q.Enqueue(v) }
 	}},
 	{"priority", func(qs Queues, key string) (distQueue, *Queue, func(string) bool) {
-		q := qs.NewDistributedPriorityQueue(key)
+		q := qs.NewPriorityQueue(key)
 		return q, q.Queue, func(v string) bool { return q.Enqueue(v, 3) }
 	}},
 }
@@ -391,8 +391,8 @@ func TestBusyConsumerStaysOutOfIdleSet(t *testing.T) {
 func TestBatchDequeueSetsIdle(t *testing.T) {
 	qs := New(getTestRedisURL())
 	defer qs.Close()
-	dq := qs.NewDistributedQueue("test_batch_idle_list")
-	dpq := qs.NewDistributedPriorityQueue("test_batch_idle_prio")
+	dq := qs.NewQueue("test_batch_idle_list")
+	dpq := qs.NewPriorityQueue("test_batch_idle_prio")
 
 	for _, c := range []struct {
 		q    distQueue
@@ -520,11 +520,11 @@ func TestHeartbeatKeepsLiveConsumersItems(t *testing.T) {
 	qs := New(getTestRedisURL())
 	defer qs.Close()
 	key := "test_heartbeat_live"
-	holder := qs.NewDistributedQueue(key)
+	holder := qs.NewQueue(key)
 	defer holder.Close()
 	delKeys(t, holder.client, key)
 	defer delKeys(t, holder.client, key)
-	sweeper := qs.NewDistributedQueue(key)
+	sweeper := qs.NewQueue(key)
 	defer sweeper.Close()
 	holder.heartbeatTimeout.Store(int64(ttl))
 	holder.SetVisibilityTimeout(0)
@@ -549,12 +549,12 @@ func TestHeartbeatSurvivesRedisStall(t *testing.T) {
 	qs1, qs2 := New(getTestRedisURL()), New(getTestRedisURL())
 	defer qs1.Close()
 	defer qs2.Close()
-	a, b := qs1.NewDistributedQueue(key), qs2.NewDistributedQueue(key)
+	a, b := qs1.NewQueue(key), qs2.NewQueue(key)
 	defer a.Close()
 	defer b.Close()
 	delKeys(t, a.client, key)
 	defer delKeys(t, a.client, key)
-	for _, q := range []*DistributedQueue{a, b} {
+	for _, q := range []*Queue{a, b} {
 		q.heartbeatTimeout.Store(int64(ttl))
 		require.True(t, q.Enqueue("job"))
 		_, ok, _ := q.DequeueWithAckId()
@@ -641,7 +641,7 @@ func TestPresenceGrace(t *testing.T) {
 			defer qs.Close()
 			var c1, c2 *Queue
 			if distributed {
-				d1, d2 := qs.NewDistributedQueue(key), qs.NewDistributedQueue(key)
+				d1, d2 := qs.NewQueue(key), qs.NewQueue(key)
 				defer d1.Close()
 				defer d2.Close()
 				c1, c2 = d1, d2
@@ -720,11 +720,11 @@ func TestMergedQueueWakesIdleConsumer(t *testing.T) {
 	defer qs.Close()
 
 	var (
-		_ *Queue         = qs.NewDistributedQueue("x_merged_type")
-		_ *PriorityQueue = qs.NewDistributedPriorityQueue("x_merged_type")
+		_ *Queue         = qs.NewQueue("x_merged_type")
+		_ *PriorityQueue = qs.NewPriorityQueue("x_merged_type")
 	)
-	assert.IsType(t, &Queue{}, qs.NewDistributedQueue(newID()))
-	assert.IsType(t, &PriorityQueue{}, qs.NewDistributedPriorityQueue(newID()))
+	assert.IsType(t, &Queue{}, qs.NewQueue(newID()))
+	assert.IsType(t, &PriorityQueue{}, qs.NewPriorityQueue(newID()))
 
 	for _, c := range []struct {
 		name string

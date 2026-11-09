@@ -224,7 +224,7 @@ func TestPriorityQueueRequeueNackedItems(t *testing.T) {
 	assert.Equal(t, 2, pq.GetNackedItemsCount(), "Should have 2 items in nacked list")
 
 	// Set ack timeout for expiration
-	pq.SetAckTimeout(1 * time.Second)
+	pq.SetVisibilityTimeout(1 * time.Second)
 
 	// Wait for visibility timeout to expire
 	time.Sleep(200 * time.Millisecond)
@@ -364,7 +364,7 @@ func TestPriorityQueueDequeueWithAckIdAndTimeout(t *testing.T) {
 
 	// Set both visibility timeout and ack timeout
 	pq.SetVisibilityTimeout(1 * time.Second)
-	pq.SetAckTimeout(5 * time.Second)
+	pq.SetVisibilityTimeout(5 * time.Second)
 
 	// Enqueue item
 	pq.Enqueue("test-item", 1)

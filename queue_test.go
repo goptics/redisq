@@ -256,7 +256,7 @@ func TestPrepareForFutureAckWithTimeout(t *testing.T) {
 
 	// Set both visibility timeout and ack timeout
 	q.SetVisibilityTimeout(1 * time.Second)
-	q.SetAckTimeout(5 * time.Second)
+	q.SetVisibilityTimeout(5 * time.Second)
 
 	err := q.PrepareForFutureAck("ack-with-timeout", "test-item")
 	assert.NoError(t, err, "PrepareForFutureAck should succeed with timeouts set")
@@ -329,7 +329,7 @@ func TestRequeueNackedItems(t *testing.T) {
 	assert.Equal(t, 2, count, "Should have 2 items in nacked list")
 
 	// Set a longer ack timeout (Redis minimum is 1s)
-	q.SetAckTimeout(1 * time.Second)
+	q.SetVisibilityTimeout(1 * time.Second)
 
 	// Wait for timeout to expire (wait a bit longer than the timeout)
 	time.Sleep(1500 * time.Millisecond)
@@ -374,7 +374,7 @@ func TestAcknowledgmentConcurrency(t *testing.T) {
 	defer cleanup()
 
 	// Set a longer ack timeout for this test
-	q.SetAckTimeout(5 * time.Second)
+	q.SetVisibilityTimeout(5 * time.Second)
 
 	// Number of concurrent workers and items
 	const numWorkers = 5
@@ -713,7 +713,7 @@ func TestAckTimeoutKeepsPendingForRequeue(t *testing.T) {
 	q, cleanup := setupTestQueue(t)
 	defer cleanup()
 
-	q.SetAckTimeout(time.Second)
+	q.SetVisibilityTimeout(time.Second)
 	require.True(t, q.Enqueue("a"))
 	require.True(t, q.Enqueue("b"))
 	for range 2 {
@@ -725,23 +725,6 @@ func TestAckTimeoutKeepsPendingForRequeue(t *testing.T) {
 	require.NoError(t, q.RequeueNackedItems()) // the sweeper may have done it already
 	assert.Equal(t, 2, q.Len(), "expired jobs should be back in the queue")
 	assert.Equal(t, 0, q.GetNackedItemsCount())
-}
-
-// SetAckTimeout(0) meant "no expiry"; it must not turn the visibility timeout
-// off, which would requeue jobs that are still being processed.
-func TestAckTimeoutZeroKeepsVisibility(t *testing.T) {
-	q, cleanup := setupTestQueue(t)
-	defer cleanup()
-
-	q.SetVisibilityTimeout(time.Minute)
-	q.SetAckTimeout(0)
-	require.True(t, q.Enqueue("job"))
-	_, ok, _ := q.DequeueWithAckId()
-	require.True(t, ok)
-
-	require.NoError(t, q.RequeueNackedItems())
-	assert.Equal(t, 0, q.Len(), "an in-progress job was requeued")
-	assert.Equal(t, 1, q.GetNackedItemsCount())
 }
 
 // Several processes requeueing the same expired items at once must push each
@@ -1003,7 +986,7 @@ func TestScriptsUnderVerbatimReplication(t *testing.T) {
 	t.Run("wake", func(t *testing.T) {
 		qs := New(getTestRedisURL())
 		defer qs.Close()
-		q := qs.NewDistributedQueue("test_verbatim_wake")
+		q := qs.NewQueue("test_verbatim_wake")
 		defer q.Close()
 		delKeys(t, q.client, "test_verbatim_wake")
 		defer delKeys(t, q.client, "test_verbatim_wake")
@@ -1012,7 +995,7 @@ func TestScriptsUnderVerbatimReplication(t *testing.T) {
 		require.NoError(t, q.client.SAdd(ctx, q.idleKey, "gone-1", "gone-2").Err())
 		assert.True(t, q.EnqueueOnce("b", "x"), "the same with an id")
 
-		pq := qs.NewDistributedPriorityQueue("test_verbatim_wake_prio")
+		pq := qs.NewPriorityQueue("test_verbatim_wake_prio")
 		defer pq.Close()
 		delKeys(t, pq.client, "test_verbatim_wake_prio")
 		defer delKeys(t, pq.client, "test_verbatim_wake_prio")
@@ -2654,18 +2637,21 @@ func TestEnqueueOnceDropsOldRecord(t *testing.T) {
 type wfTest struct {
 	t     *testing.T
 	qs    Queues
-	store *workflowStore
+	store *WorkflowStore
 	a, c  *Queue
 	b     *PriorityQueue
 }
 
-func newWFTest(t *testing.T, opts ...Option) *wfTest {
-	qs := New(getTestRedisURL(), append([]Option{WithNamespace(newID())}, opts...)...)
-	e := &wfTest{t: t, qs: qs, store: qs.(*queues).wf, a: qs.NewQueue("a"), b: qs.NewPriorityQueue("b"), c: qs.NewQueue("c")}
+func newWFTest(t *testing.T, opts ...WorkflowOption) *wfTest {
+	qs := New(getTestRedisURL(), WithNamespace(newID()))
+	store, err := NewWorkflowStore(qs, opts...)
+	require.NoError(t, err)
+	e := &wfTest{t: t, qs: qs, store: store, a: qs.NewQueue("a"), b: qs.NewPriorityQueue("b"), c: qs.NewQueue("c")}
 	t.Cleanup(func() {
 		e.a.Close()
 		e.b.Close()
 		e.c.Close()
+		store.Close()
 		qs.Close()
 	})
 	return e
@@ -2776,7 +2762,7 @@ func (e *wfTest) finish(p wfPopped, run func(p wfPopped) (contract.Outcome, []by
 			end.Reason = p.label() + " broke"
 		}
 	}
-	_, done := p.q.FinishTask(p.ack, end)
+	_, done := e.store.FinishTask(p.q.QueueID(), p.ack, end)
 	require.True(e.t, done)
 	return ok
 }
@@ -2863,7 +2849,7 @@ func TestWorkflowDAGAcrossQueues(t *testing.T) {
 	run, err := e.store.Runnable(ctx, "dag", "a", false)
 	require.NoError(t, err)
 	assert.True(t, run)
-	pushed, ok := e.a.FinishTask(a.ack, contract.TaskEnd{Workflow: "dag", Task: "a", Outcome: contract.OutcomeCompleted, Result: []byte(`{"url":"s3://x"}`)})
+	pushed, ok := e.store.FinishTask(e.a.QueueID(), a.ack, contract.TaskEnd{Workflow: "dag", Task: "a", Outcome: contract.OutcomeCompleted, Result: []byte(`{"url":"s3://x"}`)})
 	require.True(t, ok)
 	assert.Equal(t, []string{e.b.queueKey, e.c.queueKey}, pushed)
 
@@ -2895,7 +2881,7 @@ func TestWorkflowDAGAcrossQueues(t *testing.T) {
 	require.True(t, e.a.Enqueue(wfEnvelope("dag", "a", false, "1")))
 	late, ok := wfPop(t, e.a)
 	require.True(t, ok)
-	pushed, ok = e.a.FinishTask(late.ack, contract.TaskEnd{Workflow: "dag", Task: "a", Outcome: contract.OutcomeFailed, Reason: "late"})
+	pushed, ok = e.store.FinishTask(e.a.QueueID(), late.ack, contract.TaskEnd{Workflow: "dag", Task: "a", Outcome: contract.OutcomeFailed, Reason: "late"})
 	require.True(t, ok)
 	assert.Empty(t, pushed)
 	assert.Equal(t, r, e.record("dag"))
@@ -3071,10 +3057,10 @@ func TestWorkflowLostFinish(t *testing.T) {
 			tk{name: "a", q: e.a, undo: e.c}, tk{name: "b", q: e.b, deps: []string{"a"}})))
 		a, ok := wfPop(t, e.a)
 		require.True(t, ok)
-		pushed, ok := e.a.FinishTask(a.ack, end)
+		pushed, ok := e.store.FinishTask(e.a.QueueID(), a.ack, end)
 		require.True(t, ok)
 		assert.Equal(t, []string{e.b.queueKey}, pushed)
-		pushed, ok = e.a.FinishTask(a.ack, end)
+		pushed, ok = e.store.FinishTask(e.a.QueueID(), a.ack, end)
 		require.True(t, ok)
 		assert.Equal(t, []string{e.a.queueKey, e.c.queueKey, e.b.queueKey}, pushed, "every push-target queue")
 		assert.Equal(t, []string{"b"}, e.drain(completeAll))
@@ -3090,7 +3076,7 @@ func TestWorkflowLostFinish(t *testing.T) {
 		assert.Equal(t, []string{"a", "b"}, e.drain(completeAll))
 		assert.Equal(t, contract.WorkflowCompleted, e.record("cr").State)
 		// The crashed consumer's late finish finds nothing to do.
-		_, ok = e.a.FinishTask(a.ack, end)
+		_, ok = e.store.FinishTask(e.a.QueueID(), a.ack, end)
 		assert.True(t, ok)
 		assert.Empty(t, e.drain(completeAll))
 	})
@@ -3115,7 +3101,7 @@ func TestWorkflowPurgeCancels(t *testing.T) {
 	assert.Equal(t, contract.WorkflowFailed, r.State, "a purge before Cancel counts as a failure")
 	assert.Equal(t, map[string]contract.JobState{"a": contract.JobCancelled, "b": contract.JobCancelled}, taskStates(r))
 	assert.Equal(t, "queue purged", r.Tasks[0].Reason)
-	_, done := e.a.FinishTask(held.ack, contract.TaskEnd{Workflow: "p1", Task: "a", Outcome: contract.OutcomeCompleted})
+	_, done := e.store.FinishTask(e.a.QueueID(), held.ack, contract.TaskEnd{Workflow: "p1", Task: "a", Outcome: contract.OutcomeCompleted})
 	assert.True(t, done, "a finish of a purged item does nothing")
 
 	r = e.record("p2")
@@ -3156,7 +3142,7 @@ func TestWorkflowListing(t *testing.T) {
 		if p.wf == "w4" {
 			out = contract.OutcomeCompleted
 		}
-		_, done := e.a.FinishTask(p.ack, contract.TaskEnd{Workflow: p.wf, Task: p.task, Outcome: out})
+		_, done := e.store.FinishTask(e.a.QueueID(), p.ack, contract.TaskEnd{Workflow: p.wf, Task: p.task, Outcome: out})
 		require.True(t, done)
 	}
 	ids := func(state contract.WorkflowState, offset, limit int) []string {
@@ -3215,31 +3201,9 @@ func TestWorkflowSubmitRefuses(t *testing.T) {
 
 	assert.Equal(t, e.store.ScopeID(), e.b.ScopeID())
 	assert.NotEqual(t, e.store.ScopeID(), foreign.ScopeID())
-	assert.Same(t, e.store, e.a.WorkflowStore())
-	assert.Nil(t, newQueueBase(e.a.client, "x").WorkflowStore(), "no store: untyped nil")
-}
-
-// Queues.WorkflowStore is the store every queue of the client returns, and
-// runs a workflow across them through the calls varmq's NewWorkflow
-// (ScopeID, Submit) and OpenWorkflow (Record, Cancel) make.
-func TestQueuesWorkflowStore(t *testing.T) {
-	e := newWFTest(t)
-	ctx := t.Context()
-	store := e.qs.WorkflowStore()
-	assert.Same(t, e.store, store)
-	for _, q := range e.all() {
-		assert.Same(t, store, q.WorkflowStore())
-		assert.Equal(t, store.ScopeID(), q.ScopeID())
-	}
-	assert.Nil(t, (&queues{}).WorkflowStore(), "no store: untyped nil")
-
-	require.NoError(t, store.Submit(ctx, wfPlan("qs", false, true,
-		tk{name: "a", q: e.a}, tk{name: "b", q: e.b, deps: []string{"a"}})))
-	assert.Equal(t, []string{"a", "b"}, e.drain(completeAll))
-	r, err := store.Record(ctx, "qs")
-	require.NoError(t, err)
-	assert.Equal(t, contract.WorkflowCompleted, r.State)
-	require.NoError(t, store.Cancel(ctx, "qs", nil), "ended: no change")
+	found, ok := contract.LookupWorkflowStore(e.a.ScopeID())
+	assert.True(t, ok)
+	assert.Same(t, e.store, found)
 }
 
 // A result over the limit fails the task; one that is not JSON is
@@ -3286,7 +3250,7 @@ func TestWorkflowExpired(t *testing.T) {
 	require.True(t, ok)
 	_, err := e.store.Runnable(ctx, "gone", "a", false)
 	assert.ErrorIs(t, err, contract.ErrWorkflowNotFound)
-	pushed, ok := e.a.FinishTask(a.ack, contract.TaskEnd{Workflow: "gone", Task: "a", Outcome: contract.OutcomeCancelled})
+	pushed, ok := e.store.FinishTask(e.a.QueueID(), a.ack, contract.TaskEnd{Workflow: "gone", Task: "a", Outcome: contract.OutcomeCancelled})
 	assert.True(t, ok)
 	assert.Empty(t, pushed)
 	assert.Zero(t, e.a.GetNackedItemsCount(), "settled")
@@ -3301,7 +3265,7 @@ func TestWorkflowForeignItem(t *testing.T) {
 	require.True(t, e.c.Enqueue(wfEnvelope("fx", "a", false, "1")))
 	p, ok := wfPop(t, e.c)
 	require.True(t, ok)
-	pushed, ok := e.c.FinishTask(p.ack, contract.TaskEnd{Workflow: "fx", Task: "a", Outcome: contract.OutcomeCompleted})
+	pushed, ok := e.store.FinishTask(e.c.QueueID(), p.ack, contract.TaskEnd{Workflow: "fx", Task: "a", Outcome: contract.OutcomeCompleted})
 	assert.True(t, ok)
 	assert.Empty(t, pushed)
 	assert.Equal(t, contract.JobPending, e.record("fx").Tasks[0].State)
@@ -3311,7 +3275,7 @@ func TestWorkflowForeignItem(t *testing.T) {
 	require.True(t, ok)
 	q, ok := wfPop(t, e.a)
 	require.True(t, ok)
-	_, ok = e.a.FinishTask(q.ack, contract.TaskEnd{Workflow: "bad id!", Task: "a", Outcome: contract.OutcomeCompleted})
+	_, ok = e.store.FinishTask(e.a.QueueID(), q.ack, contract.TaskEnd{Workflow: "bad id!", Task: "a", Outcome: contract.OutcomeCompleted})
 	assert.True(t, ok, "invalid tag: settled as a plain job")
 	assert.Equal(t, []string{"b"}, func() []string {
 		require.True(t, e.finish(p, completeAll))
@@ -3408,8 +3372,12 @@ func TestWorkflowTwoProcesses(t *testing.T) {
 // Guards: bad options, bad IDs, unknown outcomes, closed queues, queues
 // without a store, and errors from a closed client.
 func TestWorkflowGuards(t *testing.T) {
-	assert.Panics(t, func() { New(getTestRedisURL(), WithWorkflowResultLimit(0)) })
-	assert.Panics(t, func() { New(getTestRedisURL(), WithWorkflowRetention(0)) })
+	qs0 := New(getTestRedisURL(), WithNamespace(newID()))
+	defer qs0.Close()
+	_, err0 := NewWorkflowStore(qs0, WithWorkflowResultLimit(0))
+	assert.Error(t, err0)
+	_, err0 = NewWorkflowStore(qs0, WithWorkflowRetention(0))
+	assert.Error(t, err0)
 
 	e := newWFTest(t)
 	ctx := t.Context()
@@ -3430,13 +3398,18 @@ func TestWorkflowGuards(t *testing.T) {
 
 	a, ok := wfPop(t, e.a)
 	require.True(t, ok)
-	_, ok = e.a.FinishTask(a.ack, contract.TaskEnd{Workflow: "g", Task: "a", Outcome: "odd"})
+	_, ok = e.store.FinishTask(e.a.QueueID(), a.ack, contract.TaskEnd{Workflow: "g", Task: "a", Outcome: "odd"})
 	assert.False(t, ok, "unknown outcome")
 
-	// A queue without a store: plain finishes and purge, no scope.
+	// A queue key outside the store's scope or layout is refused.
+	for _, id := range []string{"redisq:other:fifo:{a}", e.a.queueKey + "}", "redisq:fifo:{a}", e.store.prefix + "fifo:a", e.store.prefix + "xxxx:{a}", e.store.prefix + "fifo:{a{b}"} {
+		_, ok = e.store.FinishTask(id, a.ack, contract.TaskEnd{Workflow: "g", Task: "a", Outcome: contract.OutcomeCompleted})
+		assert.False(t, ok, id)
+	}
+	// A queue made without a store: no scope, plain purge.
 	bare := newQueueBase(e.a.client, e.a.queueKey)
 	assert.Empty(t, bare.ScopeID())
-	_, ok = bare.FinishTask(a.ack, contract.TaskEnd{Workflow: "g", Task: "a", Outcome: contract.OutcomeCompleted})
+	_, ok = e.store.FinishTask(e.a.QueueID(), a.ack, contract.TaskEnd{Workflow: "g", Task: "a", Outcome: contract.OutcomeCompleted})
 	assert.True(t, ok)
 	bare.Purge()
 	assert.Zero(t, e.a.client.Exists(ctx, e.a.getStatsKey()).Val())
@@ -3444,12 +3417,14 @@ func TestWorkflowGuards(t *testing.T) {
 	// Closed queue and closed client.
 	closed := e.qs.NewQueue("z")
 	require.NoError(t, closed.Close())
-	_, ok = closed.FinishTask("x", contract.TaskEnd{Workflow: "g", Task: "a", Outcome: contract.OutcomeCompleted})
-	assert.False(t, ok)
+	_, ok = e.store.FinishTask(closed.QueueID(), "x", contract.TaskEnd{Workflow: "g", Task: "a", Outcome: contract.OutcomeCompleted})
+	assert.True(t, ok, "a closed queue's ack is stale: settled through the key, nothing to do")
 	qs := New(getTestRedisURL(), WithNamespace(newID()))
 	q := qs.NewQueue("a")
 	defer q.Close()
-	store := qs.(*queues).wf
+	store, err := NewWorkflowStore(qs)
+	require.NoError(t, err)
+	defer store.Close()
 	require.NoError(t, qs.Close())
 	assert.Error(t, store.Submit(ctx, wfPlan("g", false, false, tk{name: "a", q: q})))
 	assert.Error(t, store.Cancel(ctx, "g", nil))
@@ -3459,7 +3434,7 @@ func TestWorkflowGuards(t *testing.T) {
 	assert.Error(t, err)
 	_, err = store.Workflows(ctx, "", 0, 10)
 	assert.Error(t, err)
-	_, ok = q.FinishTask("x", contract.TaskEnd{Workflow: "g", Task: "a", Outcome: contract.OutcomeCompleted})
+	_, ok = store.FinishTask(q.QueueID(), "x", contract.TaskEnd{Workflow: "g", Task: "a", Outcome: contract.OutcomeCompleted})
 	assert.False(t, ok)
 	q.Purge()                             // logs the error
 	store.trimIndex(context.Background()) // logs the error
@@ -3640,7 +3615,7 @@ func TestWorkflowConcurrent(t *testing.T) {
 		wg.Go(func() {
 			qs := New(getTestRedisURL(), WithNamespace(strings.TrimPrefix(strings.TrimSuffix(e.store.prefix, ":"), "redisq:")))
 			defer qs.Close()
-			store := qs.(*queues).wf
+			store := e.store // other clients' queues: it builds them from the key
 			mine := []*Queue{qs.NewQueue("a"), qs.NewQueue("c")}
 			defer mine[0].Close()
 			defer mine[1].Close()
@@ -3658,7 +3633,7 @@ func TestWorkflowConcurrent(t *testing.T) {
 						} else {
 							end.Outcome = contract.OutcomeCancelled
 						}
-						_, ok := q.FinishTask(p.ack, end)
+						_, ok := store.FinishTask(q.QueueID(), p.ack, end)
 						assert.True(t, ok)
 					}
 				}
@@ -3691,7 +3666,7 @@ func TestWorkflowFinishChecks(t *testing.T) {
 	a, ok := wfPop(t, e.a)
 	require.True(t, ok)
 	require.Equal(t, "a", a.task)
-	pushed, ok := e.a.FinishTask(a.ack, contract.TaskEnd{Workflow: "fc", Task: "b", Outcome: contract.OutcomeFailed})
+	pushed, ok := e.store.FinishTask(e.a.QueueID(), a.ack, contract.TaskEnd{Workflow: "fc", Task: "b", Outcome: contract.OutcomeFailed})
 	assert.True(t, ok)
 	assert.Empty(t, pushed)
 	assert.Equal(t, map[string]contract.JobState{"a": contract.JobPending, "b": contract.JobPending, "c": contract.JobWaiting},
@@ -3709,7 +3684,7 @@ func TestWorkflowFinishChecks(t *testing.T) {
 	require.NoError(t, e.a.client.HSet(ctx, e.store.key("fc"), "t:b", "{nope").Err())
 	b, ok := wfPop(t, e.a)
 	require.True(t, ok)
-	_, ok = e.a.FinishTask(b.ack, contract.TaskEnd{Workflow: "fc", Task: "b", Outcome: contract.OutcomeCompleted})
+	_, ok = e.store.FinishTask(e.a.QueueID(), b.ack, contract.TaskEnd{Workflow: "fc", Task: "b", Outcome: contract.OutcomeCompleted})
 	assert.True(t, ok)
 	assert.Zero(t, e.a.GetNackedItemsCount())
 	assert.ErrorContains(t, e.store.Cancel(ctx, "fc", nil), "unreadable")
@@ -3762,4 +3737,112 @@ func TestWorkflowRobust(t *testing.T) {
 	e.store.trimmedAt.Store(0)
 	e.store.trimIndex(ctx)
 	assert.Equal(t, redis.Nil, e.a.client.ZScore(ctx, e.store.indexKey(), "old").Err())
+}
+
+// NewWorkflowStore registers the scope's store with contract; a second one
+// for the scope is refused until the first closes.
+func TestNewWorkflowStoreRegistry(t *testing.T) {
+	ns := newID()
+	qs := New(getTestRedisURL(), WithNamespace(ns))
+	defer qs.Close()
+	qs2 := New(getTestRedisURL(), WithNamespace(ns))
+	defer qs2.Close()
+	other := New(getTestRedisURL(), WithNamespace(newID()))
+	defer other.Close()
+	q := qs.NewQueue("a")
+	defer q.Close()
+
+	// The scope needs no store, and is the same across clients and kinds.
+	scope := q.ScopeID()
+	assert.NotEmpty(t, scope)
+	assert.Equal(t, scope, qs2.NewPriorityQueue("b").ScopeID())
+	assert.NotEqual(t, scope, other.NewQueue("a").ScopeID())
+	_, found := contract.LookupWorkflowStore(scope)
+	assert.False(t, found)
+
+	s, err := NewWorkflowStore(qs, WithWorkflowResultLimit(10), WithWorkflowRetention(time.Hour))
+	require.NoError(t, err)
+	assert.Equal(t, scope, s.ScopeID())
+	assert.Equal(t, 10, s.resultLimit)
+	assert.Equal(t, time.Hour, s.retention)
+	got, found := contract.LookupWorkflowStore(scope)
+	require.True(t, found)
+	assert.Same(t, s, got)
+	assert.Contains(t, contract.WorkflowStores(), contract.WorkflowStore(s))
+
+	_, err = NewWorkflowStore(qs2)
+	assert.ErrorIs(t, err, contract.ErrScopeRegistered, "one store per scope")
+	s2, err := NewWorkflowStore(other)
+	require.NoError(t, err, "another scope")
+	assert.NoError(t, s2.Close())
+
+	require.NoError(t, s.Close())
+	require.NoError(t, s.Close(), "idempotent")
+	_, found = contract.LookupWorkflowStore(scope)
+	assert.False(t, found)
+	s3, err := NewWorkflowStore(qs2)
+	require.NoError(t, err, "the scope is free after Close")
+	assert.NoError(t, s3.Close())
+
+	_, err = NewWorkflowStore(qs, WithWorkflowResultLimit(0))
+	assert.Error(t, err)
+	_, err = NewWorkflowStore(qs, WithWorkflowRetention(0))
+	assert.Error(t, err)
+	_, err = NewWorkflowStore(nil)
+	assert.Error(t, err)
+	_, found = contract.LookupWorkflowStore(scope)
+	assert.False(t, found, "a failed constructor registers nothing")
+}
+
+// A queue with no store in its process still runs plain jobs, and a purge
+// still cancels the workflow tasks it removes, with the default retention.
+func TestQueueWithoutWorkflowStore(t *testing.T) {
+	qs := New(getTestRedisURL(), WithNamespace(newID()))
+	defer qs.Close()
+	q := qs.NewQueue("plain")
+	defer q.Close()
+	pq := qs.NewPriorityQueue("plain-prio")
+	defer pq.Close()
+
+	require.True(t, q.Enqueue(`{"id":"j1","data":1}`))
+	_, ok, ack := q.DequeueWithAckId()
+	require.True(t, ok)
+	assert.True(t, q.Acknowledge(ack))
+	require.True(t, pq.Enqueue(`{"id":"j2","data":2}`, 1))
+	_, ok, ack = pq.DequeueWithAckId()
+	require.True(t, ok)
+	assert.True(t, pq.Acknowledge(ack))
+
+	s, err := NewWorkflowStore(qs)
+	require.NoError(t, err)
+	require.NoError(t, s.Submit(t.Context(), wfPlan("np", false, false, tk{name: "a", q: q})))
+	require.NoError(t, s.Close())
+	q.Purge()
+	rec, err := s.Record(t.Context(), "np")
+	require.NoError(t, err)
+	assert.Equal(t, contract.JobCancelled, rec.Tasks[0].State, "a purged task ends")
+}
+
+// A store of one client finishes tasks of a queue that another client of the
+// scope made, and of a priority queue, by the key alone.
+func TestWorkflowStoreFinishesByQueueKey(t *testing.T) {
+	e := newWFTest(t)
+	other := New(getTestRedisURL(), WithNamespace(strings.TrimPrefix(strings.TrimSuffix(e.store.prefix, ":"), "redisq:")))
+	defer other.Close()
+	oa, ob := other.NewQueue("a"), other.NewPriorityQueue("b")
+	defer oa.Close()
+	defer ob.Close()
+
+	require.NoError(t, e.store.Submit(t.Context(), wfPlan("key", false, false,
+		tk{name: "a", q: e.a}, tk{name: "b", q: e.b, deps: []string{"a"}})))
+	a, ok := wfPop(t, oa)
+	require.True(t, ok)
+	pushed, ok := e.store.FinishTask(oa.QueueID(), a.ack, contract.TaskEnd{Workflow: "key", Task: "a", Outcome: contract.OutcomeCompleted, Result: []byte(`1`)})
+	require.True(t, ok)
+	assert.Equal(t, []string{e.b.queueKey}, pushed)
+	b, ok := wfPop(t, ob.Queue)
+	require.True(t, ok)
+	_, ok = e.store.FinishTask(ob.QueueID(), b.ack, contract.TaskEnd{Workflow: "key", Task: "b", Outcome: contract.OutcomeCompleted})
+	require.True(t, ok)
+	assert.Equal(t, contract.WorkflowCompleted, e.record("key").State)
 }

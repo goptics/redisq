@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -28,11 +29,9 @@ import (
 // supported (spec 6.9). Every key a script touches is in KEYS.
 
 var (
-	_ contract.WorkflowStore           = (*workflowStore)(nil)
-	_ contract.WorkflowInspector       = (*workflowStore)(nil)
-	_ contract.WorkflowKeyLister       = (*workflowStore)(nil)
-	_ contract.WorkflowAcknowledgeable = (*Queue)(nil)
-	_ contract.WorkflowAcknowledgeable = (*PriorityQueue)(nil)
+	_ contract.WorkflowStore     = (*WorkflowStore)(nil)
+	_ contract.WorkflowInspector = (*WorkflowStore)(nil)
+	_ contract.WorkflowKeyLister = (*WorkflowStore)(nil)
 )
 
 // Store defaults (spec 6.10).
@@ -45,9 +44,10 @@ const (
 // plus the page (spec 7.3).
 const maxWorkflowsScan = 10000
 
-// workflowStore is the workflow store of one Redis and namespace: every
-// queue of a Queues shares it.
-type workflowStore struct {
+// WorkflowStore is the workflow store of one Redis and namespace (a scope):
+// every queue of the scope shares it. Make it with NewWorkflowStore.
+type WorkflowStore struct {
+	qs          *queues
 	client      *redis.Client
 	scope       string
 	prefix      string // redisq:[<ns>:]
@@ -56,72 +56,105 @@ type workflowStore struct {
 	trimFrom    atomic.Int64 // trimIndex's offset past old entries still live
 	trimming    atomic.Bool  // a trimIndex runs: every queue's sweep calls it
 	trimmedAt   atomic.Int64 // Unix ms of the last trimIndex
+	bare        sync.Map     // queue key -> *Queue built from the key (see queue)
 }
+
+// WorkflowOption configures NewWorkflowStore.
+type WorkflowOption func(*WorkflowStore) error
 
 // WithWorkflowResultLimit caps a workflow task's result at n bytes (default
 // 64 KiB). A bigger one fails the task (varmq: task result too large).
-func WithWorkflowResultLimit(n int) Option {
-	return func(qs *queues) error {
+func WithWorkflowResultLimit(n int) WorkflowOption {
+	return func(s *WorkflowStore) error {
 		if n <= 0 {
 			return fmt.Errorf("redisq: workflow result limit %d must be above 0", n)
 		}
-		qs.wfResultLimit = n
+		s.resultLimit = n
 		return nil
 	}
 }
 
 // WithWorkflowRetention sets how long an ended workflow is kept (default 7
 // days). A running one is kept until it ends.
-func WithWorkflowRetention(d time.Duration) Option {
-	return func(qs *queues) error {
+func WithWorkflowRetention(d time.Duration) WorkflowOption {
+	return func(s *WorkflowStore) error {
 		if d < time.Millisecond {
 			return fmt.Errorf("redisq: workflow retention %v must be at least 1ms", d)
 		}
-		qs.wfRetention = d
+		s.retention = d
 		return nil
 	}
 }
 
-// newWorkflowStore is qs's store. Its scope is the Redis address, database
-// and key prefix: two stores share state exactly when those match.
-func newWorkflowStore(qs *queues) *workflowStore {
-	o := qs.client.Options()
-	return &workflowStore{
-		client:      qs.client,
-		scope:       "redisq:" + o.Addr + "/" + strconv.Itoa(o.DB) + "/" + qs.prefix(),
-		prefix:      qs.prefix(),
-		resultLimit: cmp.Or(qs.wfResultLimit, defaultResultLimit),
-		retention:   cmp.Or(qs.wfRetention, defaultWFRetention),
+// NewWorkflowStore is the workflow store of qs's Redis, database and
+// namespace, registered with varmq's contract so workers find it by scope.
+// Make it in every process that runs, submits or lists workflows of that
+// scope; one per scope per process, else contract.ErrScopeRegistered.
+// It uses qs's connection: Close it before qs. qs must come from New.
+func NewWorkflowStore(qs Queues, opts ...WorkflowOption) (*WorkflowStore, error) {
+	q, ok := qs.(*queues)
+	if !ok {
+		return nil, fmt.Errorf("redisq: NewWorkflowStore needs the Queues from New, got %T", qs)
 	}
+	s := &WorkflowStore{
+		qs:          q,
+		client:      q.client,
+		scope:       q.scope(),
+		prefix:      q.prefix(),
+		resultLimit: defaultResultLimit,
+		retention:   defaultWFRetention,
+	}
+	for _, o := range opts {
+		if err := o(s); err != nil {
+			return nil, err
+		}
+	}
+	if err := contract.RegisterWorkflowStore(s); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
-func (s *workflowStore) ScopeID() string      { return s.scope }
-func (s *workflowStore) key(id string) string { return s.prefix + "wf:" + id }
-func (s *workflowStore) indexKey() string     { return s.prefix + "wf:index" }
+// Close unregisters the store; its scope can take another. It leaves the
+// Queues connection open.
+func (s *WorkflowStore) Close() error {
+	contract.UnregisterWorkflowStore(s)
+	return nil
+}
 
-func (s *workflowStore) notFound(id string) error {
+func (s *WorkflowStore) ScopeID() string      { return s.scope }
+func (s *WorkflowStore) key(id string) string { return s.prefix + "wf:" + id }
+func (s *WorkflowStore) indexKey() string     { return s.prefix + "wf:index" }
+
+func (s *WorkflowStore) notFound(id string) error {
 	return fmt.Errorf("%w: %s", contract.ErrWorkflowNotFound, id)
 }
 
 // owns: q is a redisq queue of this store's scope.
-func (s *workflowStore) owns(q *Queue) bool { return q != nil && q.wf != nil && q.wf.scope == s.scope }
+func (s *WorkflowStore) owns(q *Queue) bool { return q != nil && q.scope == s.scope }
 
-// ScopeID is the workflow store's scope: the Redis address, database and
-// namespace. "" for a queue made without a store.
-func (q *Queue) ScopeID() string {
-	if q.wf == nil {
-		return ""
-	}
-	return q.wf.scope
-}
+// ScopeID is the queue's workflow scope: the Redis address, database and
+// namespace. Workflows of a scope live in its registered store.
+func (q *Queue) ScopeID() string { return q.scope }
 
-// WorkflowStore is the same store as Queues.WorkflowStore(); for varmq
-// (contract.WorkflowAcknowledgeable). nil (untyped) for a queue made without one.
-func (q *Queue) WorkflowStore() contract.WorkflowStore {
-	if q.wf == nil {
+// store is the workflow store registered for this queue's scope in this
+// process, or nil.
+func (q *Queue) store() *WorkflowStore {
+	cs, ok := contract.LookupWorkflowStore(q.scope)
+	if !ok {
 		return nil
 	}
-	return q.wf
+	s, _ := cs.(*WorkflowStore)
+	return s
+}
+
+// queuePrefix is the redisq:[<ns>:] part of a queue key.
+func queuePrefix(key string) string {
+	i := strings.IndexByte(key, '{')
+	if i < 5 {
+		return ""
+	}
+	return key[:i-5] // minus fifo: or prio:
 }
 
 // validWFName: 1 to n characters of [A-Za-z0-9_.-] (spec 1.2).
@@ -604,7 +637,7 @@ redis.call('ZADD', KEYS[2], now, ARGV[2])
 return 1`)
 
 // planQueue is the redisq queue of a plan's task or undo, in this scope.
-func (s *workflowStore) planQueue(name, queueID string, q, item any) (*Queue, []byte, error) {
+func (s *WorkflowStore) planQueue(name, queueID string, q, item any) (*Queue, []byte, error) {
 	var rq *Queue
 	switch v := q.(type) {
 	case *Queue:
@@ -632,7 +665,7 @@ func (s *workflowStore) planQueue(name, queueID string, q, item any) (*Queue, []
 
 // Submit stores plan p and pushes its roots (spec 6.9). A stored ID is
 // success when its plan hash is equal, else ErrWorkflowExists.
-func (s *workflowStore) Submit(ctx context.Context, p contract.WorkflowPlan) error {
+func (s *WorkflowStore) Submit(ctx context.Context, p contract.WorkflowPlan) error {
 	if len(p.Tasks) == 0 {
 		return fmt.Errorf("varmq: workflow %s has no tasks", p.ID)
 	}
@@ -734,6 +767,30 @@ if not t or (undo and (type(t.undo) ~= 'table' or t.undo.queue ~= ARGV[13])) or 
 local fx = wffinish(W, ARGV[9], ARGV[11], ARGV[3], ARGV[6], undo)
 return {1, unpack(wfapply(W, fx, Q, {}, {}))}`)
 
+// queue is the queue object that settles queueID's jobs: the live one a Queues
+// of this store made, else a bare one built from the key layout
+// redisq:[<ns>:]<fifo|prio>:{key} (a worker-only process, or another client
+// of the scope; its Job Record retention is the default, not a SetCompleted
+// Retention of the worker's queue). ponytail: bare queues are cached for the
+// store's life.
+func (s *WorkflowStore) queue(id string) (*Queue, error) {
+	if q := s.qs.lookup(id); q != nil && q.ctx.Err() == nil { // a closed one may shadow a live object
+		return q, nil
+	}
+	if q, ok := s.bare.Load(id); ok {
+		return q.(*Queue), nil
+	}
+	kind, ok := strings.CutPrefix(id, s.prefix)
+	if !ok || len(kind) < 8 || kind[4] != ':' || kind[5] != '{' || kind[len(kind)-1] != '}' ||
+		strings.ContainsAny(kind[6:len(kind)-1], "{}") || (kind[:4] != "fifo" && kind[:4] != "prio") {
+		return nil, fmt.Errorf("queue %q is not a queue of scope %s", id, s.scope)
+	}
+	q := newQueueBase(s.client, id)
+	q.scope, q.isPriority = s.scope, kind[:4] == "prio"
+	act, _ := s.bare.LoadOrStore(id, q)
+	return act.(*Queue), nil
+}
+
 // FinishTask settles ackID and applies the task end to its workflow in one
 // step (spec 6.10): it returns the queue IDs it pushed into, or, when the
 // item had already ended, every push-target queue of the workflow. A gone
@@ -742,17 +799,17 @@ return {1, unpack(wfapply(W, fx, Q, {}, {}))}`)
 // limit fails the task (contract.ErrResultTooLarge); one that is not JSON
 // is dropped. Ends with an invalid workflow ID or task name are settled as
 // plain jobs.
-func (q *Queue) FinishTask(ackID string, e contract.TaskEnd) ([]string, bool) {
+func (s *WorkflowStore) FinishTask(queueID, ackID string, e contract.TaskEnd) ([]string, bool) {
+	q, err := s.queue(queueID)
+	if err != nil {
+		log.Printf("redisq: finish task %s/%s: %v", e.Workflow, e.Task, err)
+		return nil, false
+	}
 	if q.ctx.Err() != nil {
 		log.Println("queue closed, cannot finish task")
 		return nil, false
 	}
-	limit, ret := defaultResultLimit, defaultWFRetention
-	if q.wf != nil {
-		limit, ret = q.wf.resultLimit, q.wf.retention
-	}
-	// ponytail: a queue with no store (only newQueueBase) settles every
-	// end as a plain job: it has no namespace to find workflows in.
+	limit, ret := s.resultLimit, s.retention
 
 	state, reason, result := "completed", e.Reason, e.Result
 	switch e.Outcome {
@@ -773,7 +830,7 @@ func (q *Queue) FinishTask(ackID string, e contract.TaskEnd) ([]string, bool) {
 		return nil, false
 	}
 
-	if q.wf == nil || !validWorkflowID(e.Workflow) || !validTaskName(e.Task) {
+	if !validWorkflowID(e.Workflow) || !validTaskName(e.Task) {
 		return nil, q.finish(ackID, state, reason, result)
 	}
 
@@ -782,9 +839,9 @@ func (q *Queue) FinishTask(ackID string, e contract.TaskEnd) ([]string, bool) {
 	if e.Undo {
 		undo = "1"
 	}
-	wfKey := q.wf.key(e.Workflow)
+	wfKey := s.key(e.Workflow)
 	var pushed []string
-	err := reread(func() error {
+	err = reread(func() error {
 		ts, err := wfTargets(q.ctx, q.client, wfKey)
 		if err != nil {
 			return err
@@ -827,7 +884,7 @@ return {1}`)
 // Cancel cancels workflow id (spec 6.11): waiting tasks now, queued ones at
 // their pre-run check. undo nil keeps the workflow's undo_on_cancel.
 // Cancelling an ended or cancelled workflow does nothing.
-func (s *workflowStore) Cancel(ctx context.Context, id string, undo *bool) error {
+func (s *WorkflowStore) Cancel(ctx context.Context, id string, undo *bool) error {
 	if !validWorkflowID(id) {
 		return s.notFound(id)
 	}
@@ -886,7 +943,7 @@ type undoState struct {
 
 // get reads fields of workflow id: meta first; ErrWorkflowNotFound when
 // the hash is gone.
-func (s *workflowStore) get(ctx context.Context, id string, fields ...string) (wfMeta, []any, error) {
+func (s *WorkflowStore) get(ctx context.Context, id string, fields ...string) (wfMeta, []any, error) {
 	if !validWorkflowID(id) {
 		return wfMeta{}, nil, s.notFound(id)
 	}
@@ -911,7 +968,7 @@ func field(v any, out any) bool {
 }
 
 // Runnable is the pre-run check (spec 6.12).
-func (s *workflowStore) Runnable(ctx context.Context, workflowID, task string, undo bool) (bool, error) {
+func (s *WorkflowStore) Runnable(ctx context.Context, workflowID, task string, undo bool) (bool, error) {
 	m, r, err := s.get(ctx, workflowID, "t:"+task, "s:"+task, "u:"+task)
 	if err != nil {
 		return false, err
@@ -930,7 +987,7 @@ func (s *workflowStore) Runnable(ctx context.Context, workflowID, task string, u
 
 // DepResult returns task's stored result: ErrDepFailed when it failed or
 // was cancelled, ErrNoResult when it left none or has not ended.
-func (s *workflowStore) DepResult(ctx context.Context, workflowID, task string) ([]byte, error) {
+func (s *WorkflowStore) DepResult(ctx context.Context, workflowID, task string) ([]byte, error) {
 	_, r, err := s.get(ctx, workflowID, "s:"+task, "r:"+task)
 	if err != nil {
 		return nil, err
@@ -947,7 +1004,7 @@ func (s *workflowStore) DepResult(ctx context.Context, workflowID, task string) 
 }
 
 // Record returns workflow id (spec 7.3, One).
-func (s *workflowStore) Record(ctx context.Context, id string) (contract.WorkflowRecord, error) {
+func (s *WorkflowStore) Record(ctx context.Context, id string) (contract.WorkflowRecord, error) {
 	if !validWorkflowID(id) {
 		return contract.WorkflowRecord{}, s.notFound(id)
 	}
@@ -959,7 +1016,7 @@ func (s *workflowStore) Record(ctx context.Context, id string) (contract.Workflo
 }
 
 // recordOf builds workflow id's record from its hash h.
-func (s *workflowStore) recordOf(id string, h map[string]string) (contract.WorkflowRecord, error) {
+func (s *WorkflowStore) recordOf(id string, h map[string]string) (contract.WorkflowRecord, error) {
 	var m wfMeta
 	if h["meta"] == "" {
 		return contract.WorkflowRecord{}, s.notFound(id)
@@ -992,7 +1049,7 @@ func (s *workflowStore) recordOf(id string, h map[string]string) (contract.Workf
 
 // Workflows lists up to limit workflows in state ("" any), newest first
 // then by ID, skipping offset (spec 7.3, List).
-func (s *workflowStore) Workflows(ctx context.Context, state contract.WorkflowState, offset, limit int) ([]contract.WorkflowRecord, error) {
+func (s *WorkflowStore) Workflows(ctx context.Context, state contract.WorkflowState, offset, limit int) ([]contract.WorkflowRecord, error) {
 	keys, err := s.WorkflowKeys(ctx, state, offset, limit)
 	if err != nil {
 		return nil, err
@@ -1024,7 +1081,7 @@ const listChunk = 200
 // nothing. A state filter reads at most 10000 + limit entries. Entries past
 // offset+limit with the last one's created_at are read too, so ties sort by
 // ID as varmq merges them.
-func (s *workflowStore) WorkflowKeys(ctx context.Context, state contract.WorkflowState, offset, limit int) ([]contract.WorkflowKey, error) {
+func (s *WorkflowStore) WorkflowKeys(ctx context.Context, state contract.WorkflowState, offset, limit int) ([]contract.WorkflowKey, error) {
 	offset, limit = max(offset, 0), max(limit, 0)
 	limit = min(limit, math.MaxInt-offset)
 	want := offset + limit
@@ -1111,7 +1168,7 @@ return n`)
 // retention after finished_at: a workflow running past the retention would
 // drop out of listings while Record still finds it. Old entries still live
 // are stepped over (trimFrom), so they don't stall the trim.
-func (s *workflowStore) trimIndex(ctx context.Context) {
+func (s *WorkflowStore) trimIndex(ctx context.Context) {
 	now := time.Now()
 	if now.UnixMilli()-s.trimmedAt.Load() < 50_000 || !s.trimming.CompareAndSwap(false, true) {
 		return // one trim per store a minute, not one per queue
@@ -1235,10 +1292,14 @@ const purgeTimeout = 5 * time.Minute
 
 func (q *Queue) purge() error {
 	del := append(q.requeueKeys(), q.getJobsKey(), q.getCompletedKey(), q.getFailedKey(), q.getStatsKey(), q.getCancelledKey())
-	if q.wf == nil { // no store (newQueueBase): no workflows to find
+	if q.scope == "" { // newQueueBase alone: no namespace to find workflows in
 		return q.client.Del(q.ctx, del...).Err()
 	}
-	ret := q.wf.retention
+	// No store in this process: workflow keys come from the queue key.
+	ret, wfPrefix := defaultWFRetention, queuePrefix(q.queueKey)
+	if s := q.store(); s != nil {
+		ret = s.retention
+	}
 	var ids []string
 	// A purge scans every item in one script: give it time, so the read
 	// timeout doesn't re-send it while it runs.
@@ -1252,7 +1313,7 @@ func (q *Queue) purge() error {
 		var fresh []string
 		hashes := make([]string, len(ids))
 		for i, id := range ids {
-			hashes[i] = q.wf.key(id)
+			hashes[i] = wfPrefix + "wf:" + id
 			if len(known[id]) == 0 { // new, or its hash was gone: it may exist now
 				fresh = append(fresh, id)
 			}
@@ -1260,7 +1321,7 @@ func (q *Queue) purge() error {
 		if len(fresh) > 0 {
 			keys := make([]string, len(fresh))
 			for i, id := range fresh {
-				keys[i] = q.wf.key(id)
+				keys[i] = wfPrefix + "wf:" + id
 			}
 			each, err := wfTargetsEach(q.ctx, q.client, keys...)
 			if err != nil {

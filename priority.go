@@ -60,11 +60,11 @@ func (pq *PriorityQueue) pushKeys() []string {
 	return []string{pq.queueKey, pq.queueKey + ":seq", pq.getIdleKey(), pq.getStatsKey()}
 }
 
-func newPriorityQueue(client *redis.Client, queueKey string, wf *workflowStore) *PriorityQueue {
+func newPriorityQueue(client *redis.Client, queueKey string, scope string) *PriorityQueue {
 	q := &PriorityQueue{
 		Queue: newQueueBase(client, queueKey),
 	}
-	q.wf = wf
+	q.scope = scope
 	q.isPriority = true
 	q.tickScript, q.releaseScript = zsetTick, zsetRelease
 	q.storageKeys = []string{q.queueKey + ":seq", q.getPriorityKey()}

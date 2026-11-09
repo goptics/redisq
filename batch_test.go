@@ -139,9 +139,9 @@ func TestDequeueBatchShortPopMarksConsumerIdle(t *testing.T) {
 	defer qs.Close()
 	ctx := context.Background()
 
-	dq := qs.NewDistributedQueue("test_batch_idle_list")
+	dq := qs.NewQueue("test_batch_idle_list")
 	defer dq.Close()
-	dpq := qs.NewDistributedPriorityQueue("test_batch_idle_prio")
+	dpq := qs.NewPriorityQueue("test_batch_idle_prio")
 	defer dpq.Close()
 
 	for _, c := range []struct {
@@ -513,7 +513,7 @@ func TestDequeueBatchReusedReservationMarksIdle(t *testing.T) {
 	p := newDropProxy(t, listAckPop, listAckPopOneLen)
 	qs := New(p.url())
 	defer qs.Close()
-	dq := qs.NewDistributedQueue("test_batch_reuse_idle")
+	dq := qs.NewQueue("test_batch_reuse_idle")
 	defer dq.Close()
 	delKeys(t, dq.client, dq.queueKey)
 	defer delKeys(t, dq.client, dq.queueKey)
@@ -574,7 +574,7 @@ func TestDequeueBatchMaxPopMarksIdle(t *testing.T) {
 	ctx := context.Background()
 	qs := New(getTestRedisURL())
 	defer qs.Close()
-	dq := qs.NewDistributedQueue("test_batch_maxpop_idle")
+	dq := qs.NewQueue("test_batch_maxpop_idle")
 	defer dq.Close()
 	delKeys(t, dq.client, dq.queueKey)
 	defer delKeys(t, dq.client, dq.queueKey)
@@ -968,7 +968,7 @@ func TestDequeueBatchOneItemIdleRule(t *testing.T) {
 	ctx := context.Background()
 	qs := New(getTestRedisURL())
 	defer qs.Close()
-	dq := qs.NewDistributedQueue("test_batch_one_idle")
+	dq := qs.NewQueue("test_batch_one_idle")
 	defer dq.Close()
 	delKeys(t, dq.client, dq.queueKey)
 	defer delKeys(t, dq.client, dq.queueKey)

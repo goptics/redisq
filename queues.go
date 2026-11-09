@@ -2,10 +2,12 @@ package redisq
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"weak"
 
-	"github.com/goptics/varmq/contract"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -13,9 +15,8 @@ type queues struct {
 	client    *redis.Client
 	namespace string
 
-	wf            *workflowStore // shared by every queue (see workflow.go)
-	wfResultLimit int            // WithWorkflowResultLimit; 0 = default
-	wfRetention   time.Duration  // WithWorkflowRetention; 0 = default
+	regMu sync.Mutex
+	reg   map[string]weak.Pointer[Queue] // queues made here by key, for WorkflowStore.FinishTask
 
 	reportEvery time.Duration // WithInstanceReports; 0 = off
 	stopReports func()
@@ -41,13 +42,6 @@ func WithNamespace(ns string) Option {
 type Queues interface {
 	NewQueue(queueKey string) *Queue
 	NewPriorityQueue(queueKey string) *PriorityQueue
-	// Deprecated: use NewQueue; every queue is distributed since v1.6.0.
-	NewDistributedQueue(queueKey string) *Queue
-	// Deprecated: use NewPriorityQueue; every queue is distributed since v1.6.0.
-	NewDistributedPriorityQueue(queueKey string) *PriorityQueue
-	// WorkflowStore is the one workflow store of this client's Redis and
-	// namespace, shared by all its queues. Pass it to varmq.NewWorkflow.
-	WorkflowStore() contract.WorkflowStore
 	Close() error
 }
 
@@ -77,7 +71,6 @@ func New(url string, options ...Option) Queues {
 	opts.DialerRetries = 1 // one dial attempt; a URL can't set this
 
 	qs.client = redis.NewClient(opts)
-	qs.wf = newWorkflowStore(qs)
 	if qs.reportEvery > 0 {
 		qs.startReports()
 	}
@@ -106,33 +99,15 @@ func (qs *queues) prefix() string {
 }
 
 func (qs *queues) NewQueue(queueKey string) *Queue {
-	return newQueue(qs.client, qs.key("fifo", queueKey), qs.wf)
+	q := newQueue(qs.client, qs.key("fifo", queueKey), qs.scope())
+	qs.register(q)
+	return q
 }
 
 func (qs *queues) NewPriorityQueue(queueKey string) *PriorityQueue {
-	return newPriorityQueue(qs.client, qs.key("prio", queueKey), qs.wf)
-}
-
-// WorkflowStore is the client's workflow store; nil (untyped) if none.
-func (qs *queues) WorkflowStore() contract.WorkflowStore {
-	if qs.wf == nil {
-		return nil
-	}
-	return qs.wf
-}
-
-// NewDistributedQueue is NewQueue.
-//
-// Deprecated: use NewQueue; every queue is distributed since v1.6.0.
-func (qs *queues) NewDistributedQueue(queueKey string) *Queue {
-	return qs.NewQueue(queueKey)
-}
-
-// NewDistributedPriorityQueue is NewPriorityQueue.
-//
-// Deprecated: use NewPriorityQueue; every queue is distributed since v1.6.0.
-func (qs *queues) NewDistributedPriorityQueue(queueKey string) *PriorityQueue {
-	return qs.NewPriorityQueue(queueKey)
+	pq := newPriorityQueue(qs.client, qs.key("prio", queueKey), qs.scope())
+	qs.register(pq.Queue)
+	return pq
 }
 
 // Close stops instance reports, removing this process's record, then
@@ -143,4 +118,29 @@ func (qs *queues) Close() error {
 		<-qs.reportsDone
 	}
 	return qs.client.Close()
+}
+
+// scope is the Redis address, database and key prefix: two clients share
+// workflow state exactly when those match. Needs no store.
+func (qs *queues) scope() string {
+	o := qs.client.Options()
+	return "redisq:" + o.Addr + "/" + strconv.Itoa(o.DB) + "/" + qs.prefix()
+}
+
+// register notes q under its key so a store of this client finds the live
+// object (its record retention) when it finishes a task.
+func (qs *queues) register(q *Queue) {
+	qs.regMu.Lock()
+	defer qs.regMu.Unlock()
+	if qs.reg == nil {
+		qs.reg = map[string]weak.Pointer[Queue]{}
+	}
+	qs.reg[q.queueKey] = weak.Make(q)
+}
+
+// lookup is the live queue made here under key, or nil.
+func (qs *queues) lookup(key string) *Queue {
+	qs.regMu.Lock()
+	defer qs.regMu.Unlock()
+	return qs.reg[key].Value()
 }
