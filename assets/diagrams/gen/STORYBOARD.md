@@ -223,7 +223,7 @@ section's invariants; `make diagrams` rebuilds them.
 - Plain queues subscribe to their wake channel too, and `presenceGrace` went from 5 s to 2.5 s: row A now
   reaps at 4.3 s (2.5-5 s in general); the labels say "gone ≥ 2.5 s", since sweeps land a second apart.
 - Re-cited against redisq `5903240` (#33: one queue kind, so `distributed.go` is now only the deprecated
-  aliases and its citations moved to `queue.go`; #34: workflows). Labels say `Queue`, not `DistributedQueue`. The ack-on-fail fact is now
+  aliases and its citations moved to `queue.go` (`distributed.go` was removed with the aliases in the workflow-store split); #34: workflows). Labels say `Queue`, not `DistributedQueue`. The ack-on-fail fact is now
   `Reject` (varmq `main`). Behaviour drawn is unchanged.
   - Open: varmq `main` binds an ack source that batches (`batchAckSource`, `source.go:317`,
     `DequeueBatchWithAckIds`), so with VarMQ ≥ v1.11.0 a wake with 3 free slots makes one batch pop, not 3

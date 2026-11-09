@@ -56,12 +56,12 @@ type Queue struct {
 	rawKeys               []string                    // what Dequeue's scripts take
 	closeOnce             sync.Once
 	outcomes              outcomeWatchers // WatchOutcome watchers (see outcome.go)
-	wf                    *workflowStore  // the namespace's workflow store; nil for a queue made without one
+	scope                 string          // see ScopeID; "" for a queue made by newQueueBase alone
 }
 
-func newQueue(c *redis.Client, queueKey string, wf *workflowStore) *Queue {
+func newQueue(c *redis.Client, queueKey string, scope string) *Queue {
 	q := newQueueBase(c, queueKey)
-	q.wf = wf
+	q.scope = scope
 	q.tickScript, q.releaseScript = listTick, listRelease
 	q.start()
 	return q
@@ -134,18 +134,6 @@ func (q *Queue) getVisibilityTimeout() time.Duration {
 // expiration: an expired task would leave its workflow running forever.
 func (q *Queue) SetExpiration(expiration time.Duration) {
 	q.expiration.Store(int64(expiration))
-}
-
-// SetAckTimeout sets how long a job can be processing before being requeued.
-//
-// Deprecated: use SetVisibilityTimeout, which this calls. It used to expire
-// the whole pending hash, which deleted every unacknowledged job instead of
-// requeueing it. A value <= 0 meant "no expiry" and is ignored: a zero
-// visibility timeout would requeue every pending job, even ones in progress.
-func (q *Queue) SetAckTimeout(ackTimeout time.Duration) {
-	if ackTimeout > 0 {
-		q.SetVisibilityTimeout(ackTimeout)
-	}
 }
 
 // SetVisibilityTimeout sets the visibility timeout for jobs
@@ -1436,8 +1424,8 @@ func (q *Queue) sweep() {
 		q.sweepOutcomes()
 		if i%60 == 0 { // ponytail: a minute is fine against hour-long ages
 			q.trim()
-			if q.wf != nil {
-				q.wf.trimIndex(q.ctx)
+			if s := q.store(); s != nil {
+				s.trimIndex(q.ctx)
 			}
 		}
 	}
@@ -1592,6 +1580,7 @@ func (q *Queue) Close() error {
 	var err error
 	q.closeOnce.Do(func() {
 		q.leave()
+		untrack(liveKey{q.scope, q.queueKey}, q)
 		q.cancel() // stops the sweep
 		err = q.release()
 		q.outcomes.close()

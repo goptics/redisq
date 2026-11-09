@@ -42,7 +42,7 @@ func TestPauseGatesEveryPop(t *testing.T) {
 	qs := pauseClient(t)
 	key := newID()
 	fifo, prio := qs.NewQueue("fifo-"+key), qs.NewPriorityQueue("prio-"+key)
-	dfifo, dprio := qs.NewDistributedQueue("dfifo-"+key), qs.NewDistributedPriorityQueue("dprio-"+key)
+	dfifo, dprio := qs.NewQueue("dfifo-"+key), qs.NewPriorityQueue("dprio-"+key)
 	kinds := map[string]struct {
 		q   pausable
 		add func(string) bool
@@ -181,7 +181,7 @@ func TestPauseGuardBeforeGate(t *testing.T) {
 func TestPauseSeenByOtherProcesses(t *testing.T) {
 	key := newID()
 	a := pauseClient(t).NewQueue(key)
-	b := pauseClient(t).NewDistributedQueue(key)
+	b := pauseClient(t).NewQueue(key)
 	var mu sync.Mutex
 	var calls []bool
 	got := func() []bool { mu.Lock(); defer mu.Unlock(); return append([]bool(nil), calls...) }
@@ -224,7 +224,7 @@ func TestPauseLostControlHeals(t *testing.T) {
 
 // Resume wakes an idle distributed consumer, as an enqueue does.
 func TestResumeWakesIdleConsumer(t *testing.T) {
-	q := pauseClient(t).NewDistributedQueue(newID())
+	q := pauseClient(t).NewQueue(newID())
 	woken := make(chan string, 10)
 	q.Subscribe(func(a string) { woken <- a })
 	require.NoError(t, q.Pause())

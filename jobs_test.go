@@ -32,11 +32,11 @@ var jobsCases = []jobsCase{
 		return q.Queue, q, func(v, id string) bool { return q.EnqueueOnce(v, 1, id) }, popWith(q), func() { q.Close() }
 	}},
 	{"distributed", func(qs Queues, key string) (*Queue, contract.QueueInspector, func(string, string) bool, func() (string, bool), func()) {
-		q := qs.NewDistributedQueue(key)
+		q := qs.NewQueue(key)
 		return q, q, func(v, id string) bool { return q.EnqueueOnce(v, id) }, popWith(q), func() { q.Close() }
 	}},
 	{"distributed priority", func(qs Queues, key string) (*Queue, contract.QueueInspector, func(string, string) bool, func() (string, bool), func()) {
-		q := qs.NewDistributedPriorityQueue(key)
+		q := qs.NewPriorityQueue(key)
 		return q.Queue, q, func(v, id string) bool { return q.EnqueueOnce(v, 1, id) }, popWith(q), func() { q.Close() }
 	}},
 }

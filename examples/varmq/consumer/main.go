@@ -28,7 +28,7 @@ func main() {
 	// Any shared priority storage works here: redisq, sqliteq or your own
 	q := w.WithPriorityQueue(rq)
 
-	fmt.Println("pending jobs:", q.NumPending())
+	fmt.Println("pending jobs:", q.Len())
 	fmt.Println("listening...")
 
 	rq.Listen()     // until SIGINT or SIGTERM

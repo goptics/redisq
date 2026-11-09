@@ -11,10 +11,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func setupTestDistributedPriorityQueue(t *testing.T) (*DistributedPriorityQueue, func()) {
+func setupTestNotifyPriorityQueue(t *testing.T) (*PriorityQueue, func()) {
 	redisURL := getTestRedisURL()
 	qs := New(redisURL)
-	q := qs.NewDistributedPriorityQueue(testQueueKey)
+	q := qs.NewPriorityQueue(testQueueKey)
 
 	// Clear the queue before test
 	ctx := context.Background()
@@ -29,9 +29,9 @@ func setupTestDistributedPriorityQueue(t *testing.T) (*DistributedPriorityQueue,
 	return q, cleanup
 }
 
-func TestDistributedPriorityQueue(t *testing.T) {
+func TestNotifyPriorityQueue(t *testing.T) {
 	t.Run("basic operations", func(t *testing.T) {
-		q, cleanup := setupTestDistributedPriorityQueue(t)
+		q, cleanup := setupTestNotifyPriorityQueue(t)
 		defer cleanup()
 
 		notifications := make(chan string, 2)
@@ -82,7 +82,7 @@ func TestDistributedPriorityQueue(t *testing.T) {
 	})
 
 	t.Run("concurrent operations", func(t *testing.T) {
-		q, cleanup := setupTestDistributedPriorityQueue(t)
+		q, cleanup := setupTestNotifyPriorityQueue(t)
 		defer cleanup()
 
 		const (
@@ -122,7 +122,7 @@ func TestDistributedPriorityQueue(t *testing.T) {
 	})
 
 	t.Run("edge cases", func(t *testing.T) {
-		q, cleanup := setupTestDistributedPriorityQueue(t)
+		q, cleanup := setupTestNotifyPriorityQueue(t)
 		defer cleanup()
 
 		t.Run("empty queue", func(t *testing.T) {
@@ -138,11 +138,11 @@ func TestDistributedPriorityQueue(t *testing.T) {
 }
 
 // A failed enqueue must not wake workers or count as submitted in varmq.
-func TestDistributedPriorityQueueNoNotifyOnFailedEnqueue(t *testing.T) {
+func TestNotifyPriorityQueueNoNotifyOnFailedEnqueue(t *testing.T) {
 	qs := New(getTestRedisURL())
 	defer qs.Close()
 
-	dpq := qs.NewDistributedPriorityQueue("test_failed_enqueue_notify")
+	dpq := qs.NewPriorityQueue("test_failed_enqueue_notify")
 	defer dpq.Close()
 
 	got := make(chan string, 1)
