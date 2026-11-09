@@ -36,6 +36,15 @@ func main() {
 	qs := redisq.New(url, opts...)
 	defer qs.Close()
 
+	// Every process needs the store: varmq finds it by scope to run and
+	// finish tasks.
+	store, err := redisq.NewWorkflowStore(qs)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "store:", err)
+		os.Exit(1)
+	}
+	defer store.Close()
+
 	upload, thumb := qs.NewQueue("upload"), qs.NewPriorityQueue("thumb")
 	email, unsend := qs.NewQueue("email"), qs.NewQueue("unsend")
 	defer upload.Close()
@@ -102,7 +111,7 @@ func main() {
 
 	case "submit":
 		ctx := context.Background()
-		wf := varmq.NewWorkflow(qs.WorkflowStore(), varmq.WithWorkflowID(cmpOr(os.Getenv("WF_ID"), "upload-1")))
+		wf := varmq.NewWorkflow(store, varmq.WithWorkflowID(cmpOr(os.Getenv("WF_ID"), "upload-1")))
 		up := wf.Add("upload", varmq.NewResultQueue[string, string](upload), "photo.png")
 		small := wf.Add("thumb-s", varmq.NewResultPriorityQueue[int, string](thumb), 64).After(up).Priority(1)
 		large := wf.Add("thumb-l", varmq.NewResultPriorityQueue[int, string](thumb), 512).After(up).Priority(2)

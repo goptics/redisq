@@ -89,8 +89,7 @@ func main() {
 | `Queue`         | `qs.NewQueue(key)`         | FIFO         |
 | `PriorityQueue` | `qs.NewPriorityQueue(key)` | Lowest first |
 
-Both support every API below: acks, dedup, batches, wakes, outcomes, pause and cancel. `DistributedQueue`,
-`DistributedPriorityQueue` and their constructors remain as deprecated aliases.
+Both support every API below: acks, dedup, batches, wakes, outcomes, pause and cancel.
 
 ```go
 queue := qs.NewQueue("my-queue")
@@ -206,7 +205,7 @@ queue.QueueStats(ctx) // counts per Job State now, totals since the counters beg
 queue.Jobs(ctx, contract.JobFailed, 0, 50) // newest first; pending in hand-out order
 ```
 
-Both queue types (and the deprecated `Distributed*` aliases) implement `contract.QueueInspector`
+Both queue types implement `contract.QueueInspector`
 (`github.com/goptics/varmq/contract`), which VarMQ's `Handler` serves as `GET /queues` and
 `GET /queues/{id}/jobs`. The layout is VarMQ's
 [`spec/redis-storage.md`](https://github.com/goptics/varmq/blob/main/spec/redis-storage.md) 1.7.0. `GET /queues/{id}/jobs/{jobId}` returns 501:
@@ -323,24 +322,43 @@ See [`examples/varmq`](examples/varmq) for a provider/consumer setup.
 
 ### Workflows
 
-A VarMQ workflow is a DAG of jobs across queues. Every redisq queue can carry its tasks, and `qs.WorkflowStore()` is the
-one store of the client's Redis and namespace:
+A VarMQ workflow is a DAG of jobs across queues. The workflow state lives in a workflow store, which is separate from
+the queues. Make one store from your `Queues` client, in every process that submits or runs workflow tasks:
 
 ```go
+qs := redisq.New("redis://localhost:6379")
+store, err := redisq.NewWorkflowStore(qs) // registers itself for its scope
+if err != nil {
+	log.Fatal(err)
+}
+defer store.Close() // unregisters it; close it before qs
+
 upload, thumb := qs.NewQueue("upload"), qs.NewPriorityQueue("thumb")
 
-wf := varmq.NewWorkflow(qs.WorkflowStore(), varmq.WithWorkflowID("upload-1"))
+wf := varmq.NewWorkflow(store, varmq.WithWorkflowID("upload-1"))
 up := wf.Add("upload", varmq.NewResultQueue[string, string](upload), "photo.png")
 wf.Add("thumb", varmq.NewResultPriorityQueue[int, string](thumb), 64).After(up)
-err := wf.Submit(ctx) // workers in any process run it; wf.WaitContext(ctx) for the end
+err = wf.Submit(ctx) // workers in any process run it; wf.WaitContext(ctx) for the end
 ```
 
+The scope of a store is the Redis address, the database and the namespace. Every queue of that scope reports it with
+`ScopeID()`. When a worker takes a task, VarMQ finds the store by that scope. So a process that runs workflow tasks
+must make a store for the scope, or VarMQ does not run those tasks and reports an error. A process has one store per
+scope. A second `NewWorkflowStore` for the same scope returns `contract.ErrScopeRegistered` until you close the first.
+
+`NewWorkflowStore` takes options. `WithWorkflowResultLimit` sets the largest task result, 64 KiB by default.
+`WithWorkflowRetention` sets how long an ended workflow stays, 7 days by default. A running workflow stays until it
+ends.
+
 A task finishes in one script that settles its job and pushes the tasks it releases. So a crash never leaves a
-workflow between the two. The layout is VarMQ's `spec/redis-storage.md` 1.5.0 (`redisq:[ns:]wf:<id>`,
-`redisq:[ns:]wf:index`). `WithWorkflowResultLimit` (default 64 KiB) and `WithWorkflowRetention` (default 7 days) set
-the store. Every consumer of a queue that carries workflow tasks must run this version. Anyone who can push to a
-task's queue can push a copy of that task, so treat push access as trusted. Don't use `SetExpiration` on a queue that
-carries workflow tasks: workflow pushes don't renew the expiry, and Submit refuses such a queue object. See
+workflow between the two. VarMQ calls `store.FinishTask(queueID, ackID, end)` for this. The store finds the queue from
+its key, so the queue can come from any client of the same scope. The workflow keys are `redisq:[ns:]wf:<id>` and
+`redisq:[ns:]wf:index`, as in VarMQ's `spec/redis-storage.md`. A task's job record uses the retention that you set
+with `SetCompletedRetention` on the queue object of the same `Queues` client. Other clients use the default.
+
+Every consumer of a queue that carries workflow tasks must run this version. Anyone who can push to a task's queue
+can push a copy of that task, so treat push access as trusted. Do not use `SetExpiration` on a queue that carries
+workflow tasks. Workflow pushes do not renew the expiry, and Submit refuses such a queue object. See
 [`examples/workflow`](examples/workflow).
 
 ## How It Works
