@@ -3452,6 +3452,13 @@ func TestWorkflowGuards(t *testing.T) {
 	recs, err := e.store.Workflows(ctx, "", 0, 10)
 	require.NoError(t, err)
 	assert.Empty(t, recs)
+
+	// A workflow key of the wrong type: listing and purge report the error.
+	require.NoError(t, e.a.client.Set(ctx, e.store.key("g"), "x", 0).Err())
+	_, err = e.store.WorkflowKeys(ctx, "", 0, 10)
+	assert.Error(t, err)
+	require.True(t, e.a.Enqueue(`{"id":"wf:g:a","wf":"g","task":"a"}`))
+	assert.Error(t, e.a.purge())
 }
 
 // Purge of a queue holding items of more workflows than Lua can unpack at

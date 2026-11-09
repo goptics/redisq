@@ -495,10 +495,7 @@ func wfTargetsEach(ctx context.Context, c *redis.Client, keys ...string) ([][]wf
 	}
 	out := make([][]wfTarget, len(cmds))
 	for i, cmd := range cmds {
-		r, err := cmd.StringSlice()
-		if err != nil {
-			return nil, err
-		}
+		r, _ := cmd.StringSlice() // Exec above returned any command's error
 		for j := 0; j+1 < len(r); j += 2 {
 			out[i] = append(out[i], wfTarget{r[j], r[j+1]})
 		}
