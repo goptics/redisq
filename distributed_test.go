@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func setupTestDistributedQueue(t *testing.T) (*Queue, func()) {
+func setupTestNotifyQueue(t *testing.T) (*Queue, func()) {
 	redisURL := getTestRedisURL()
 	qs := New(redisURL)
 	q := qs.NewQueue(testQueueKey)
@@ -31,15 +31,15 @@ func setupTestDistributedQueue(t *testing.T) (*Queue, func()) {
 	return q, cleanup
 }
 
-func TestNewDistributedQueue(t *testing.T) {
-	q, cleanup := setupTestDistributedQueue(t)
+func TestNewNotifyQueue(t *testing.T) {
+	q, cleanup := setupTestNotifyQueue(t)
 	defer cleanup()
 
 	assert.NotNil(t, q.Notification, "Notification should not be nil")
 }
 
-func TestDistributedQueueEnqueueDequeue(t *testing.T) {
-	q, cleanup := setupTestDistributedQueue(t)
+func TestNotifyQueueEnqueueDequeue(t *testing.T) {
+	q, cleanup := setupTestNotifyQueue(t)
 	defer cleanup()
 
 	notifications := make(chan string, 2)
@@ -69,8 +69,8 @@ func TestDistributedQueueEnqueueDequeue(t *testing.T) {
 	}
 }
 
-func TestDistributedQueueConcurrency(t *testing.T) {
-	q, cleanup := setupTestDistributedQueue(t)
+func TestNotifyQueueConcurrency(t *testing.T) {
+	q, cleanup := setupTestNotifyQueue(t)
 	defer cleanup()
 
 	const numGoroutines = 10
@@ -106,7 +106,7 @@ func TestDistributedQueueConcurrency(t *testing.T) {
 
 // A job whose consumer never acknowledges it must come back on its own, and
 // wake distributed workers, without waiting for a process restart.
-func TestDistributedQueueSweeperRequeues(t *testing.T) {
+func TestNotifyQueueSweeperRequeues(t *testing.T) {
 	qs := New(getTestRedisURL())
 	defer qs.Close()
 
@@ -200,11 +200,11 @@ func (c *cmdCounter) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.P
 
 // An enqueue on a distributed queue is one round trip: the push and the wake
 // run in one script.
-func TestDistributedEnqueueIsOneRoundTrip(t *testing.T) {
+func TestNotifyEnqueueIsOneRoundTrip(t *testing.T) {
 	const n = 100
 
 	t.Run("list", func(t *testing.T) {
-		q, cleanup := setupTestDistributedQueue(t)
+		q, cleanup := setupTestNotifyQueue(t)
 		defer cleanup()
 		q.SetExpiration(time.Minute)
 		require.True(t, q.Enqueue("warm-up")) // loads the script
@@ -218,7 +218,7 @@ func TestDistributedEnqueueIsOneRoundTrip(t *testing.T) {
 	})
 
 	t.Run("priority", func(t *testing.T) {
-		q, cleanup := setupTestDistributedPriorityQueue(t)
+		q, cleanup := setupTestNotifyPriorityQueue(t)
 		defer cleanup()
 		q.SetExpiration(time.Minute)
 		require.True(t, q.Enqueue("warm-up", 1))
@@ -298,7 +298,7 @@ func TestEmptyDequeueMarksConsumerIdle(t *testing.T) {
 
 // Enqueue refuses work once the queue or its client is closed, and Len
 // reads 0 instead of failing.
-func TestDistributedQueueClosed(t *testing.T) {
+func TestNotifyQueueClosed(t *testing.T) {
 	qs := New(getTestRedisURL())
 	dq := qs.NewQueue("test_closed_dq")
 	dpq := qs.NewPriorityQueue("test_closed_dpq")

@@ -2,9 +2,12 @@ package redisq
 
 import (
 	"fmt"
+	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"weak"
 
@@ -15,8 +18,7 @@ type queues struct {
 	client    *redis.Client
 	namespace string
 
-	regMu sync.Mutex
-	reg   map[string]weak.Pointer[Queue] // queues made here by key, for WorkflowStore.FinishTask
+	wfStore atomic.Pointer[WorkflowStore] // the store built on this client, closed with it
 
 	reportEvery time.Duration // WithInstanceReports; 0 = off
 	stopReports func()
@@ -100,19 +102,22 @@ func (qs *queues) prefix() string {
 
 func (qs *queues) NewQueue(queueKey string) *Queue {
 	q := newQueue(qs.client, qs.key("fifo", queueKey), qs.scope())
-	qs.register(q)
+	track(q)
 	return q
 }
 
 func (qs *queues) NewPriorityQueue(queueKey string) *PriorityQueue {
 	pq := newPriorityQueue(qs.client, qs.key("prio", queueKey), qs.scope())
-	qs.register(pq.Queue)
+	track(pq.Queue)
 	return pq
 }
 
 // Close stops instance reports, removing this process's record, then
 // closes the client.
 func (qs *queues) Close() error {
+	if s := qs.wfStore.Load(); s != nil {
+		s.Close()
+	}
 	if qs.stopReports != nil {
 		qs.stopReports()
 		<-qs.reportsDone
@@ -127,20 +132,52 @@ func (qs *queues) scope() string {
 	return "redisq:" + o.Addr + "/" + strconv.Itoa(o.DB) + "/" + qs.prefix()
 }
 
-// register notes q under its key so a store of this client finds the live
-// object (its record retention) when it finishes a task.
-func (qs *queues) register(q *Queue) {
-	qs.regMu.Lock()
-	defer qs.regMu.Unlock()
-	if qs.reg == nil {
-		qs.reg = map[string]weak.Pointer[Queue]{}
-	}
-	qs.reg[q.queueKey] = weak.Make(q)
+// liveQueues is every queue object of the process by scope and queue key,
+// so a WorkflowStore finds the live object (its record retention) of a queue
+// whichever client made it. Weak: an unreferenced queue drops out.
+var liveQueues struct {
+	mu sync.Mutex
+	m  map[liveKey][]weak.Pointer[Queue]
 }
 
-// lookup is the live queue made here under key, or nil.
-func (qs *queues) lookup(key string) *Queue {
-	qs.regMu.Lock()
-	defer qs.regMu.Unlock()
-	return qs.reg[key].Value()
+type liveKey struct{ scope, key string }
+
+// track adds q to liveQueues until it closes or is collected.
+func track(q *Queue) {
+	k := liveKey{q.scope, q.queueKey}
+	w := weak.Make(q)
+	liveQueues.mu.Lock()
+	defer liveQueues.mu.Unlock()
+	if liveQueues.m == nil {
+		liveQueues.m = map[liveKey][]weak.Pointer[Queue]{}
+	}
+	liveQueues.m[k] = append(liveQueues.m[k], w)
+	runtime.AddCleanup(q, func(k liveKey) { untrack(k, nil) }, k)
+}
+
+// untrack drops q's entry (nil: every dead one) for k.
+func untrack(k liveKey, q *Queue) {
+	liveQueues.mu.Lock()
+	defer liveQueues.mu.Unlock()
+	ws := slices.DeleteFunc(liveQueues.m[k], func(w weak.Pointer[Queue]) bool {
+		v := w.Value()
+		return v == nil || v == q
+	})
+	if len(ws) == 0 {
+		delete(liveQueues.m, k)
+	} else {
+		liveQueues.m[k] = ws
+	}
+}
+
+// liveQueue is the first live (open) object for scope and key, or nil.
+func liveQueue(scope, key string) *Queue {
+	liveQueues.mu.Lock()
+	defer liveQueues.mu.Unlock()
+	for _, w := range liveQueues.m[liveKey{scope, key}] {
+		if q := w.Value(); q != nil && q.ctx.Err() == nil {
+			return q
+		}
+	}
+	return nil
 }

@@ -1580,6 +1580,7 @@ func (q *Queue) Close() error {
 	var err error
 	q.closeOnce.Do(func() {
 		q.leave()
+		untrack(liveKey{q.scope, q.queueKey}, q)
 		q.cancel() // stops the sweep
 		err = q.release()
 		q.outcomes.close()

@@ -11,7 +11,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -33,6 +32,10 @@ var (
 	_ contract.WorkflowInspector = (*WorkflowStore)(nil)
 	_ contract.WorkflowKeyLister = (*WorkflowStore)(nil)
 )
+
+// ErrResultTooLarge is the failure of a task whose result is over the
+// store's limit (WithWorkflowResultLimit).
+var ErrResultTooLarge = contract.ErrResultTooLarge
 
 // Store defaults (spec 6.10).
 const (
@@ -56,7 +59,6 @@ type WorkflowStore struct {
 	trimFrom    atomic.Int64 // trimIndex's offset past old entries still live
 	trimming    atomic.Bool  // a trimIndex runs: every queue's sweep calls it
 	trimmedAt   atomic.Int64 // Unix ms of the last trimIndex
-	bare        sync.Map     // queue key -> *Queue built from the key (see queue)
 }
 
 // WorkflowOption configures NewWorkflowStore.
@@ -90,7 +92,10 @@ func WithWorkflowRetention(d time.Duration) WorkflowOption {
 // namespace, registered with varmq's contract so workers find it by scope.
 // Make it in every process that runs, submits or lists workflows of that
 // scope; one per scope per process, else contract.ErrScopeRegistered.
-// It uses qs's connection: Close it before qs. qs must come from New.
+// It uses qs's connection; closing qs closes the store. qs must come from New.
+// A scope is only the address, database and namespace: the store settles the
+// tasks of every client of the scope with its own connection, so use one Redis
+// credential (ACL user, TLS settings) per scope in a process.
 func NewWorkflowStore(qs Queues, opts ...WorkflowOption) (*WorkflowStore, error) {
 	q, ok := qs.(*queues)
 	if !ok {
@@ -105,6 +110,9 @@ func NewWorkflowStore(qs Queues, opts ...WorkflowOption) (*WorkflowStore, error)
 		retention:   defaultWFRetention,
 	}
 	for _, o := range opts {
+		if o == nil {
+			return nil, errors.New("redisq: nil WorkflowOption")
+		}
 		if err := o(s); err != nil {
 			return nil, err
 		}
@@ -112,6 +120,7 @@ func NewWorkflowStore(qs Queues, opts ...WorkflowOption) (*WorkflowStore, error)
 	if err := contract.RegisterWorkflowStore(s); err != nil {
 		return nil, err
 	}
+	q.wfStore.Store(s)
 	return s, nil
 }
 
@@ -119,6 +128,7 @@ func NewWorkflowStore(qs Queues, opts ...WorkflowOption) (*WorkflowStore, error)
 // Queues connection open.
 func (s *WorkflowStore) Close() error {
 	contract.UnregisterWorkflowStore(s)
+	s.qs.wfStore.CompareAndSwap(s, nil)
 	return nil
 }
 
@@ -767,18 +777,13 @@ if not t or (undo and (type(t.undo) ~= 'table' or t.undo.queue ~= ARGV[13])) or 
 local fx = wffinish(W, ARGV[9], ARGV[11], ARGV[3], ARGV[6], undo)
 return {1, unpack(wfapply(W, fx, Q, {}, {}))}`)
 
-// queue is the queue object that settles queueID's jobs: the live one a Queues
-// of this store made, else a bare one built from the key layout
-// redisq:[<ns>:]<fifo|prio>:{key} (a worker-only process, or another client
-// of the scope; its Job Record retention is the default, not a SetCompleted
-// Retention of the worker's queue). ponytail: bare queues are cached for the
-// store's life.
+// queue is the queue object that settles queueID's jobs: the live one of the
+// process (its SetCompletedRetention and SetFailedRetention apply), else a
+// bare one built from the key layout redisq:[<ns>:]<fifo|prio>:{key} with the
+// default retention. A bare queue starts nothing, so none is cached.
 func (s *WorkflowStore) queue(id string) (*Queue, error) {
-	if q := s.qs.lookup(id); q != nil && q.ctx.Err() == nil { // a closed one may shadow a live object
+	if q := liveQueue(s.scope, id); q != nil {
 		return q, nil
-	}
-	if q, ok := s.bare.Load(id); ok {
-		return q.(*Queue), nil
 	}
 	kind, ok := strings.CutPrefix(id, s.prefix)
 	if !ok || len(kind) < 8 || kind[4] != ':' || kind[5] != '{' || kind[len(kind)-1] != '}' ||
@@ -787,8 +792,7 @@ func (s *WorkflowStore) queue(id string) (*Queue, error) {
 	}
 	q := newQueueBase(s.client, id)
 	q.scope, q.isPriority = s.scope, kind[:4] == "prio"
-	act, _ := s.bare.LoadOrStore(id, q)
-	return act.(*Queue), nil
+	return q, nil
 }
 
 // FinishTask settles ackID and applies the task end to its workflow in one
@@ -803,10 +807,6 @@ func (s *WorkflowStore) FinishTask(queueID, ackID string, e contract.TaskEnd) ([
 	q, err := s.queue(queueID)
 	if err != nil {
 		log.Printf("redisq: finish task %s/%s: %v", e.Workflow, e.Task, err)
-		return nil, false
-	}
-	if q.ctx.Err() != nil {
-		log.Println("queue closed, cannot finish task")
 		return nil, false
 	}
 	limit, ret := s.resultLimit, s.retention
@@ -1292,11 +1292,11 @@ const purgeTimeout = 5 * time.Minute
 
 func (q *Queue) purge() error {
 	del := append(q.requeueKeys(), q.getJobsKey(), q.getCompletedKey(), q.getFailedKey(), q.getStatsKey(), q.getCancelledKey())
-	if q.scope == "" { // newQueueBase alone: no namespace to find workflows in
-		return q.client.Del(q.ctx, del...).Err()
-	}
 	// No store in this process: workflow keys come from the queue key.
 	ret, wfPrefix := defaultWFRetention, queuePrefix(q.queueKey)
+	if q.scope == "" || wfPrefix == "" { // no namespace to find workflows in
+		return q.client.Del(q.ctx, del...).Err()
+	}
 	if s := q.store(); s != nil {
 		ret = s.retention
 	}

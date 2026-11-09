@@ -15,14 +15,7 @@ Requires `github.com/goptics/varmq/contract` v0.8.0 and VarMQ ≥ v1.11.0 (#33, 
 - A FIFO and a priority queue of one name no longer collide, and a queue's keys share a Redis Cluster slot (#27)
 - Keys written by 1.5.x and earlier are not read: drain those queues before upgrading (#27)
 - One queue kind per order: `Queue` and `PriorityQueue` now do all that `DistributedQueue` / `DistributedPriorityQueue` did (#33)
-- `dq.Queue` and `dpq.PriorityQueue` no longer compile (aliases, no embedded field): call the method on the handle (#33)
-- The workflow store is its own object: `redisq.NewWorkflowStore(qs, opts...)` replaces `(*Queue).WorkflowStore()` and `Queues.WorkflowStore()` (#38); make one per process and scope (#NN)
-- `NewWorkflowStore` registers the store in `contract` by scope and `store.Close()` unregisters it; a second store for a scope returns `contract.ErrScopeRegistered` (#NN)
-- `WithWorkflowResultLimit` and `WithWorkflowRetention` are now `WorkflowOption`s of `NewWorkflowStore`, no longer `redisq.New` options (#NN)
-- `(*Queue).FinishTask` moved to `(*WorkflowStore).FinishTask(queueID, ackID, end)`; the store finds the queue from its key (#NN)
-- A task end settles a job's record with the default retention unless the store's client made that queue object (#NN)
-- Removed `NewDistributedQueue`, `NewDistributedPriorityQueue`, the `DistributedQueue` and `DistributedPriorityQueue` aliases and `SetAckTimeout`: use `NewQueue`, `NewPriorityQueue`, `Queue`, `PriorityQueue` and `SetVisibilityTimeout` (#NN)
-- `(*Queue).ScopeID()` stays on every queue and needs no store (#NN)
+- Removed `NewDistributedQueue`, `NewDistributedPriorityQueue`, the `DistributedQueue` and `DistributedPriorityQueue` aliases and `SetAckTimeout`: use `NewQueue`, `NewPriorityQueue`, `Queue`, `PriorityQueue` and `SetVisibilityTimeout`. `dq.Queue` and `dpq.PriorityQueue` no longer exist: call the method on the handle (#NN)
 
 ### Changed
 
@@ -41,17 +34,20 @@ Requires `github.com/goptics/varmq/contract` v0.8.0 and VarMQ ≥ v1.11.0 (#33, 
 - Job records and stats, as varmq's `spec/redis-storage.md` 1.0.0: `Acknowledge` (now one script) and the new `Reject(ackID, reason)` count the job in `:stats`, keep its Job Record in `:jobs` and `:completed`/`:failed`, and trim by count and age, in one atomic step (#29)
 - Every enqueue counts as submitted, except an `EnqueueOnce` repeat (#29)
 - `SetCompletedRetention` and `SetFailedRetention`: by default the last 1,000 completed jobs for 24h and the last 10,000 failed jobs for 7 days; 0 keeps none. The sweep also trims once a minute (#29)
-- Both queue types (and the deprecated `Distributed*` aliases) implement `contract.QueueInspector` (`QueueID`, `QueueStats`, `Jobs`) from `github.com/goptics/varmq/contract` (#29, #33)
+- Both queue types implement `contract.QueueInspector` (`QueueID`, `QueueStats`, `Jobs`) from `github.com/goptics/varmq/contract` (#29, #33)
 - New keys `<key>:started`, `<key>:attempts`, `<key>:jobs`, `<key>:completed`, `<key>:failed`, `<key>:stats`; pops record start times and requeues count attempts (#29)
 - `Purge` deletes all of a queue's jobs and job data: waiting and processing items, deadlines, start times, attempts, records, counters, and a priority queue's sequence and priorities. Consumer state and `EnqueueOnce` ids stay (#29)
 - A purged workflow task or undo ends `cancelled` in the same script, so its workflow goes on (spec 6.6) (#34)
-- Workflows, as varmq's `spec/redis-storage.md` 1.5.0 (6.9 to 6.12, 7.3): every queue implements `contract.WorkflowAcknowledgeable` (`ScopeID`, `WorkflowStore`, `FinishTask`) (#34)
-- `WorkflowStore()` is the store of the queue's Redis and namespace (`contract.WorkflowStore`, `WorkflowInspector`, `WorkflowKeyLister`), so VarMQ workers in any process run one DAG across redisq queues (#34)
+- Workflows, as varmq's `spec/redis-storage.md` 1.5.0 (6.9 to 6.12, 7.3): `NewWorkflowStore(qs, opts...)` makes the store of a `Queues` client's Redis, database and namespace (`contract.WorkflowStore`, `WorkflowInspector`, `WorkflowKeyLister`), so VarMQ workers in any process run one DAG across redisq queues (#34, #NN)
+- `NewWorkflowStore` registers the store in `contract` by scope; `Close` unregisters it. A second store for a scope returns `contract.ErrScopeRegistered`; closing the `Queues` unregisters its store too (#NN)
+- Every queue has `ScopeID()` (the Redis address, database and namespace); it needs no store (#NN)
+- `(*WorkflowStore).FinishTask(queueID, ackID, end)` finds the queue from its key, so any client of the scope can finish it. It uses the `SetCompletedRetention` and `SetFailedRetention` of the queue object in the process, else the defaults (#NN)
+- Exported `ErrResultTooLarge`, the error of a task result over the limit (#NN)
 - Keys `redisq:[ns:]wf:<id>` (hash: `meta`, `t:`/`s:`/`n:`/`i:`/`r:`/`e:`/`u:` per task) and `redisq:[ns:]wf:index` (#34)
 - Submit, FinishTask, Cancel and Purge are one script each. FinishTask settles the item as `Acknowledge`/`Reject` (record, stats, outcome) and pushes what the end releases in the same step (#34)
 - A re-sent finish changes nothing and names every push-target queue. Results over the limit fail the task; undo envelopes are pushed byte for byte (#34)
 - Workflow keys have no hashtag, so workflows need one Redis (no Cluster), as the spec says (#34)
-- `WithWorkflowResultLimit(n)` (default 64 KiB) and `WithWorkflowRetention(d)` (default 7 days) set the store; the sweep trims `wf:index` once a minute (#34)
+- `WithWorkflowResultLimit(n)` (default 64 KiB) and `WithWorkflowRetention(d)` (default 7 days) are `WorkflowOption`s of `NewWorkflowStore`; the sweep trims `wf:index` once a minute (#34)
 - Every consumer of a queue that carries workflow tasks must run this version (spec 9) (#34)
 - Submit refuses items Redis's cjson can't decode (nesting over 1000, lone surrogate escapes), queue objects with `SetExpiration` (workflow pushes don't renew it) and queue keys that aren't UTF-8 (#34)
 - A Purge re-sent after a lost reply changes nothing. FinishTask applies a workflow step only when the settled item's own tag names the end's task; an unreadable workflow hash settles items alone (#34)
@@ -93,11 +89,6 @@ Requires `github.com/goptics/varmq/contract` v0.8.0 and VarMQ ≥ v1.11.0 (#33, 
 - `AcknowledgeCancelled(ackID, reason)`: as `Reject` (counted failed, failed retention, no requeue), record and outcome state `cancelled`, `error` the reason (#33)
 - `Acknowledge`, `AcknowledgeResult`, `Reject` and a pushing `EnqueueOnce` drop the id's cancel mark (`ZREM`); the 1s sweep prunes expired marks; `Purge` deletes `<key>:cancelled` (#33)
 - `WatchOutcome` takes `cancelled` as final (a record without `errors` reports error `cancelled`) (#33)
-
-### Deprecated
-
-- `DistributedQueue`, `DistributedPriorityQueue`: now aliases of `Queue`, `PriorityQueue` (#33)
-- `NewDistributedQueue`, `NewDistributedPriorityQueue` return `*Queue`, `*PriorityQueue`, the same as `NewQueue`, `NewPriorityQueue` (#33)
 
 ## [1.5.1] - 2026-10-31
 

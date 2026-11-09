@@ -3370,7 +3370,7 @@ func TestWorkflowTwoProcesses(t *testing.T) {
 }
 
 // Guards: bad options, bad IDs, unknown outcomes, closed queues, queues
-// without a store, and errors from a closed client.
+// without a live store object, and errors from a closed client.
 func TestWorkflowGuards(t *testing.T) {
 	qs0 := New(getTestRedisURL(), WithNamespace(newID()))
 	defer qs0.Close()
@@ -3406,7 +3406,7 @@ func TestWorkflowGuards(t *testing.T) {
 		_, ok = e.store.FinishTask(id, a.ack, contract.TaskEnd{Workflow: "g", Task: "a", Outcome: contract.OutcomeCompleted})
 		assert.False(t, ok, id)
 	}
-	// A queue made without a store: no scope, plain purge.
+	// A queue made by newQueueBase alone has no scope: plain purge.
 	bare := newQueueBase(e.a.client, e.a.queueKey)
 	assert.Empty(t, bare.ScopeID())
 	_, ok = e.store.FinishTask(e.a.QueueID(), a.ack, contract.TaskEnd{Workflow: "g", Task: "a", Outcome: contract.OutcomeCompleted})
@@ -3845,4 +3845,26 @@ func TestWorkflowStoreFinishesByQueueKey(t *testing.T) {
 	_, ok = e.store.FinishTask(ob.QueueID(), b.ack, contract.TaskEnd{Workflow: "key", Task: "b", Outcome: contract.OutcomeCompleted})
 	require.True(t, ok)
 	assert.Equal(t, contract.WorkflowCompleted, e.record("key").State)
+
+	// Each queue object's own record retention applies, whichever client made it.
+	oc := other.NewQueue("d")
+	defer oc.Close()
+	require.NoError(t, e.store.Submit(t.Context(), wfPlan("ret", false, false,
+		tk{name: "a", q: e.a}, tk{name: "b", q: oc})))
+	e.a.SetCompletedRetention(0, 0)
+	oc.SetCompletedRetention(0, 0)
+	ra, ok := wfPop(t, e.a)
+	require.True(t, ok)
+	rc, ok := wfPop(t, oc)
+	require.True(t, ok)
+	end := func(task string) contract.TaskEnd {
+		return contract.TaskEnd{Workflow: "ret", Task: task, Outcome: contract.OutcomeCompleted}
+	}
+	_, ok = e.store.FinishTask(e.a.QueueID(), ra.ack, end("a"))
+	require.True(t, ok)
+	_, ok = e.store.FinishTask(oc.QueueID(), rc.ack, end("b"))
+	require.True(t, ok)
+	ctx := t.Context()
+	assert.Zero(t, e.a.client.ZCard(ctx, e.a.getCompletedKey()).Val(), "a keeps no record")
+	assert.Zero(t, e.a.client.ZCard(ctx, oc.getCompletedKey()).Val(), "the other client's queue keeps none")
 }

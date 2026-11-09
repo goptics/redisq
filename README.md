@@ -344,7 +344,8 @@ err = wf.Submit(ctx) // workers in any process run it; wf.WaitContext(ctx) for t
 The scope of a store is the Redis address, the database and the namespace. Every queue of that scope reports it with
 `ScopeID()`. When a worker takes a task, VarMQ finds the store by that scope. So a process that runs workflow tasks
 must make a store for the scope, or VarMQ does not run those tasks and reports an error. A process has one store per
-scope. A second `NewWorkflowStore` for the same scope returns `contract.ErrScopeRegistered` until you close the first.
+scope. A scope is only the address, the database and the namespace. The store settles the tasks of every client of
+the scope with its own connection. So use one Redis credential (ACL user and TLS settings) per scope in a process. A second `NewWorkflowStore` for the same scope returns `contract.ErrScopeRegistered` until you close the first.
 
 `NewWorkflowStore` takes options. `WithWorkflowResultLimit` sets the largest task result, 64 KiB by default.
 `WithWorkflowRetention` sets how long an ended workflow stays, 7 days by default. A running workflow stays until it
@@ -354,7 +355,8 @@ A task finishes in one script that settles its job and pushes the tasks it relea
 workflow between the two. VarMQ calls `store.FinishTask(queueID, ackID, end)` for this. The store finds the queue from
 its key, so the queue can come from any client of the same scope. The workflow keys are `redisq:[ns:]wf:<id>` and
 `redisq:[ns:]wf:index`, as in VarMQ's `spec/redis-storage.md`. A task's job record uses the retention that you set
-with `SetCompletedRetention` on the queue object of the same `Queues` client. Other clients use the default.
+with `SetCompletedRetention` and `SetFailedRetention` on the queue object in the same process, whichever client made
+it. A `Purge` in a process with no store uses the default workflow retention.
 
 Every consumer of a queue that carries workflow tasks must run this version. Anyone who can push to a task's queue
 can push a copy of that task, so treat push access as trusted. Do not use `SetExpiration` on a queue that carries
