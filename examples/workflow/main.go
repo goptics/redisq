@@ -102,7 +102,7 @@ func main() {
 
 	case "submit":
 		ctx := context.Background()
-		wf := varmq.NewWorkflow(upload.WorkflowStore(), varmq.WithWorkflowID(cmpOr(os.Getenv("WF_ID"), "upload-1")))
+		wf := varmq.NewWorkflow(qs.WorkflowStore(), varmq.WithWorkflowID(cmpOr(os.Getenv("WF_ID"), "upload-1")))
 		up := wf.Add("upload", varmq.NewResultQueue[string, string](upload), "photo.png")
 		small := wf.Add("thumb-s", varmq.NewResultPriorityQueue[int, string](thumb), 64).After(up).Priority(1)
 		large := wf.Add("thumb-l", varmq.NewResultPriorityQueue[int, string](thumb), 512).After(up).Priority(2)
