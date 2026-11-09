@@ -7,40 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Requires `github.com/goptics/varmq/contract` v0.6.0 and VarMQ ≥ v1.11.0 (#33, #34)
+
+### ⚠️ Breaking Changes
+
+- Every key and channel is now `redisq:[ns:]fifo:{key}` or `redisq:[ns:]prio:{key}` plus its suffix (#27)
+- A FIFO and a priority queue of one name no longer collide, and a queue's keys share a Redis Cluster slot (#27)
+- Keys written by 1.5.x and earlier are not read: drain those queues before upgrading (#27)
+- One queue kind per order: `Queue` and `PriorityQueue` now do all that `DistributedQueue` / `DistributedPriorityQueue` did (#33)
+- `dq.Queue` and `dpq.PriorityQueue` no longer compile (aliases, no embedded field): call the method on the handle (#33)
+
 ### Changed
 
-- **Breaking:** every key and channel is now `redisq:[ns:]fifo:{key}` or `redisq:[ns:]prio:{key}` plus its suffix, so a FIFO and a priority queue of one name no longer collide and a queue's keys share a Redis Cluster slot. Keys written by 1.5.x and earlier are not read: drain those queues before upgrading
-- Queue keys must be non-empty and free of `{` and `}`; a constructor panics otherwise
-- **Behavior change:** `Enqueue` / `EnqueueOnce` now refuse (`false`) JSON Go reads but Redis Lua cjson can't: nesting over 1000, lone UTF-16 surrogate escape (`\ud800`). 1.5.x stored such items and returned `true`. Else the pop's cancel gate misses its id: uncancellable, no outcome. Applies to every item, id or not
-- **Breaking:** one queue kind per order: `Queue` and `PriorityQueue` now do all `DistributedQueue` / `DistributedPriorityQueue` did. Every `Enqueue`, `EnqueueOnce` and requeue wakes idle consumers (`<key>:idle`, `<key>:wake:<id>`); `Subscribe` makes an object a consumer; a consumer's empty pop or `Len` joins the idle set; `Close` leaves it. One pub/sub connection per object, as before: wake, control and outcome channels. `dq.Queue` and `dpq.PriorityQueue` no longer compile (aliases, no such embedded field): call the method on the handle directly. Key layout unchanged. Mixed versions fine: older plain consumers never join `:idle`, keep polling
+- Queue keys must be non-empty and free of `{` and `}`; a constructor panics otherwise (#27)
+- Every `Enqueue`, `EnqueueOnce` and requeue wakes idle consumers (`<key>:idle`, `<key>:wake:<id>`) (#33)
+- `Subscribe` makes an object a consumer; its empty pop or `Len` joins the idle set; `Close` leaves it (#33)
+- One pub/sub connection per object, as before, for the wake, control and outcome channels. Key layout unchanged (#33)
+- Mixed versions work: older plain consumers never join `:idle` and keep polling (#33)
+- **Behavior change:** `Enqueue` / `EnqueueOnce` refuse (`false`) JSON that Go reads but Redis Lua cjson can't: nesting over 1000, a lone UTF-16 surrogate escape (`\ud800`) (#33)
+- Refused because the pop's cancel gate would miss their id (no cancel, no outcome); 1.5.x stored them and returned `true`. Applies to every item, id or not (#33)
+- `Dequeue` (no ack) is now a script on both FIFO and priority queues, to check the pause (#32)
 
 ### Added
 
-- `New` takes options; `WithNamespace(ns)` scopes keys under `redisq:ns:`
-- Job records and stats, as varmq's `spec/redis-storage.md` 1.0.0: `Acknowledge` (now one script) and the new `Reject(ackID, reason)` count the job in `:stats`, keep its Job Record in `:jobs` and `:completed`/`:failed`, and trim by count and age, in one atomic step; every enqueue counts as submitted, except an `EnqueueOnce` repeat (#29)
+- `New` takes options; `WithNamespace(ns)` scopes keys under `redisq:ns:` (#27)
+- Job records and stats, as varmq's `spec/redis-storage.md` 1.0.0: `Acknowledge` (now one script) and the new `Reject(ackID, reason)` count the job in `:stats`, keep its Job Record in `:jobs` and `:completed`/`:failed`, and trim by count and age, in one atomic step (#29)
+- Every enqueue counts as submitted, except an `EnqueueOnce` repeat (#29)
 - `SetCompletedRetention` and `SetFailedRetention`: by default the last 1,000 completed jobs for 24h and the last 10,000 failed jobs for 7 days; 0 keeps none. The sweep also trims once a minute (#29)
-- Both queue types (and the deprecated `Distributed*` aliases) implement `contract.QueueInspector` (`QueueID`, `QueueStats`, `Jobs`) from `github.com/goptics/varmq/contract` (#29)
+- Both queue types (and the deprecated `Distributed*` aliases) implement `contract.QueueInspector` (`QueueID`, `QueueStats`, `Jobs`) from `github.com/goptics/varmq/contract` (#29, #33)
 - New keys `<key>:started`, `<key>:attempts`, `<key>:jobs`, `<key>:completed`, `<key>:failed`, `<key>:stats`; pops record start times and requeues count attempts (#29)
-- `WithInstanceReports(interval)`: `New` reports this process (from varmq: worker names, status, concurrency, bound Queue IDs) to `redisq:[ns:]{instances}` / `:beats` every 1-60s, as varmq's `spec/redis-storage.md` 1.1.0 section 8; `Close` removes the record. The value `New` returns also implements `contract.InstanceRegistry` (type-assert; `Queues` itself is unchanged) (`ReportInstance`, `RemoveInstance`, `Instances`); `Instances` writes nothing (an ACL user needs `+time +zrange +hgetall +multi +exec`). Needs `github.com/goptics/varmq/contract` v0.2.0
-- Queue pause, as varmq's `spec/redis-storage.md` 1.3.0: every queue type implements varmq's `QueuePauser` and `PauseNotifier` (`Pause`, `Resume`, `Paused`, `OnPauseChange`, and `PauseRefusals`, so varmq never reports a refused pop as a failure). `Pause` sets `<key>:paused` (pause time in ms, no expiry); while it exists every pop, plain or acknowledged, one item or a batch, hands out nothing, in every process, after the re-send guard. Adds, acks, rejects and requeues go on. `Resume` deletes it and wakes idle consumers. Each queue object caches the flag for `Paused` from its own calls, pop replies, the `<key>:control` channel (on the subscription it already holds) and the 1s sweep, so a lost message costs at most a second and a new object starts with the flag. `QueueStats` reports `paused` and `paused_at`. `Purge` and `SetExpiration` keep the flag. A queue is paused only once every consumer runs this version and varmq with queue pause: older consumers ignore the key, and an older varmq on this version keeps asking a paused queue for work. Needs `github.com/goptics/varmq/contract` v0.4.0
-- `Dequeue` (no ack) is now a script on both FIFO and priority queues, to check the pause
-- Job outcome signal, as varmq's `spec/redis-storage.md` 1.6.0: `Acknowledge`, `AcknowledgeResult` and `Reject` publish a `contract.JobOutcome` JSON (`id`, `state`, failed: `error`, result: `result`) on `<key>:done:<job id>` in the same script, after the record step, record kept or not; only for jobs with an envelope id
-- `WatchOutcome(id, fn)` on both kinds (`contract.OutcomeWatcher`): fn once, own goroutine, when the job ends in any process. First watcher of an id subscribes its channel on the object's pub/sub connection; the watch ends by itself after fn, last one unsubscribes. Catch-up from the Job Record right after subscribing and every sweep (up to 500 ids per second), so a job ended before the watch, or a lost message, still reports while its record is kept. `cancel` stops early; no-op after fn. `Close` drops watchers uncalled (a delivery already under way may still call fn)
-- `EnqueueOnce` that pushes (not a dedupe hit) drops the id's old Job Record (`:jobs`, `:completed`, `:failed`) in the same script: a reused id never reports the previous run's outcome or result to a new watch
-- `SetDedupWindow(<=0)` turns off only the dedupe: `EnqueueOnce` with an id still drops its old record and cancel mark (was a plain `Enqueue`)
-- `AcknowledgeResult(ackID, result)` on both kinds (`contract.ResultAcknowledgeable`): `Acknowledge` plus result JSON, spliced raw (big integers intact) into the outcome and the completed record's new optional `result` field. Invalid JSON: `false`, nothing changes. No size limit here (varmq caps at 64 KiB)
-- Job cancel, as varmq's `spec/redis-storage.md` 1.7.0 section 6.14, on both kinds (`contract.JobCanceller`, `CancelNotifier`, `CancelAcknowledgeable`): `CancelJob(id)` one script: record ended (`completed`/`failed`/`cancelled`) -> `contract.ErrJobEnded`, nothing changes; else prune expired marks, `ZADD <key>:cancelled <now+24h ms> id` (per-mark expiry as score; key `PEXPIRE` 24h only a backstop) and `PUBLISH <key>:control cancel:<id>`. Empty id: error. Unknown ids get marked too: authorize and rate-limit untrusted callers
-- Every pop (raw, single, batch; FIFO and priority), after the pause gate: when `<key>:cancelled` exists, an item whose envelope id has a live mark (score > now) is never handed out: mark dropped, record `cancelled` (no `started_at`, no `errors`) in `:jobs` + `:failed` under failed retention, outcome `{"state":"cancelled","error":"cancelled"}` published, no `:stats` count; the pop takes the next item instead. Expired mark: removed, item handed out. At most 1000 drops per script call (one `:failed` trim after them): a pop that runs out returns what it has, stays out of `:idle` and reports the rest (`remaining`); every pop call (raw, single, batch) retries at once with the same ack IDs, while each run shrinks `remaining`, so a cancelled backlog alone does not make a batch call return 0 items. No key: one `EXISTS` more, nothing else. Items without an envelope id always go out. A valid workflow item (spec 3: `wf` a workflow ID, `task` a task name, `undo` absent or a bool, id `wf:<wf>:<task>[:undo]`) is handed out and keeps its mark: it runs unless its workflow is cancelled. Any other `wf` field (crafted, null, mismatched id) is checked as a plain job
-- `OnCancel(fn)`: fn per `cancel:<id>` control message, own goroutine per call (off the pub/sub reader, no order); `stop` removes it. Stale message dropped: fn only while `ZSCORE <key>:cancelled <id>` > now (Redis clock), so a finish or re-add (`ZREM`) before delivery calls nothing; check error: fn called anyway. No callbacks: no check
-- `AcknowledgeCancelled(ackID, reason)`: as `Reject` (counted failed, failed retention, no requeue), record and outcome state `cancelled`, `error` the reason
-- `Acknowledge`, `AcknowledgeResult`, `Reject` and a pushing `EnqueueOnce` drop the id's cancel mark (`ZREM`); the 1s sweep prunes expired marks; `Purge` deletes `<key>:cancelled`. `WatchOutcome` takes `cancelled` as final (record without `errors`: error `cancelled`)
-- Workflows, as varmq's `spec/redis-storage.md` 1.5.0 (6.9 to 6.12, 7.3): every queue implements `contract.WorkflowAcknowledgeable` (`ScopeID`, `WorkflowStore`, `FinishTask`); `WorkflowStore()` is the store of the queue's Redis and namespace (`contract.WorkflowStore`, `WorkflowInspector`, `WorkflowKeyLister`), so varmq workers in any process run one DAG across redisq queues. Keys `redisq:[ns:]wf:<id>` (hash: `meta`, `t:`/`s:`/`n:`/`i:`/`r:`/`e:`/`u:` per task) and `redisq:[ns:]wf:index`. Submit, FinishTask, Cancel and Purge are one script each: FinishTask settles the item as `Acknowledge`/`Reject` (record, stats, outcome) and pushes what the end releases in the same step; a re-sent finish changes nothing and names every push-target queue. Results over the limit fail the task; undo envelopes are pushed byte for byte. Workflow keys have no hashtag, so workflows need one Redis (no Cluster), as the spec says. `WithWorkflowResultLimit(n)` (default 64 KiB) and `WithWorkflowRetention(d)` (default 7 days) set the store; the sweep trims `wf:index` once a minute. Every consumer of a queue that carries workflow tasks must run this version (spec 9). Submit refuses items Redis's cjson can't decode (nesting over 1000, lone surrogate escapes), queue objects with `SetExpiration` (workflow pushes don't renew it) and queue keys that aren't UTF-8; a Purge re-sent after a lost reply changes nothing; FinishTask applies a workflow step only when the settled item's own tag names the end's task; an unreadable workflow hash settles items alone. Anyone who can push to a task's queue can push a copy of the task: treat push access as trusted (the pre-run check has no queue to compare; an additive contract interface can add one). Needs `github.com/goptics/varmq/contract` v0.6.0
-- `examples/workflow`: one workflow over four queues, served by two worker processes
-- `Purge` deletes all of a queue's jobs and job data: waiting and processing items, deadlines, start times, attempts, records, counters, and a priority queue's sequence and priorities. Consumer state and `EnqueueOnce` ids stay (#29). A purged workflow task or undo ends `cancelled` in the same script, so its workflow goes on (spec 6.6)
+- `Purge` deletes all of a queue's jobs and job data: waiting and processing items, deadlines, start times, attempts, records, counters, and a priority queue's sequence and priorities. Consumer state and `EnqueueOnce` ids stay (#29)
+- A purged workflow task or undo ends `cancelled` in the same script, so its workflow goes on (spec 6.6) (#34)
+- Workflows, as varmq's `spec/redis-storage.md` 1.5.0 (6.9 to 6.12, 7.3): every queue implements `contract.WorkflowAcknowledgeable` (`ScopeID`, `WorkflowStore`, `FinishTask`) (#34)
+- `WorkflowStore()` is the store of the queue's Redis and namespace (`contract.WorkflowStore`, `WorkflowInspector`, `WorkflowKeyLister`), so VarMQ workers in any process run one DAG across redisq queues (#34)
+- Keys `redisq:[ns:]wf:<id>` (hash: `meta`, `t:`/`s:`/`n:`/`i:`/`r:`/`e:`/`u:` per task) and `redisq:[ns:]wf:index` (#34)
+- Submit, FinishTask, Cancel and Purge are one script each. FinishTask settles the item as `Acknowledge`/`Reject` (record, stats, outcome) and pushes what the end releases in the same step (#34)
+- A re-sent finish changes nothing and names every push-target queue. Results over the limit fail the task; undo envelopes are pushed byte for byte (#34)
+- Workflow keys have no hashtag, so workflows need one Redis (no Cluster), as the spec says (#34)
+- `WithWorkflowResultLimit(n)` (default 64 KiB) and `WithWorkflowRetention(d)` (default 7 days) set the store; the sweep trims `wf:index` once a minute (#34)
+- Every consumer of a queue that carries workflow tasks must run this version (spec 9) (#34)
+- Submit refuses items Redis's cjson can't decode (nesting over 1000, lone surrogate escapes), queue objects with `SetExpiration` (workflow pushes don't renew it) and queue keys that aren't UTF-8 (#34)
+- A Purge re-sent after a lost reply changes nothing. FinishTask applies a workflow step only when the settled item's own tag names the end's task; an unreadable workflow hash settles items alone (#34)
+- Anyone who can push to a task's queue can push a copy of the task: treat push access as trusted (the pre-run check has no queue to compare; an additive contract interface can add one) (#34)
+- `examples/workflow`: one workflow over four queues, served by two worker processes (#34)
+- `WithInstanceReports(interval)`: `New` reports this process (from varmq: worker names, status, concurrency, bound Queue IDs) to `redisq:[ns:]{instances}` / `:beats` every 1-60s, as varmq's `spec/redis-storage.md` 1.1.0 section 8; `Close` removes the record (#30)
+- The value `New` returns also implements `contract.InstanceRegistry` (`ReportInstance`, `RemoveInstance`, `Instances`; type-assert, `Queues` itself is unchanged) (#30)
+- `Instances` writes nothing (an ACL user needs `+time +zrange +hgetall +multi +exec`) (#30)
+- Queue pause, as varmq's `spec/redis-storage.md` 1.3.0: every queue type implements varmq's `QueuePauser` and `PauseNotifier` (`Pause`, `Resume`, `Paused`, `OnPauseChange`, `PauseRefusals`) (#32)
+- `PauseRefusals` lets varmq tell a refused pop from a failure (#32)
+- `Pause` sets `<key>:paused` (pause time in ms, no expiry). While it exists, every pop (plain or acknowledged, one item or a batch) hands out nothing, in every process, after the re-send guard (#32)
+- Adds, acks, rejects and requeues go on while paused. `Resume` deletes the flag and wakes idle consumers (#32)
+- Each queue object caches the flag for `Paused` from its own calls, pop replies, the `<key>:control` channel (on the subscription it already holds) and the 1s sweep: a lost message costs at most a second, and a new object starts with the flag (#32)
+- `QueueStats` reports `paused` and `paused_at`. `Purge` and `SetExpiration` keep the flag (#32)
+- A queue is paused only once every consumer runs this version and a VarMQ with queue pause: older consumers ignore the key, and an older VarMQ on this version keeps asking a paused queue for work (#32)
+- Job outcome signal, as varmq's `spec/redis-storage.md` 1.6.0: `Acknowledge`, `AcknowledgeResult` and `Reject` publish a `contract.JobOutcome` JSON (`id`, `state`, failed: `error`, result: `result`) on `<key>:done:<job id>` (#33)
+- The outcome goes out in the same script, after the record step, record kept or not; only for jobs with an envelope id (#33)
+- `WatchOutcome(id, fn)` on both kinds (`contract.OutcomeWatcher`): fn once, own goroutine, when the job ends in any process (#33)
+- The first watcher of an id subscribes its channel on the object's pub/sub connection; the watch ends by itself after fn, and the last one unsubscribes (#33)
+- Catch-up from the Job Record right after subscribing and every sweep (up to 500 ids per second): a job that ended before the watch, or a lost message, still reports while its record is kept (#33)
+- `cancel` stops a watch early (no-op after fn). `Close` drops watchers uncalled; a delivery already under way may still call fn (#33)
+- `EnqueueOnce` that pushes (not a dedupe hit) drops the id's old Job Record (`:jobs`, `:completed`, `:failed`) in the same script: a reused id never reports the previous run's outcome or result to a new watch (#33)
+- `SetDedupWindow(<=0)` turns off only the dedupe: `EnqueueOnce` with an id still drops its old record and cancel mark (was a plain `Enqueue`) (#33)
+- `AcknowledgeResult(ackID, result)` on both kinds (`contract.ResultAcknowledgeable`): `Acknowledge` plus result JSON, spliced raw (big integers intact) into the outcome and the completed record's new optional `result` field (#33)
+- `AcknowledgeResult` with invalid JSON returns `false` and changes nothing. No size limit here (VarMQ caps at 64 KiB) (#33)
+- Job cancel, as varmq's `spec/redis-storage.md` 1.7.0 section 6.14, on both kinds: `contract.JobCanceller`, `CancelNotifier`, `CancelAcknowledgeable` (#33)
+- `CancelJob(id)`, one script: a record that ended (`completed`/`failed`/`cancelled`) returns `contract.ErrJobEnded` and changes nothing; an empty id is an error (#33)
+- Else it prunes expired marks, runs `ZADD <key>:cancelled <now+24h ms> id` (per-mark expiry as score; the key's `PEXPIRE` 24h is only a backstop) and `PUBLISH <key>:control cancel:<id>` (#33)
+- Unknown ids get marked too: authorize and rate-limit untrusted callers of `CancelJob` (#33)
+- Every pop (raw, single, batch; FIFO and priority), after the pause gate, skips a waiting item whose envelope id has a live mark (score > now) when `<key>:cancelled` exists (#33)
+- A skipped item: mark dropped, record `cancelled` (no `started_at`, no `errors`) in `:jobs` + `:failed` under failed retention, outcome `{"state":"cancelled","error":"cancelled"}` published, no `:stats` count; the pop takes the next item (#33)
+- An expired mark is removed and its item handed out. Items without an envelope id always go out. With no `:cancelled` key a pop costs one `EXISTS` more, nothing else (#33)
+- At most 1000 drops per script call (one `:failed` trim after them). A pop that runs out returns what it has, stays out of `:idle` and reports the rest (`remaining`) (#33)
+- Every pop call retries at once with the same ack IDs while each run shrinks `remaining`, so a cancelled backlog alone does not make a batch call return 0 items (#33)
+- A valid workflow item (spec 3: `wf` a workflow ID, `task` a task name, `undo` absent or a bool, id `wf:<wf>:<task>[:undo]`) is handed out and keeps its mark: it runs unless its workflow is cancelled (#34)
+- Any other `wf` field (crafted, null, mismatched id) is checked as a plain job (#34)
+- `OnCancel(fn)`: fn per `cancel:<id>` control message, own goroutine per call (off the pub/sub reader, no order); `stop` removes it (#33)
+- `OnCancel` drops a stale message: fn runs only while `ZSCORE <key>:cancelled <id>` > now (Redis clock), so a finish or re-add (`ZREM`) before delivery calls nothing. A failed check calls fn anyway; with no callbacks, no check (#33)
+- `AcknowledgeCancelled(ackID, reason)`: as `Reject` (counted failed, failed retention, no requeue), record and outcome state `cancelled`, `error` the reason (#33)
+- `Acknowledge`, `AcknowledgeResult`, `Reject` and a pushing `EnqueueOnce` drop the id's cancel mark (`ZREM`); the 1s sweep prunes expired marks; `Purge` deletes `<key>:cancelled` (#33)
+- `WatchOutcome` takes `cancelled` as final (a record without `errors` reports error `cancelled`) (#33)
 
 ### Deprecated
 
-- `DistributedQueue`, `DistributedPriorityQueue`: now aliases of `Queue`, `PriorityQueue`. `NewDistributedQueue`, `NewDistributedPriorityQueue` return `*Queue`, `*PriorityQueue` (same as `NewQueue`, `NewPriorityQueue`)
+- `DistributedQueue`, `DistributedPriorityQueue`: now aliases of `Queue`, `PriorityQueue` (#33)
+- `NewDistributedQueue`, `NewDistributedPriorityQueue` return `*Queue`, `*PriorityQueue`, the same as `NewQueue`, `NewPriorityQueue` (#33)
 
 ## [1.5.1] - 2026-10-31
 
