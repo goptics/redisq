@@ -15,7 +15,7 @@ Requires `github.com/goptics/varmq/contract` v0.8.0 and VarMQ ≥ v1.11.0 (#33, 
 - A FIFO and a priority queue of one name no longer collide, and a queue's keys share a Redis Cluster slot (#27)
 - Keys written by 1.5.x and earlier are not read: drain those queues before upgrading (#27)
 - One queue kind per order: `Queue` and `PriorityQueue` now do all that `DistributedQueue` / `DistributedPriorityQueue` did (#33)
-- Removed `NewDistributedQueue`, `NewDistributedPriorityQueue`, the `DistributedQueue` and `DistributedPriorityQueue` aliases and `SetAckTimeout`: use `NewQueue`, `NewPriorityQueue`, `Queue`, `PriorityQueue` and `SetVisibilityTimeout`. `dq.Queue` and `dpq.PriorityQueue` no longer exist: call the method on the handle (#NN)
+- Removed `NewDistributedQueue`, `NewDistributedPriorityQueue`, the `DistributedQueue` and `DistributedPriorityQueue` aliases and `SetAckTimeout`: use `NewQueue`, `NewPriorityQueue`, `Queue`, `PriorityQueue` and `SetVisibilityTimeout`. `dq.Queue` and `dpq.PriorityQueue` no longer exist: call the method on the handle (#40)
 
 ### Changed
 
@@ -38,11 +38,11 @@ Requires `github.com/goptics/varmq/contract` v0.8.0 and VarMQ ≥ v1.11.0 (#33, 
 - New keys `<key>:started`, `<key>:attempts`, `<key>:jobs`, `<key>:completed`, `<key>:failed`, `<key>:stats`; pops record start times and requeues count attempts (#29)
 - `Purge` deletes all of a queue's jobs and job data: waiting and processing items, deadlines, start times, attempts, records, counters, and a priority queue's sequence and priorities. Consumer state and `EnqueueOnce` ids stay (#29)
 - A purged workflow task or undo ends `cancelled` in the same script, so its workflow goes on (spec 6.6) (#34)
-- Workflows, as varmq's `spec/redis-storage.md` 1.5.0 (6.9 to 6.12, 7.3): `NewWorkflowStore(qs, opts...)` makes the store of a `Queues` client's Redis, database and namespace (`contract.WorkflowStore`, `WorkflowInspector`, `WorkflowKeyLister`), so VarMQ workers in any process run one DAG across redisq queues (#34, #NN)
-- `NewWorkflowStore` registers the store in `contract` by scope; `Close` unregisters it. A second store for a scope returns `contract.ErrScopeRegistered`; closing the `Queues` unregisters its store too (#NN)
-- Every queue has `ScopeID()` (the Redis address, database and namespace); it needs no store (#NN)
-- `(*WorkflowStore).FinishTask(queueID, ackID, end)` finds the queue from its key, so any client of the scope can finish it. It uses the `SetCompletedRetention` and `SetFailedRetention` of the queue object in the process, else the defaults (#NN)
-- Exported `ErrResultTooLarge`, the error of a task result over the limit (#NN)
+- Workflows, as varmq's `spec/redis-storage.md` 1.5.0 (6.9 to 6.12, 7.3): `NewWorkflowStore(qs, opts...)` makes the store of a `Queues` client's Redis, database and namespace (`contract.WorkflowStore`, `WorkflowInspector`, `WorkflowKeyLister`), so VarMQ workers in any process run one DAG across redisq queues (#34, #40)
+- `NewWorkflowStore` registers the store in `contract` by scope; `Close` unregisters it. A second store for a scope returns `contract.ErrScopeRegistered`; closing the `Queues` unregisters its store too (#40)
+- Every queue has `ScopeID()` (the Redis address, database and namespace); it needs no store (#40)
+- `(*WorkflowStore).FinishTask(queueID, ackID, end)` finds the queue from its key, so any client of the scope can finish it. It uses the `SetCompletedRetention` and `SetFailedRetention` of the queue object in the process, else the defaults (#40)
+- Exported `ErrResultTooLarge`, the error of a task result over the limit (#40)
 - Keys `redisq:[ns:]wf:<id>` (hash: `meta`, `t:`/`s:`/`n:`/`i:`/`r:`/`e:`/`u:` per task) and `redisq:[ns:]wf:index` (#34)
 - Submit, FinishTask, Cancel and Purge are one script each. FinishTask settles the item as `Acknowledge`/`Reject` (record, stats, outcome) and pushes what the end releases in the same step (#34)
 - A re-sent finish changes nothing and names every push-target queue. Results over the limit fail the task; undo envelopes are pushed byte for byte (#34)
