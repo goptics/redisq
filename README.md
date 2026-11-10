@@ -351,10 +351,14 @@ the scope with its own connection. So use one Redis credential (ACL user and TLS
 `WithWorkflowRetention` sets how long an ended workflow stays, 7 days by default. A running workflow stays until it
 ends.
 
+The store counts the workflows of each state (`WorkflowCounts`, for VarMQ's `GET /workflow-counts`). A workflow record
+shows, for each task and each undo, the time of its push, of its start and of its end, on the Redis clock. The counts
+are exact when every process of the scope runs this version.
+
 A task finishes in one script that settles its job and pushes the tasks it releases. So a crash never leaves a
 workflow between the two. VarMQ calls `store.FinishTask(queueID, ackID, end)` for this. The store finds the queue from
-its key, so the queue can come from any client of the same scope. The workflow keys are `redisq:[ns:]wf:<id>` and
-`redisq:[ns:]wf:index`, as in VarMQ's `spec/redis-storage.md`. A task's job record uses the retention that you set
+its key, so the queue can come from any client of the same scope. The workflow keys are `redisq:[ns:]wf:<id>`,
+`redisq:[ns:]wf:index` and `redisq:[ns:]wf:index:states`, as in VarMQ's `spec/redis-storage.md`. A task's job record uses the retention that you set
 with `SetCompletedRetention` and `SetFailedRetention` on the queue object in the same process, whichever client made
 it. A `Purge` in a process with no store uses the default workflow retention.
 

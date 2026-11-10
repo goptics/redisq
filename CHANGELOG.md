@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Requires `github.com/goptics/varmq/contract` v0.8.0 and VarMQ ≥ v1.11.0 (#33, #34)
+Requires `github.com/goptics/varmq/contract` v0.9.0 and VarMQ ≥ v1.11.0 (#33, #34)
 
 ### ⚠️ Breaking Changes
 
@@ -48,6 +48,10 @@ Requires `github.com/goptics/varmq/contract` v0.8.0 and VarMQ ≥ v1.11.0 (#33, 
 - A re-sent finish changes nothing and names every push-target queue. Results over the limit fail the task; undo envelopes are pushed byte for byte (#34)
 - Workflow keys have no hashtag, so workflows need one Redis (no Cluster), as the spec says (#34)
 - `WithWorkflowResultLimit(n)` (default 64 KiB) and `WithWorkflowRetention(d)` (default 7 days) are `WorkflowOption`s of `NewWorkflowStore`; the sweep trims `wf:index` once a minute (#34)
+- `(*WorkflowStore).WorkflowCounts` (`contract.WorkflowCounter`; varmq's `spec/redis-storage.md` 1.9.0, 7.3): workflows per state, all seven states, from new ZSET `redisq:[ns:]wf:index:states` (ID → state number). Submit, FinishTask, Cancel and Purge write it with the state; the trim drops it with the index entry
+- A missing or drifted states ZSET (data of an older version) is rebuilt from the hashes on the next `WorkflowCounts`, in chunks. Counts are exact once every instance on the Redis runs this version; an expired workflow counts until the trim
+- Task times in workflow records (`enqueued_at`, `started_at`, `finished_at`, for the undo too), on the Redis clock: new hash fields `ea:`/`sa:`/`fa:` per task and three members in `u:`; no field for a time not reached
+- `Runnable` is one script: a yes stamps the start, a no writes nothing. No hash for an unknown ID, TTL untouched
 - Every consumer of a queue that carries workflow tasks must run this version (spec 9) (#34)
 - Submit refuses items Redis's cjson can't decode (nesting over 1000, lone surrogate escapes), queue objects with `SetExpiration` (workflow pushes don't renew it) and queue keys that aren't UTF-8 (#34)
 - A Purge re-sent after a lost reply changes nothing. FinishTask applies a workflow step only when the settled item's own tag names the end's task; an unreadable workflow hash settles items alone (#34)
