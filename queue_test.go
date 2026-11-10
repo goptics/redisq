@@ -2868,8 +2868,13 @@ func TestWorkflowDAGAcrossQueues(t *testing.T) {
 	assert.GreaterOrEqual(t, r.FinishedAt, r.CreatedAt)
 	assert.True(t, r.UndoOnCancel)
 	require.Len(t, r.Tasks, 4)
+	d := r.Tasks[3]
+	assert.NotZero(t, d.EnqueuedAt)
+	assert.GreaterOrEqual(t, d.StartedAt, d.EnqueuedAt)
+	assert.GreaterOrEqual(t, d.FinishedAt, d.StartedAt)
+	d.EnqueuedAt, d.StartedAt, d.FinishedAt = 0, 0, 0 // clock values, checked above
 	assert.Equal(t, contract.TaskRecord{Name: "d", State: contract.JobCompleted, Deps: []string{"b", "c"},
-		QueueID: e.a.queueKey, JobID: "wf:dag:d", ResultSize: len(`"d"`)}, r.Tasks[3])
+		QueueID: e.a.queueKey, JobID: "wf:dag:d", ResultSize: len(`"d"`)}, d)
 	assert.Equal(t, e.b.queueKey, r.Tasks[1].QueueID)
 
 	// Each task left a completed record in its queue and was counted.
@@ -3867,4 +3872,412 @@ func TestWorkflowStoreFinishesByQueueKey(t *testing.T) {
 	ctx := t.Context()
 	assert.Zero(t, e.a.client.ZCard(ctx, e.a.getCompletedKey()).Val(), "a keeps no record")
 	assert.Zero(t, e.a.client.ZCard(ctx, oc.getCompletedKey()).Val(), "the other client's queue keeps none")
+}
+
+// WorkflowCounts is one number per state, all seven present, kept by every
+// state write (submit, finish, cancel, purge); a lost or drifted states ZSET
+// heals from the hashes on the next call.
+func TestWorkflowCounts(t *testing.T) {
+	e := newWFTest(t)
+	ctx := t.Context()
+	counts := func() map[contract.WorkflowState]int64 {
+		t.Helper()
+		m, err := e.store.WorkflowCounts(ctx)
+		require.NoError(t, err)
+		return m
+	}
+	want := func(running, completed, failed, compensating, compensated, compFailed, cancelled int64) map[contract.WorkflowState]int64 {
+		return map[contract.WorkflowState]int64{contract.WorkflowRunning: running, contract.WorkflowCompleted: completed,
+			contract.WorkflowFailed: failed, contract.WorkflowCompensating: compensating, contract.WorkflowCompensated: compensated,
+			contract.WorkflowCompensationFailed: compFailed, contract.WorkflowCancelled: cancelled}
+	}
+	assert.Equal(t, want(0, 0, 0, 0, 0, 0, 0), counts(), "empty store: every state, zero")
+
+	submit := func(id string, tasks ...tk) {
+		t.Helper()
+		require.NoError(t, e.store.Submit(ctx, wfPlan(id, false, false, tasks...)))
+	}
+	submit("done", tk{name: "ok", q: e.a})
+	submit("fail", tk{name: "bad", q: e.b})
+	submit("saga", tk{name: "s1", q: e.a, undo: e.c}, tk{name: "s2", q: e.b, deps: []string{"s1"}})
+	submit("stuck", tk{name: "u1", q: e.a, undo: e.c}, tk{name: "u2", q: e.c, deps: []string{"u1"}})
+	submit("cx", tk{name: "z", q: e.c})
+	// Scripts write the states ZSET themselves: check before any
+	// WorkflowCounts call, which would heal a missing entry.
+	rc, sk := e.a.client, e.store.statesKey()
+	assert.Equal(t, int64(5), rc.ZCard(ctx, sk).Val())
+	for _, id := range []string{"done", "fail", "saga", "stuck", "cx"} {
+		assert.Equal(t, float64(1), rc.ZScore(ctx, sk, id).Val(), id)
+	}
+	assert.Equal(t, want(5, 0, 0, 0, 0, 0, 0), counts())
+	require.NoError(t, e.store.Cancel(ctx, "cx", nil))
+	e.drain(failing("bad", "s2", "u2", "u1:undo"))
+	assert.Equal(t, float64(2), rc.ZScore(ctx, sk, "done").Val(), "completed")
+	assert.Equal(t, want(0, 1, 1, 0, 1, 1, 1), counts())
+
+	// One compensating (its undo still queued), two running.
+	submit("comp", tk{name: "k1", q: e.a, undo: e.c}, tk{name: "k2", q: e.b, deps: []string{"k1"}})
+	for _, q := range []*Queue{e.a, e.b.Queue} {
+		p, ok := wfPop(t, q)
+		require.True(t, ok)
+		require.True(t, e.finish(p, failing("k2")))
+	}
+	submit("run", tk{name: "r", q: e.a})
+	submit("run2", tk{name: "r", q: e.b})
+	all := want(2, 1, 1, 1, 1, 1, 1)
+	assert.Equal(t, all, counts())
+	c, states := e.a.client, e.store.statesKey()
+	assert.Equal(t, int64(8), c.ZCard(ctx, states).Val())
+	assert.Equal(t, float64(4), c.ZScore(ctx, states, "comp").Val())
+
+	// Backfill: data of a version before the states ZSET.
+	require.NoError(t, c.Del(ctx, states).Err())
+	assert.Equal(t, all, counts(), "rebuilt from the hashes")
+	assert.Equal(t, int64(8), c.ZCard(ctx, states).Val())
+	// An older instance trimmed the index only: "ghost" stays in states. A
+	// heal ran just now: gated (cooldown, then one in flight), the call
+	// answers the stale counts, no error.
+	require.NoError(t, c.ZAdd(ctx, states, redis.Z{Score: 1, Member: "ghost"}).Err())
+	stale := want(3, 1, 1, 1, 1, 1, 1)
+	assert.Equal(t, stale, counts(), "cooldown")
+	e.store.healedAt.Store(0)
+	e.store.healing.Store(true)
+	assert.Equal(t, stale, counts(), "a heal in flight")
+	e.store.healing.Store(false)
+	assert.Equal(t, float64(1), c.ZScore(ctx, states, "ghost").Val(), "not healed")
+	// Cooldown over: the extra state leaves.
+	assert.Equal(t, all, counts())
+	assert.Equal(t, redis.Nil, c.ZScore(ctx, states, "ghost").Err())
+	assert.Equal(t, int64(8), c.ZCard(ctx, states).Val())
+	// An index entry whose hash is gone, added by an older instance: score
+	// 0, counted nowhere, sizes agree (no heal on each call).
+	require.NoError(t, c.ZAdd(ctx, e.store.indexKey(), redis.Z{Score: 1, Member: "lost"}).Err())
+	e.store.healedAt.Store(0)
+	assert.Equal(t, all, counts())
+	assert.Equal(t, []redis.Z{{Score: 0, Member: "lost"}}, c.ZRangeWithScores(ctx, states, 0, 0).Val())
+
+	// The trim drops the entry from both.
+	e.store.trimmedAt.Store(0)
+	e.store.trimIndex(ctx)
+	assert.Equal(t, redis.Nil, c.ZScore(ctx, states, "lost").Err())
+	assert.Equal(t, int64(8), c.ZCard(ctx, states).Val())
+
+	// Purge ends run's task: running -> failed.
+	e.a.Purge()
+	assert.Equal(t, want(1, 1, 2, 1, 1, 1, 1), counts())
+}
+
+// A finished workflow whose hash expired counts (as it lists in wf:index)
+// until the trim drops it.
+func TestWorkflowCountsTrim(t *testing.T) {
+	e := newWFTest(t, WithWorkflowRetention(50*time.Millisecond))
+	ctx := t.Context()
+	require.NoError(t, e.store.Submit(ctx, wfPlan("old", false, false, tk{name: "a", q: e.a})))
+	e.drain(completeAll)
+	require.Eventually(t, func() bool { return e.a.client.Exists(ctx, e.store.key("old")).Val() == 0 }, 2*time.Second, 10*time.Millisecond)
+	m, err := e.store.WorkflowCounts(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), m[contract.WorkflowCompleted], "stale until the trim")
+
+	// Unrelated drift heals: the expired one keeps its state. Member
+	// "index" is no workflow ID: no key built from it (its key would be
+	// wf:index, a ZSET: HGET fails), and it leaves the states ZSET.
+	c, states := e.a.client, e.store.statesKey()
+	require.NoError(t, c.ZAdd(ctx, states, redis.Z{Score: 1, Member: "ghost"}, redis.Z{Score: 1, Member: "index"}).Err())
+	require.NoError(t, c.ZAdd(ctx, e.store.indexKey(), redis.Z{Score: 1, Member: "index"}).Err())
+	m, err = e.store.WorkflowCounts(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), m[contract.WorkflowCompleted], "heal keeps an expired score")
+	assert.Zero(t, m[contract.WorkflowRunning])
+	assert.Equal(t, []redis.Z{{Score: 2, Member: "old"}}, c.ZRangeWithScores(ctx, states, 0, -1).Val())
+	require.NoError(t, c.ZRem(ctx, e.store.indexKey(), "index").Err())
+
+	e.store.trimmedAt.Store(0)
+	e.store.trimIndex(ctx)
+	m, err = e.store.WorkflowCounts(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, m[contract.WorkflowCompleted])
+	assert.Zero(t, e.a.client.Exists(ctx, e.store.statesKey()).Val())
+}
+
+// A task record carries when it was pushed, when the pre-run check let it
+// run and when it ended, on the Redis clock; so does its undo. As varmq's
+// TestMemStoreTaskTimes.
+func TestWorkflowTaskTimes(t *testing.T) {
+	e := newWFTest(t)
+	ctx := t.Context()
+	c := e.a.client
+	// tick is the Redis clock, after a pause: stamps of two steps differ.
+	tick := func() int64 {
+		time.Sleep(2 * time.Millisecond)
+		return c.Time(ctx).Val().UnixMilli()
+	}
+	times := func(r contract.TaskRecord) contract.TaskRecord {
+		return contract.TaskRecord{EnqueuedAt: r.EnqueuedAt, StartedAt: r.StartedAt, FinishedAt: r.FinishedAt}
+	}
+	task := func(name string) contract.TaskRecord {
+		t.Helper()
+		for _, tr := range e.record("w").Tasks {
+			if tr.Name == name {
+				return tr
+			}
+		}
+		t.Fatalf("no task %s", name)
+		return contract.TaskRecord{}
+	}
+	in := func(lo, v, hi int64, msg string) {
+		t.Helper()
+		assert.True(t, lo <= v && v <= hi, "%s: %d not in [%d, %d]", msg, v, lo, hi)
+	}
+	end := func(p wfPopped, out contract.Outcome) {
+		t.Helper()
+		_, ok := e.store.FinishTask(p.q.QueueID(), p.ack, contract.TaskEnd{Workflow: p.wf, Task: p.task, Undo: p.undo, Outcome: out})
+		require.True(t, ok)
+	}
+	runnable := func(name string, undo bool) bool {
+		t.Helper()
+		ok, err := e.store.Runnable(ctx, "w", name, undo)
+		require.NoError(t, err)
+		return ok
+	}
+
+	m0 := tick()
+	require.NoError(t, e.store.Submit(ctx, wfPlan("w", false, false,
+		tk{name: "a", q: e.a, undo: e.c},
+		tk{name: "b", q: e.b, deps: []string{"a"}},
+		tk{name: "c", q: e.a, deps: []string{"b"}})))
+	m1 := tick()
+	a := task("a")
+	t0 := a.EnqueuedAt
+	in(m0, t0, m1, "root pushed at submit")
+	assert.Equal(t, contract.TaskRecord{EnqueuedAt: t0}, times(a))
+	assert.Equal(t, contract.TaskRecord{}, times(task("b")), "waiting: no times")
+	assert.Equal(t, contract.TaskRecord{}, times(*a.Undo), "undo not pushed: no times")
+
+	require.True(t, runnable("a", false))
+	require.False(t, runnable("b", false))
+	m2 := tick()
+	t1 := task("a").StartedAt
+	in(m1, t1, m2, "a started")
+	assert.Zero(t, task("b").StartedAt, "a refused check stamps nothing")
+
+	pa, ok := wfPop(t, e.a)
+	require.True(t, ok)
+	end(pa, contract.OutcomeCompleted)
+	m3 := tick()
+	t2 := task("a").FinishedAt
+	in(m2, t2, m3, "a finished")
+	assert.Equal(t, contract.TaskRecord{EnqueuedAt: t0, StartedAt: t1, FinishedAt: t2}, times(task("a")))
+	assert.Equal(t, contract.TaskRecord{EnqueuedAt: t2}, times(task("b")), "released by a's end")
+
+	pb, ok := wfPop(t, e.b.Queue)
+	require.True(t, ok)
+	end(pb, contract.OutcomeFailed)
+	m4 := tick()
+	t3 := task("b").FinishedAt
+	in(m3, t3, m4, "b finished")
+	assert.Equal(t, contract.TaskRecord{EnqueuedAt: t2, FinishedAt: t3}, times(task("b")))
+	assert.Equal(t, contract.TaskRecord{FinishedAt: t3}, times(task("c")), "cancelled while waiting")
+	assert.Equal(t, contract.TaskRecord{EnqueuedAt: t3}, times(*task("a").Undo), "undo pushed")
+
+	require.False(t, runnable("a", false), "ended: no restamp")
+	require.True(t, runnable("a", true))
+	m5 := tick()
+	t4 := task("a").Undo.StartedAt
+	in(m4, t4, m5, "undo started")
+	pu, ok := wfPop(t, e.c)
+	require.True(t, ok)
+	require.True(t, pu.undo)
+	end(pu, contract.OutcomeCompleted)
+	t5 := task("a").Undo.FinishedAt
+	in(m5, t5, tick(), "undo finished")
+	a = task("a")
+	assert.Equal(t, contract.TaskRecord{EnqueuedAt: t3, StartedAt: t4, FinishedAt: t5}, times(*a.Undo))
+	assert.Equal(t, contract.TaskRecord{EnqueuedAt: t0, StartedAt: t1, FinishedAt: t2}, times(a), "the undo leaves the task's own times")
+	assert.Equal(t, contract.JobCompleted, a.Undo.State)
+	assert.Equal(t, contract.WorkflowCompensated, e.record("w").State)
+
+	// The listing reads the same fields; a time not reached has no field.
+	recs, err := e.store.Workflows(ctx, "", 0, 10)
+	require.NoError(t, err)
+	require.Len(t, recs, 1)
+	assert.Equal(t, e.record("w").Tasks, recs[0].Tasks)
+	h := c.HGetAll(ctx, e.store.key("w")).Val()
+	assert.Equal(t, strconv.FormatInt(t1, 10), h["sa:a"])
+	for _, f := range []string{"sa:b", "ea:c", "sa:c"} {
+		assert.NotContains(t, h, f)
+	}
+}
+
+// Runnable never makes a hash (unknown or expired ID) and leaves the TTL of
+// a finished workflow as it is.
+func TestWorkflowRunnableNoWrite(t *testing.T) {
+	e := newWFTest(t, WithWorkflowRetention(time.Hour))
+	ctx := t.Context()
+	c := e.a.client
+	for _, undo := range []bool{false, true} {
+		_, err := e.store.Runnable(ctx, "nope", "a", undo)
+		assert.ErrorIs(t, err, contract.ErrWorkflowNotFound)
+	}
+	assert.Zero(t, c.Exists(ctx, e.store.key("nope")).Val(), "no ghost hash")
+
+	require.NoError(t, e.store.Submit(ctx, wfPlan("fin", false, false, tk{name: "a", q: e.a, undo: e.c})))
+	ok, err := e.store.Runnable(ctx, "fin", "a", false)
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, time.Duration(-1), c.PTTL(ctx, e.store.key("fin")).Val(), "running: the stamp sets no TTL")
+	e.drain(completeAll)
+	before := e.record("fin")
+	ttl := c.PTTL(ctx, e.store.key("fin")).Val()
+	time.Sleep(20 * time.Millisecond) // a TTL refresh would land back near 1h
+	for _, undo := range []bool{false, true} {
+		ok, err := e.store.Runnable(ctx, "fin", "a", undo)
+		require.NoError(t, err)
+		assert.False(t, ok)
+	}
+	left := c.PTTL(ctx, e.store.key("fin")).Val()
+	assert.True(t, left > 0 && left <= ttl-15*time.Millisecond, "TTL kept: %v then %v", ttl, left)
+	assert.Equal(t, before, e.record("fin"), "no stamp after the end")
+
+	// A compensating workflow has no TTL either; the undo stamp sets none.
+	require.NoError(t, e.store.Submit(ctx, wfPlan("und", false, false,
+		tk{name: "a", q: e.a, undo: e.c}, tk{name: "b", q: e.b, deps: []string{"a"}})))
+	for _, q := range []*Queue{e.a, e.b.Queue} {
+		p, ok := wfPop(t, q)
+		require.True(t, ok)
+		require.True(t, e.finish(p, failing("b")))
+	}
+	ok, err = e.store.Runnable(ctx, "und", "a", true)
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, time.Duration(-1), c.PTTL(ctx, e.store.key("und")).Val())
+	assert.Equal(t, []string{"a:undo"}, e.drain(completeAll), "the undo still runs after the stamp")
+	assert.Equal(t, contract.WorkflowCompensated, e.record("und").State)
+}
+
+// A heal over many ZSCAN pages (skiplist, not listpack), with Submit and
+// Cancel at work, leaves each workflow's score at its hash's state.
+func TestWorkflowCountsHealPages(t *testing.T) {
+	e := newWFTest(t)
+	ctx := t.Context()
+	c, states := e.a.client, e.store.statesKey()
+	for i := range 3 * listChunk {
+		id := fmt.Sprintf("w%04d", i)
+		require.NoError(t, e.store.Submit(ctx, wfPlan(id, false, false, tk{name: "a", q: e.a})))
+		if i%2 == 0 {
+			require.NoError(t, e.store.Cancel(ctx, id, nil))
+		}
+	}
+	require.NoError(t, c.Del(ctx, states).Err())
+	require.Equal(t, "skiplist", c.ObjectEncoding(ctx, e.store.indexKey()).Val())
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	wg.Go(func() {
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = e.store.Submit(ctx, wfPlan(fmt.Sprintf("x%05d", i), false, false, tk{name: "a", q: e.b}))
+			_ = e.store.Cancel(ctx, fmt.Sprintf("w%04d", 1+2*(i%listChunk)), nil)
+		}
+	})
+	for i := range 4 {
+		if i > 0 {
+			require.NoError(t, c.Del(ctx, states).Err())
+		}
+		e.store.healedAt.Store(0)
+		_, err := e.store.WorkflowCounts(ctx)
+		require.NoError(t, err)
+	}
+	close(stop)
+	wg.Wait()
+
+	num := map[string]float64{}
+	for i, st := range wfStates {
+		num[string(st)] = float64(i + 1)
+	}
+	score := map[string]float64{}
+	for _, z := range c.ZRangeWithScores(ctx, states, 0, -1).Val() {
+		score[z.Member.(string)] = z.Score
+	}
+	ids := c.ZRange(ctx, e.store.indexKey(), 0, -1).Val()
+	require.Len(t, score, len(ids))
+	bad := 0
+	for _, id := range ids {
+		var m struct{ State string }
+		require.NoError(t, json.Unmarshal([]byte(c.HGet(ctx, e.store.key(id), "meta").Val()), &m))
+		if got, ok := score[id]; !ok || got != num[m.State] {
+			bad++
+		}
+	}
+	assert.Zero(t, bad, "members off their hash's state")
+}
+
+// failCmd fails each command whose name and first argument are the pair in
+// fail (none when nil), alone or in a pipeline.
+type failCmd struct{ fail atomic.Pointer[[2]string] }
+
+var errFailCmd = errors.New("failCmd: injected")
+
+func (h *failCmd) hit(cmd redis.Cmder) bool {
+	f, a := h.fail.Load(), cmd.Args()
+	return f != nil && len(a) > 1 && cmd.Name() == f[0] && a[1] == f[1]
+}
+
+func (h *failCmd) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *failCmd) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if h.hit(cmd) {
+			cmd.SetErr(errFailCmd)
+			return errFailCmd
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (h *failCmd) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		if slices.ContainsFunc(cmds, h.hit) {
+			for _, c := range cmds {
+				c.SetErr(errFailCmd)
+			}
+			return errFailCmd
+		}
+		return next(ctx, cmds)
+	}
+}
+
+// A Redis error while counting or healing is the call's error: no counts,
+// never a partial map. Each step of the heal fails once; then it heals.
+func TestWorkflowCountsRedisError(t *testing.T) {
+	e := newWFTest(t)
+	ctx := t.Context()
+	c, index, states := e.store.client, e.store.indexKey(), e.store.statesKey()
+	require.NoError(t, e.store.Submit(ctx, wfPlan("w1", false, false, tk{name: "a", q: e.a})))
+	require.NoError(t, c.ZAdd(ctx, states, redis.Z{Member: "no id!"}).Err()) // sizes differ: the count heals
+	h := &failCmd{}
+	c.AddHook(h)
+	for _, f := range [][2]string{
+		{"zcard", index},                 // the count
+		{"zscan", index},                 // heal: walk the index
+		{"evalsha", wfHealScript.Hash()}, // heal: states from hashes
+		{"zrem", states},                 // heal: drop a member that is no ID
+	} {
+		h.fail.Store(&f)
+		e.store.healedAt.Store(0)
+		got, err := e.store.WorkflowCounts(ctx)
+		assert.ErrorIs(t, err, errFailCmd, f[0])
+		assert.Nil(t, got, f[0])
+	}
+
+	h.fail.Store(nil)
+	e.store.healedAt.Store(0)
+	got, err := e.store.WorkflowCounts(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), got[contract.WorkflowRunning])
+	assert.Equal(t, c.ZCard(ctx, index).Val(), c.ZCard(ctx, states).Val(), "healed")
 }
