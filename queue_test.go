@@ -3902,9 +3902,17 @@ func TestWorkflowCounts(t *testing.T) {
 	submit("saga", tk{name: "s1", q: e.a, undo: e.c}, tk{name: "s2", q: e.b, deps: []string{"s1"}})
 	submit("stuck", tk{name: "u1", q: e.a, undo: e.c}, tk{name: "u2", q: e.c, deps: []string{"u1"}})
 	submit("cx", tk{name: "z", q: e.c})
+	// Scripts write the states ZSET themselves: check before any
+	// WorkflowCounts call, which would heal a missing entry.
+	rc, sk := e.a.client, e.store.statesKey()
+	assert.Equal(t, int64(5), rc.ZCard(ctx, sk).Val())
+	for _, id := range []string{"done", "fail", "saga", "stuck", "cx"} {
+		assert.Equal(t, float64(1), rc.ZScore(ctx, sk, id).Val(), id)
+	}
 	assert.Equal(t, want(5, 0, 0, 0, 0, 0, 0), counts())
 	require.NoError(t, e.store.Cancel(ctx, "cx", nil))
 	e.drain(failing("bad", "s2", "u2", "u1:undo"))
+	assert.Equal(t, float64(2), rc.ZScore(ctx, sk, "done").Val(), "completed")
 	assert.Equal(t, want(0, 1, 1, 0, 1, 1, 1), counts())
 
 	// One compensating (its undo still queued), two running.
