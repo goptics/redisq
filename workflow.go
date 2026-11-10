@@ -61,6 +61,8 @@ type WorkflowStore struct {
 	trimFrom    atomic.Int64 // trimIndex's offset past old entries still live
 	trimming    atomic.Bool  // a trimIndex runs: every queue's sweep calls it
 	trimmedAt   atomic.Int64 // Unix ms of the last trimIndex
+	healing     atomic.Bool  // a healStates runs
+	healedAt    atomic.Int64 // Unix ms of the last healStates
 }
 
 // WorkflowOption configures NewWorkflowStore.
@@ -1225,9 +1227,11 @@ func page(keys []contract.WorkflowKey, offset, want int) []contract.WorkflowKey 
 // WorkflowCounts is how many workflows the store holds in each state (spec
 // 7.3, Counts): one ZCOUNT of the states ZSET per state, every state present.
 // The states ZSET is healed first when its size differs from wf:index's
-// (data of a version before spec 1.9.0, or an older instance at work).
-// Exact only when every instance on this Redis writes the states ZSET; like
-// the listing's index, it keeps a workflow whose hash expired until the trim.
+// (data of a version before spec 1.9.0, or an older instance at work); a
+// call the heal gate stops answers what it read (may be stale). Exact only
+// once every instance on this Redis writes the states ZSET and the ZSET was
+// rebuilt (DEL) after the last older one stopped; like the listing's index,
+// it keeps a workflow whose hash expired until the trim.
 func (s *WorkflowStore) WorkflowCounts(ctx context.Context) (map[contract.WorkflowState]int64, error) {
 	for heal := true; ; heal = false {
 		pipe := s.client.TxPipeline() // one view: a Submit between the two ZCARDs would look like drift
@@ -1241,10 +1245,13 @@ func (s *WorkflowStore) WorkflowCounts(ctx context.Context) (map[contract.Workfl
 			return nil, err
 		}
 		if heal && index.Val() != states.Val() {
-			if err := s.healStates(ctx); err != nil {
+			healed, err := s.healStates(ctx)
+			if err != nil {
 				return nil, err
 			}
-			continue
+			if healed {
+				continue
+			}
 		}
 		out := make(map[contract.WorkflowState]int64, len(wfStates))
 		for i, st := range wfStates {
@@ -1256,12 +1263,18 @@ func (s *WorkflowStore) WorkflowCounts(ctx context.Context) (map[contract.Workfl
 
 // wfHealScript sets the state (KEYS[2] the states ZSET) of each workflow ID
 // in ARGV from its hash KEYS[i + 2], in one step: an ID not in wf:index
-// (KEYS[1]) leaves the ZSET; one whose hash is gone or unreadable gets score
-// 0 (no state: counted nowhere), so the two sizes agree again.
+// (KEYS[1]) leaves the ZSET; one whose hash is gone or unreadable keeps its
+// score (an expired workflow counts until the trim), or gets 0 (no state:
+// counted nowhere) without one, so the two sizes agree again.
 var wfHealScript = redis.NewScript(wfStatesFn + `for i, id in ipairs(ARGV) do
 	if redis.call('ZSCORE', KEYS[1], id) then
 		local ok, m = pcall(cjson.decode, redis.call('HGET', KEYS[i + 2], 'meta') or '')
-		redis.call('ZADD', KEYS[2], ok and type(m) == 'table' and wfstates[m.state] or 0, id)
+		local st = ok and type(m) == 'table' and wfstates[m.state]
+		if st then
+			redis.call('ZADD', KEYS[2], st, id)
+		else
+			redis.call('ZADD', KEYS[2], 'NX', 0, id)
+		end
 	else
 		redis.call('ZREM', KEYS[2], id)
 	end
@@ -1272,24 +1285,46 @@ return 1`)
 // state, then every states entry without an index entry is dropped. Chunked
 // from the client like the listing, each chunk one atomic script, so it
 // never blocks Redis for long and a Submit, finish or trim in between is
-// kept.
+// kept. A member that is no workflow ID builds no key: skipped, and dropped
+// from the states ZSET. Gated: one heal per store at a time, at most one per
+// 30 s (the first at once); a gated call heals nothing and returns false.
 // ponytail: walks the whole index and states ZSET (2 round trips per ~200
-// IDs) on every WorkflowCounts that finds the sizes unequal; fine to ~1e5
-// workflows. Past that, heal in the sweep with a cursor kept across calls.
-func (s *WorkflowStore) healStates(ctx context.Context) error {
+// IDs) per heal; fine to ~1e5 workflows. Past that, heal in the sweep with a
+// cursor kept across calls.
+// ponytail: gate per process: N processes, N heals per 30 s while an older
+// instance keeps the sizes apart; a cross-process SET NX PX lock if that hurts.
+func (s *WorkflowStore) healStates(ctx context.Context) (bool, error) {
+	if !s.healing.CompareAndSwap(false, true) {
+		return false, nil
+	}
+	defer s.healing.Store(false)
+	now := time.Now().UnixMilli() // read under the flag: a heal just done counts
+	if now-s.healedAt.Load() < 30_000 {
+		return false, nil
+	}
+	s.healedAt.Store(now)
 	for _, zset := range []string{s.indexKey(), s.statesKey()} {
 		for cursor := uint64(0); ; {
 			zs, next, err := s.client.ZScan(ctx, zset, cursor, "", listChunk).Result() // member, score, ...
 			if err != nil {
-				return err
+				return true, err
 			}
-			keys, ids := []string{s.indexKey(), s.statesKey()}, make([]any, 0, len(zs)/2)
+			keys, ids, bad := []string{s.indexKey(), s.statesKey()}, make([]any, 0, len(zs)/2), []any(nil)
 			for i := 0; i < len(zs); i += 2 {
+				if !validWorkflowID(zs[i]) {
+					bad = append(bad, zs[i])
+					continue
+				}
 				keys, ids = append(keys, s.key(zs[i])), append(ids, zs[i])
+			}
+			if len(bad) > 0 && zset == s.statesKey() {
+				if err := s.client.ZRem(ctx, zset, bad...).Err(); err != nil {
+					return true, err
+				}
 			}
 			if len(ids) > 0 {
 				if err := wfHealScript.Run(ctx, s.client, keys, ids...).Err(); err != nil {
-					return err
+					return true, err
 				}
 			}
 			if cursor = next; cursor == 0 {
@@ -1297,7 +1332,7 @@ func (s *WorkflowStore) healStates(ctx context.Context) error {
 			}
 		}
 	}
-	return nil
+	return true, nil
 }
 
 // wfTrimScript drops index entry ARGV[i] (KEYS[1] the index) and its state

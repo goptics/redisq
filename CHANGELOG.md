@@ -49,7 +49,10 @@ Requires `github.com/goptics/varmq/contract` v0.9.0 and VarMQ ≥ v1.11.0 (#33, 
 - Workflow keys have no hashtag, so workflows need one Redis (no Cluster), as the spec says (#34)
 - `WithWorkflowResultLimit(n)` (default 64 KiB) and `WithWorkflowRetention(d)` (default 7 days) are `WorkflowOption`s of `NewWorkflowStore`; the sweep trims `wf:index` once a minute (#34)
 - `(*WorkflowStore).WorkflowCounts` (`contract.WorkflowCounter`; varmq's `spec/redis-storage.md` 1.9.0, 7.3): workflows per state, all seven states, from new ZSET `redisq:[ns:]wf:index:states` (ID → state number). Submit, FinishTask, Cancel and Purge write it with the state; the trim drops it with the index entry
-- A missing or drifted states ZSET (data of an older version) is rebuilt from the hashes on the next `WorkflowCounts`, in chunks. Counts are exact once every instance on the Redis runs this version; an expired workflow counts until the trim
+- A states ZSET whose size differs from `wf:index` (missing: data of an older version) is rebuilt from the hashes on the next `WorkflowCounts`, in chunks. At most one rebuild per 30 s per process; a call in between answers what it read (may be stale). An expired workflow counts until the trim
+- While an instance on an older redisq still writes workflows, counts can be off (stale state of a workflow it ended, entries it trimmed). After the last one stops, run `DEL redisq:[ns:]wf:index:states` once: the next `WorkflowCounts` rebuilds it
+- **Upgrade, ACL users:** new key `redisq:[ns:]wf:index:states` (a `~redisq:*` or `~redisq:[ns:]wf:*` pattern covers it). `WorkflowCounts` needs `+multi +exec +zcard +zcount +zscan +zrem +evalsha +eval`, plus what its script calls: `+zscore +hget +zadd`
+- **Upgrade, ACL users:** `Runnable` is now a script that writes (`HSET` of `sa:<task>`, or `u:<task>` for an undo): it needs `+evalsha +eval +hget +hmget +hset +time`. A read-only user can no longer answer the pre-run check
 - Task times in workflow records (`enqueued_at`, `started_at`, `finished_at`, for the undo too), on the Redis clock: new hash fields `ea:`/`sa:`/`fa:` per task and three members in `u:`; no field for a time not reached
 - `Runnable` is one script: a yes stamps the start, a no writes nothing. No hash for an unknown ID, TTL untouched
 - Every consumer of a queue that carries workflow tasks must run this version (spec 9) (#34)

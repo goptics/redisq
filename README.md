@@ -352,8 +352,12 @@ the scope with its own connection. So use one Redis credential (ACL user and TLS
 ends.
 
 The store counts the workflows of each state (`WorkflowCounts`, for VarMQ's `GET /workflow-counts`). A workflow record
-shows, for each task and each undo, the time of its push, of its start and of its end, on the Redis clock. The counts
-are exact when every process of the scope runs this version.
+shows, for each task and each undo, the time of its push, of its start and of its end, on the Redis clock. While a
+process on an older redisq (no `wf:index:states`) still writes workflows, the counts can be off: a workflow it ends
+keeps its old state, an entry it trims stays. After the last old process stops, run
+`DEL redisq:[ns:]wf:index:states` once: the next `WorkflowCounts` rebuilds it from the workflow hashes. A rebuild runs
+at most once per 30 s per process, so after a drift the counts can be off for that long. A workflow whose hash expired
+counts until the trim drops it.
 
 A task finishes in one script that settles its job and pushes the tasks it releases. So a crash never leaves a
 workflow between the two. VarMQ calls `store.FinishTask(queueID, ackID, end)` for this. The store finds the queue from
