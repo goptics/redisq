@@ -4215,3 +4215,69 @@ func TestWorkflowCountsHealPages(t *testing.T) {
 	}
 	assert.Zero(t, bad, "members off their hash's state")
 }
+
+// failCmd fails each command whose name and first argument are the pair in
+// fail (none when nil), alone or in a pipeline.
+type failCmd struct{ fail atomic.Pointer[[2]string] }
+
+var errFailCmd = errors.New("failCmd: injected")
+
+func (h *failCmd) hit(cmd redis.Cmder) bool {
+	f, a := h.fail.Load(), cmd.Args()
+	return f != nil && len(a) > 1 && cmd.Name() == f[0] && a[1] == f[1]
+}
+
+func (h *failCmd) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *failCmd) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if h.hit(cmd) {
+			cmd.SetErr(errFailCmd)
+			return errFailCmd
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (h *failCmd) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		if slices.ContainsFunc(cmds, h.hit) {
+			for _, c := range cmds {
+				c.SetErr(errFailCmd)
+			}
+			return errFailCmd
+		}
+		return next(ctx, cmds)
+	}
+}
+
+// A Redis error while counting or healing is the call's error: no counts,
+// never a partial map. Each step of the heal fails once; then it heals.
+func TestWorkflowCountsRedisError(t *testing.T) {
+	e := newWFTest(t)
+	ctx := t.Context()
+	c, index, states := e.store.client, e.store.indexKey(), e.store.statesKey()
+	require.NoError(t, e.store.Submit(ctx, wfPlan("w1", false, false, tk{name: "a", q: e.a})))
+	require.NoError(t, c.ZAdd(ctx, states, redis.Z{Member: "no id!"}).Err()) // sizes differ: the count heals
+	h := &failCmd{}
+	c.AddHook(h)
+	for _, f := range [][2]string{
+		{"zcard", index},                 // the count
+		{"zscan", index},                 // heal: walk the index
+		{"evalsha", wfHealScript.Hash()}, // heal: states from hashes
+		{"zrem", states},                 // heal: drop a member that is no ID
+	} {
+		h.fail.Store(&f)
+		e.store.healedAt.Store(0)
+		got, err := e.store.WorkflowCounts(ctx)
+		assert.ErrorIs(t, err, errFailCmd, f[0])
+		assert.Nil(t, got, f[0])
+	}
+
+	h.fail.Store(nil)
+	e.store.healedAt.Store(0)
+	got, err := e.store.WorkflowCounts(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), got[contract.WorkflowRunning])
+	assert.Equal(t, c.ZCard(ctx, index).Val(), c.ZCard(ctx, states).Val(), "healed")
+}
