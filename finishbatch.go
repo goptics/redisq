@@ -90,10 +90,6 @@ if #live == 0 then return out end
 local la = {}
 for k, i in ipairs(live) do la[k] = acks[i] end
 local starts = redis.call('HMGET', KEYS[3], unpack(la))
-redis.call('HDEL', KEYS[1], unpack(la))
-redis.call('ZREM', KEYS[2], unpack(la))
-redis.call('HDEL', KEYS[3], unpack(la))
-redis.call('HDEL', KEYS[9], unpack(la))
 local envs, decs, doks, eids = {}, {}, {}, {}
 for k, i in ipairs(live) do
 	local h = ARGV[5*i + 5]
@@ -144,6 +140,12 @@ for k, i in ipairs(live) do
 	if env ~= '' then pubs[#pubs + 1] = env; pubs[#pubs + 1] = outcome(env, st, err, res) end
 end
 flush()
+-- in-flight state goes last: an error above leaves the batch in flight
+-- (redelivered), not lost
+redis.call('HDEL', KEYS[1], unpack(la))
+redis.call('ZREM', KEYS[2], unpack(la))
+redis.call('HDEL', KEYS[3], unpack(la))
+redis.call('HDEL', KEYS[9], unpack(la))
 redis.call('ZREM', KEYS[10], unpack(ids))
 if nc > 0 then
 	redis.call('HINCRBY', KEYS[5], 'completed', nc)
