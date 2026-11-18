@@ -131,9 +131,9 @@ func (q *Queue) syncSub(id string, dirty, watch bool) {
 	if s.dirty == nil {
 		s.dirty = map[string]struct{}{}
 	}
-	if dirty || !watch {
-		s.dirty[id] = struct{}{}
-	}
+	// every call marks id: a second watcher must not return before the
+	// first watcher's SUBSCRIBE is written; flushSubs skips subscribed ids
+	s.dirty[id] = struct{}{}
 	if watch {
 		s.catch = append(s.catch, id)
 		done = make(chan struct{})

@@ -486,6 +486,7 @@ func (q *Queue) PrepareForFutureAck(ackID string, item any) error {
 	case <-q.ctx.Done():
 		return fmt.Errorf("queue closed, cannot prepare for acknowledgment")
 	default:
+		q.hints.take(ackID) // item may differ from the one popped under ackID
 		keys := []string{q.getNackedItemKey(), q.getTimeoutKey(), q.getStartedKey()}
 		if err := prepareAck.Run(q.ctx, q.client, keys, ackID, item, q.vt()).Err(); err != nil {
 			return fmt.Errorf("error storing item in pending list: %v", err)
