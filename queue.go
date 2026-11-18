@@ -99,7 +99,7 @@ func newQueueBase(c *redis.Client, queueKey string) *Queue {
 		queueKey:  queueKey,
 		ctx:       ctx,
 		cancel:    cancel,
-		ackPrefix: newID(),
+		ackPrefix: newOwnerID(),
 	}
 	q.pauseHooks.kick = make(chan struct{}, 1)
 	q.pausedKey, q.controlKey = queueKey+":paused", queueKey+":control"
@@ -119,6 +119,15 @@ func newQueueBase(c *redis.Client, queueKey string) *Queue {
 // and a pop's re-send guard could hand one consumer the items another holds.
 func newID() string {
 	return crand.Text()
+}
+
+// newOwnerID is newID twice, 52 chars, so ack IDs are 78 bytes. Over
+// Redis's zset/hash-max-listpack-value (64) the keys that hold ack IDs
+// (:timeouts, :started, :completed of plain jobs) are skiplists and hash
+// tables from the first member: a listpack zset insert scans and strtod's
+// every float score (~9 us at 100 members against ~0.2 us).
+func newOwnerID() string {
+	return crand.Text() + crand.Text()
 }
 
 func (q *Queue) getExpiration() time.Duration {
