@@ -136,9 +136,10 @@ func (q *Queue) cancelRequested(id string) {
 // (no started_at; no errors, no error). res is "" or ',"result":' and the
 // result JSON, spliced raw: a cjson round trip turns big integers into
 // doubles. Built by concatenation: numbers through string.format('%.0f'),
-// strings through cjson.encode, the item through asjson.
-const recordFn = `local function record(id, state, item, started, now, attempts, err, res)
-	local rec = '{"id":' .. cjson.encode(id) .. ',"state":"' .. state .. '","item":' .. asjson(item)
+// strings through cjson.encode, the item through asjson. dok, dec: envid's
+// decode of item (nil dok: decode again).
+const recordFn = `local function record(id, state, item, started, now, attempts, err, res, dok, dec)
+	local rec = '{"id":' .. cjson.encode(id) .. ',"state":"' .. state .. '","item":' .. asjson(item, dok, dec)
 	if started then rec = rec .. ',"started_at":' .. string.format('%.0f', started) end
 	rec = rec .. ',"finished_at":' .. string.format('%.0f', now) .. ',"attempts":' .. string.format('%.0f', attempts) .. res
 	if err then
@@ -186,7 +187,7 @@ local function trimDropped()
 	end
 end
 local function dropped(v)
-	local id, e = envid(v)
+	local id, e, dok = envid(v)
 	if id == '' or wftag(e, id) then return false end
 	local exp = redis.call('ZSCORE', KEYS[ck], id)
 	if not exp then return false end
@@ -199,7 +200,7 @@ local function dropped(v)
 	local keep, age = tonumber(ARGV[ca]), tonumber(ARGV[ca + 1])
 	redis.call('ZREM', KEYS[ck + 2], id)
 	if keep > 0 and age > 0 then
-		redis.call('HSET', KEYS[ck + 1], id, record(id, 'cancelled', v, nil, now, attempts, nil, ''))
+		redis.call('HSET', KEYS[ck + 1], id, record(id, 'cancelled', v, nil, now, attempts, nil, '', dok, e))
 		redis.call('ZADD', KEYS[ck + 3], string.format('%.0f', now), id)
 	else
 		redis.call('HDEL', KEYS[ck + 1], id)

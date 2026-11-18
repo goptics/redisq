@@ -571,8 +571,8 @@ func (q *Queue) SetFailedRetention(most int, age time.Duration) {
 // varmq, so it is never a workflow item here and a cancel mark drops it.
 const envIDFn = `local function envid(v)
 	local ok, e = pcall(cjson.decode, v)
-	if ok and type(e) == 'table' and type(e.id) == 'string' then return e.id, e end
-	return '', (ok and e or nil)
+	if ok and type(e) == 'table' and type(e.id) == 'string' then return e.id, e, true end
+	return '', (ok and e or nil), ok
 end
 local function wfname(s, n)
 	return type(s) == 'string' and #s >= 1 and #s <= n and string.find(s, '^[A-Za-z0-9_.%-]+$') ~= nil
@@ -593,11 +593,12 @@ local function wftag(e, id)
 end
 `
 
-// asJSONFn defines asjson(v): item v as it goes into a record, v itself
-// when it is JSON, else v as a JSON string. cjson.decode takes nan, inf and
-// hex numbers, so a bare number counts as JSON only when it looks like one.
-const asJSONFn = `local function asjson(v)
-	local ok, e = pcall(cjson.decode, v)
+// asJSONFn defines asjson(v, ok, e): item v as it goes into a record, v
+// itself when it is JSON, else v as a JSON string. cjson.decode takes nan,
+// inf and hex numbers, so a bare number counts as JSON only when it looks
+// like one. ok, e: envid's decode of v, reused; nil ok decodes here.
+const asJSONFn = `local function asjson(v, ok, e)
+	if ok == nil then ok, e = pcall(cjson.decode, v) end
 	if not ok or (type(e) == 'number' and not string.match(v, '^%s*-?%d[%d.eE+-]*%s*$')) then return cjson.encode(v) end
 	return v
 end
@@ -660,7 +661,7 @@ redis.call('HDEL', KEYS[1], ARGV[1])
 redis.call('ZREM', KEYS[2], ARGV[1])
 redis.call('HDEL', KEYS[3], ARGV[1])
 redis.call('HDEL', KEYS[9], ARGV[1])
-local env = envid(item)
+local env, dec, dok = envid(item)
 local id, attempts = env, 1
 if id ~= '' then
 	attempts = 1 + (tonumber(redis.call('HGET', KEYS[4], id)) or 0)
@@ -677,7 +678,7 @@ local err = not done and ARGV[3] or nil
 local res = (done and ARGV[6] ~= '') and (',"result":' .. ARGV[6]) or ''
 redis.call('ZREM', KEYS[8], id)
 if keep > 0 and age > 0 then
-	redis.call('HSET', KEYS[6], id, record(id, ARGV[2], item, started, now, attempts, err, res))
+	redis.call('HSET', KEYS[6], id, record(id, ARGV[2], item, started, now, attempts, err, res, dok, dec))
 	redis.call('ZADD', KEYS[7], string.format('%.0f', now), id)
 else
 	redis.call('HDEL', KEYS[6], id)
