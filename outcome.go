@@ -60,7 +60,7 @@ type subFlush struct {
 
 // donePrefix is the outcome channel prefix, <base>:done:.
 func (q *Queue) donePrefix() string {
-	return q.queueKey + ":done:"
+	return q.k.done
 }
 
 // WatchOutcome calls fn once, from its own goroutine, when job id completes,

@@ -14,7 +14,8 @@ type group[T any] struct {
 	busy    bool
 }
 
-// groupReq is one queued value of size bytes; run sets ok.
+// groupReq is one queued value of size bytes; run sets ok. done is nil
+// for a leader's own value: the leader runs it itself.
 type groupReq[T any] struct {
 	v    T
 	size int
@@ -27,14 +28,18 @@ const maxGroupBytes = 4 << 20
 
 // do queues v, of size bytes, and returns its ok once a run took it.
 func (g *group[T]) do(v T, size, max int, run func([]*groupReq[T])) bool {
-	r := &groupReq[T]{v: v, size: size, done: make(chan struct{})}
+	r := &groupReq[T]{v: v, size: size}
 	g.mu.Lock()
 	g.pending = append(g.pending, r)
-	lead := !g.busy
+	lead := !g.busy // idle: pending was empty, so r goes in the first run
 	g.busy = true
+	if !lead {
+		r.done = make(chan struct{})
+	}
 	g.mu.Unlock()
 	if lead {
 		g.flush(max, run)
+		return r.ok
 	}
 	<-r.done
 	return r.ok
@@ -56,7 +61,9 @@ func (g *group[T]) flush(max int, run func([]*groupReq[T])) {
 
 	run(batch)
 	for _, r := range batch {
-		close(r.done)
+		if r.done != nil {
+			close(r.done)
+		}
 	}
 
 	g.mu.Lock()

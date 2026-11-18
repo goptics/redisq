@@ -36,8 +36,12 @@ func (q *Queue) finish(ackID, state, reason string, result []byte) bool {
 	return q.finishes.do(finishReq{ackID, state, reason, result, q.hints.take(ackID)}, len(reason)+len(result), maxFinishBatch, q.settle)
 }
 
-// settle runs settleBatch for batch.
+// settle runs settleBatch for batch, settleOne for a lone finish.
 func (q *Queue) settle(batch []*groupReq[finishReq]) {
+	if len(batch) == 1 {
+		q.settleLone(batch[0])
+		return
+	}
 	args := make([]any, 0, 5+5*len(batch))
 	args = append(args,
 		q.keepCompleted.Load(), time.Duration(q.keepCompletedAge.Load()).Milliseconds(),
@@ -75,7 +79,7 @@ func (q *Queue) settle(batch []*groupReq[finishReq]) {
 // as sequential calls would. Each state's set is trimmed once, at the end
 // (inserts only, so the same set as a trim per finish). Outcomes are
 // published last, after every record step.
-var settleBatch = redis.NewScript(deadlineFn + envIDFn + asJSONFn + trimFn + recordFn + `local n = (#ARGV - 5) / 5
+var settleBatch = redis.NewScript(deadlineFn + envidFn + asJSONFn + trimFn + recordFn + `local n = (#ARGV - 5) / 5
 local kc, ac, kf, af = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]), tonumber(ARGV[4])
 local out, acks, seen, live = {}, {}, {}, {}
 for i = 1, n do acks[i] = ARGV[5*i + 1] end
@@ -158,6 +162,72 @@ end
 for j = 1, #pubs, 2 do redis.call('PUBLISH', ARGV[5] .. pubs[j], pubs[j + 1]) end
 return out`)
 
+// settleLone runs settleOne for r: the trickle path, where nothing batches.
+func (q *Queue) settleLone(r *groupReq[finishReq]) {
+	f := &r.v
+	done := f.state == "completed"
+	keep, age := q.keepFailed.Load(), q.keepFailedAge.Load()
+	state, other := q.getFailedKey(), q.getCompletedKey()
+	if done {
+		keep, age = q.keepCompleted.Load(), q.keepCompletedAge.Load()
+		state, other = other, state
+	}
+	keys := []string{q.getNackedItemKey(), q.getTimeoutKey(), q.getStartedKey(), q.getAttemptsKey(), q.getStatsKey(), q.getJobsKey(), state, other, q.getCancelledKey()}
+	if q.isPriority {
+		keys = append(keys, q.getPriorityKey())
+	}
+	res, err := settleOne.Run(q.ctx, q.client, keys,
+		f.ackID, f.state, f.reason, f.result, f.hint, keep, time.Duration(age).Milliseconds(), q.donePrefix()).Int64()
+	if err != nil {
+		log.Printf("Error finishing 1 item: %v", err)
+	}
+	r.ok = err == nil && res >= 0
+}
+
+// settleOne is settleBatch for one finish, with no tables to build: same
+// steps, same order, same result codes. KEYS: nacked, timeouts, started,
+// attempts, stats, jobs, the state's set, the other state's set,
+// cancelled, then :prio for a priority queue only (FIFO never writes it).
+// ARGV: ack ID, state, reason, result JSON (""), item hint (see itemHint),
+// retention of the state (most, age ms), outcome channel prefix.
+var settleOne = redis.NewScript(deadlineFn + envidFn + asJSONFn + trimFn + recordFn + `local ack, st, r = ARGV[1], ARGV[2], ARGV[4]
+if r ~= '' and not pcall(cjson.decode, r) then return -1 end
+local item = redis.call('HGET', KEYS[1], ack)
+if not item then return 0 end
+local started = tonumber(redis.call('HGET', KEYS[3], ack))
+local env, dec, dok
+if ARGV[5] ~= '' then env, dok = string.sub(ARGV[5], 2), true
+else env, dec, dok = envid(item) end
+local id, attempts = env, 1
+if env ~= '' then
+	attempts = 1 + (tonumber(redis.call('HGET', KEYS[4], env)) or 0)
+	redis.call('HDEL', KEYS[4], env)
+else
+	id = ack
+end
+local now = tonumber(nowms())
+local done = st == 'completed'
+local keep, age = tonumber(ARGV[6]), tonumber(ARGV[7])
+local err = not done and ARGV[3] or nil
+local res = (done and r ~= '') and (',"result":' .. r) or ''
+redis.call('ZREM', KEYS[8], id)
+if keep > 0 and age > 0 then
+	redis.call('HSET', KEYS[6], id, record(id, st, item, started, now, attempts, err, res, dok, dec))
+	redis.call('ZADD', KEYS[7], string.format('%.0f', now), id)
+else
+	redis.call('HDEL', KEYS[6], id)
+end
+-- in-flight state goes last, as settleBatch
+redis.call('HDEL', KEYS[1], ack)
+redis.call('ZREM', KEYS[2], ack)
+redis.call('HDEL', KEYS[3], ack)
+if #KEYS > 9 then redis.call('HDEL', KEYS[10], ack) end
+redis.call('ZREM', KEYS[9], id)
+redis.call('HINCRBY', KEYS[5], done and 'completed' or 'failed', 1)
+trim(KEYS[7], KEYS[6], keep, age, now)
+if env ~= '' then redis.call('PUBLISH', ARGV[8] .. env, outcome(env, st, err, res)) end
+return 1`)
+
 // itemHint is what settleBatch needs of item b without decoding it in Lua:
 // "j" and its envelope id ("" for none) when b is JSON that cjson decodes
 // (json.Valid and luaDecodable), else "" (Lua decodes). cjson and Go agree
@@ -169,14 +239,18 @@ func itemHint(b []byte) string {
 	if !json.Valid(b) || !luaDecodable(b) {
 		return ""
 	}
-	if t := bytes.TrimLeft(b, " \t\r\n"); len(t) == 0 || t[0] != '{' {
+	t := bytes.TrimLeft(b, " \t\r\n")
+	if len(t) == 0 || t[0] != '{' {
 		return "j"
 	}
-	var m map[string]json.RawMessage
-	if json.Unmarshal(b, &m) != nil {
-		return ""
+	raw, ok := topID(t)
+	if !ok { // a key with an escape: let the decoder unescape keys
+		var m map[string]json.RawMessage
+		if json.Unmarshal(b, &m) != nil {
+			return ""
+		}
+		raw = m["id"]
 	}
-	raw := m["id"]
 	if len(raw) < 2 || raw[0] != '"' {
 		return "j"
 	}
@@ -185,6 +259,77 @@ func itemHint(b []byte) string {
 		return ""
 	}
 	return "j" + string(id)
+}
+
+// topID is the raw value of the last top-level "id" member of object t,
+// which json.Valid passed (nil if none): what a map decode keeps, without
+// building the map. ok is false at a key with an escape (a decode
+// unescapes keys).
+func topID(t []byte) (raw []byte, ok bool) {
+	i := 1
+	for {
+		i = skipSpace(t, i)
+		if t[i] == '}' {
+			return raw, true
+		}
+		j := i + 1
+		for t[j] != '"' {
+			if t[j] == '\\' {
+				return nil, false
+			}
+			j++
+		}
+		key := t[i+1 : j]
+		i = skipSpace(t, skipSpace(t, j+1)+1) // past ':'
+		end := skipValue(t, i)
+		if string(key) == "id" {
+			raw = t[i:end]
+		}
+		if i = skipSpace(t, end); t[i] == ',' {
+			i++
+			continue
+		}
+		return raw, true // '}'
+	}
+}
+
+func skipSpace(t []byte, i int) int {
+	for t[i] == ' ' || t[i] == '\t' || t[i] == '\r' || t[i] == '\n' {
+		i++
+	}
+	return i
+}
+
+// skipValue returns the end of the valid JSON value at t[i].
+func skipValue(t []byte, i int) int {
+	depth, str := 0, false
+	for ; ; i++ {
+		c := t[i]
+		switch {
+		case str:
+			if c == '\\' {
+				i++
+			} else if c == '"' {
+				str = false
+				if depth == 0 {
+					return i + 1
+				}
+			}
+		case c == '"':
+			str = true
+		case c == '{' || c == '[':
+			depth++
+		case c == '}' || c == ']':
+			if depth == 0 {
+				return i // end of a scalar before the closing bracket
+			}
+			if depth--; depth == 0 {
+				return i + 1
+			}
+		case depth == 0 && (c == ',' || c == ' ' || c == '\t' || c == '\r' || c == '\n'):
+			return i
+		}
+	}
 }
 
 // hintMap holds the hints of items this Queue object popped, by ack ID,

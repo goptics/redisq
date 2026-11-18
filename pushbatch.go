@@ -69,7 +69,7 @@ func (q *Queue) pushBatch(batch []*groupReq[[]byte]) {
 	for _, r := range batch {
 		args = append(args, r.v)
 	}
-	err := listPushWakeN.Run(q.ctx, q.client, q.pushKeys(), args...).Err()
+	err := listPushWakeN.Run(q.ctx, q.client, q.listPushKeys, args...).Err()
 	if err != nil {
 		log.Printf("Error enqueueing %d item(s): %v", len(batch), err)
 	}

@@ -18,9 +18,12 @@ import (
 // pausedOne and pausedBatch go after a pop's re-send guard, before it pops:
 // KEYS[#KEYS - 2] is <base>:paused (see popKeys). A paused single pop
 // returns 0, a paused batch pop {0, {}, 1}; neither joins the idle set.
+// One EXISTS of :paused and :cancelled (after cancelFn) covers both gates
+// when neither key is there, the usual case: ckn is then known false.
 const (
-	pausedOne   = "if redis.call('EXISTS', KEYS[#KEYS - 2]) == 1 then return 0 end\n"
-	pausedBatch = "if redis.call('EXISTS', KEYS[#KEYS - 2]) == 1 then return {0, {}, 1} end\n"
+	pausedOne   = pauseGate + "then return 0 end\n"
+	pausedBatch = pauseGate + "then return {0, {}, 1} end\n"
+	pauseGate   = "if redis.call('EXISTS', KEYS[#KEYS - 2], KEYS[ck]) == 0 then ckn = false\nelseif redis.call('EXISTS', KEYS[#KEYS - 2]) == 1 "
 )
 
 // pauseScript sets KEYS[1], :paused, to Redis's clock in ms unless it is
