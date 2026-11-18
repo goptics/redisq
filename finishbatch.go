@@ -1,8 +1,12 @@
 package redisq
 
 import (
+	"bytes"
+	"encoding/json"
 	"log"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -19,6 +23,7 @@ const maxFinishBatch = 256
 type finishReq struct {
 	ackID, state, reason string
 	result               []byte
+	hint                 string // see itemHint; "" unknown
 }
 
 // finish ends ackID's job in state (completed, failed or cancelled). A
@@ -28,18 +33,18 @@ func (q *Queue) finish(ackID, state, reason string, result []byte) bool {
 		log.Println("queue closed, cannot acknowledge or reject")
 		return false
 	}
-	return q.finishes.do(finishReq{ackID, state, reason, result}, maxFinishBatch, q.settle)
+	return q.finishes.do(finishReq{ackID, state, reason, result, q.hints.take(ackID)}, maxFinishBatch, q.settle)
 }
 
 // settle runs settleBatch for batch.
 func (q *Queue) settle(batch []*groupReq[finishReq]) {
-	args := make([]any, 0, 5+4*len(batch))
+	args := make([]any, 0, 5+5*len(batch))
 	args = append(args,
 		q.keepCompleted.Load(), time.Duration(q.keepCompletedAge.Load()).Milliseconds(),
 		q.keepFailed.Load(), time.Duration(q.keepFailedAge.Load()).Milliseconds(),
 		q.donePrefix())
 	for _, r := range batch {
-		args = append(args, r.v.ackID, r.v.state, r.v.reason, r.v.result)
+		args = append(args, r.v.ackID, r.v.state, r.v.reason, r.v.result, r.v.hint)
 	}
 	keys := []string{q.getNackedItemKey(), q.getTimeoutKey(), q.getStartedKey(), q.getAttemptsKey(), q.getStatsKey(), q.getJobsKey(), q.getCompletedKey(), q.getFailedKey(), q.getPriorityKey(), q.getCancelledKey()}
 	res, err := settleBatch.Run(q.ctx, q.client, keys, args...).Int64Slice()
@@ -57,9 +62,10 @@ func (q *Queue) settle(batch []*groupReq[finishReq]) {
 //
 // KEYS: nacked, timeouts, started, attempts, stats, jobs, completed, failed,
 // prio, cancelled. ARGV: completed retention (most, age ms), failed
-// retention (most, age ms), outcome channel prefix, then 4 per finish: ack
+// retention (most, age ms), outcome channel prefix, then 5 per finish: ack
 // ID, state (completed, failed or cancelled), reason, result JSON ("" for
-// none). Returns one code per finish: 1 settled, 0 not processing (or an
+// none), item hint (see itemHint: "j" and the envelope id, the item then
+// is not decoded; "" decodes it). Returns one code per finish: 1 settled, 0 not processing (or an
 // earlier finish of the batch took its ack ID), -1 result not JSON (that
 // finish changes nothing).
 //
@@ -69,13 +75,13 @@ func (q *Queue) settle(batch []*groupReq[finishReq]) {
 // as sequential calls would. Each state's set is trimmed once, at the end
 // (inserts only, so the same set as a trim per finish). Outcomes are
 // published last, after every record step.
-var settleBatch = redis.NewScript(deadlineFn + envIDFn + asJSONFn + trimFn + recordFn + `local n = (#ARGV - 5) / 4
+var settleBatch = redis.NewScript(deadlineFn + envIDFn + asJSONFn + trimFn + recordFn + `local n = (#ARGV - 5) / 5
 local kc, ac, kf, af = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]), tonumber(ARGV[4])
 local out, acks, seen, live = {}, {}, {}, {}
-for i = 1, n do acks[i] = ARGV[4*i + 2] end
+for i = 1, n do acks[i] = ARGV[5*i + 1] end
 local items = redis.call('HMGET', KEYS[1], unpack(acks))
 for i = 1, n do
-	local r = ARGV[4*i + 5]
+	local r = ARGV[5*i + 4]
 	if r ~= '' and not pcall(cjson.decode, r) then out[i] = -1
 	elseif not items[i] or seen[acks[i]] then out[i] = 0
 	else out[i] = 1; seen[acks[i]] = true; live[#live + 1] = i end
@@ -90,7 +96,9 @@ redis.call('HDEL', KEYS[3], unpack(la))
 redis.call('HDEL', KEYS[9], unpack(la))
 local envs, decs, doks, eids = {}, {}, {}, {}
 for k, i in ipairs(live) do
-	envs[k], decs[k], doks[k] = envid(items[i])
+	local h = ARGV[5*i + 5]
+	if h ~= '' then envs[k], doks[k] = string.sub(h, 2), true
+	else envs[k], decs[k], doks[k] = envid(items[i]) end
 	if envs[k] ~= '' then eids[#eids + 1] = envs[k] end
 end
 local att = {}
@@ -113,7 +121,7 @@ local function flush()
 	seg, hs, zc, zf, rc, rf, hd = {}, {}, {}, {}, {}, {}, {}
 end
 for k, i in ipairs(live) do
-	local st, env = ARGV[4*i + 3], envs[k]
+	local st, env = ARGV[5*i + 2], envs[k]
 	local id, attempts = env, 1
 	if env ~= '' then attempts = 1 + att[env]; att[env] = 0 else id = acks[i] end
 	ids[#ids + 1] = id
@@ -122,8 +130,8 @@ for k, i in ipairs(live) do
 	local done = st == 'completed'
 	local keep, age = kf, af
 	if done then keep, age, nc = kc, ac, nc + 1 else nf = nf + 1 end
-	local err = not done and ARGV[4*i + 4] or nil
-	local r = ARGV[4*i + 5]
+	local err = not done and ARGV[5*i + 3] or nil
+	local r = ARGV[5*i + 4]
 	local res = (done and r ~= '') and (',"result":' .. r) or ''
 	if done then rf[#rf + 1] = id else rc[#rc + 1] = id end
 	if keep > 0 and age > 0 then
@@ -147,3 +155,70 @@ if nf > 0 then
 end
 for j = 1, #pubs, 2 do redis.call('PUBLISH', ARGV[5] .. pubs[j], pubs[j + 1]) end
 return out`)
+
+// itemHint is what settleBatch needs of item b without decoding it in Lua:
+// "j" and its envelope id ("" for none) when b is JSON that cjson decodes
+// (json.Valid and luaDecodable), else "" (Lua decodes). cjson and Go agree
+// on such items: a duplicate key's last value wins in both, keys match
+// exactly (a map, no case folding). An id with an escape or invalid UTF-8
+// gets "" (Lua decodes), so the id bytes are cjson's. A number item that
+// Go takes is one asjson keeps as is.
+func itemHint(b []byte) string {
+	if !json.Valid(b) || !luaDecodable(b) {
+		return ""
+	}
+	if t := bytes.TrimLeft(b, " \t\r\n"); len(t) == 0 || t[0] != '{' {
+		return "j"
+	}
+	var m map[string]json.RawMessage
+	if json.Unmarshal(b, &m) != nil {
+		return ""
+	}
+	raw := m["id"]
+	if len(raw) < 2 || raw[0] != '"' {
+		return "j"
+	}
+	id := raw[1 : len(raw)-1]
+	if bytes.IndexByte(id, '\\') >= 0 || !utf8.Valid(id) {
+		return ""
+	}
+	return "j" + string(id)
+}
+
+// hintMap holds the hints of items this Queue object popped, by ack ID,
+// until their finish takes them. Close drops them; past maxHints it starts
+// over (a lost hint only costs a decode).
+type hintMap struct {
+	mu sync.Mutex
+	m  map[string]string
+}
+
+const maxHints = 1 << 20
+
+func (h *hintMap) put(ackID, hint string) {
+	if hint == "" {
+		return
+	}
+	h.mu.Lock()
+	if h.m == nil || len(h.m) >= maxHints {
+		h.m = map[string]string{}
+	}
+	h.m[ackID] = hint
+	h.mu.Unlock()
+}
+
+func (h *hintMap) take(ackID string) string {
+	h.mu.Lock()
+	v, ok := h.m[ackID]
+	if ok {
+		delete(h.m, ackID)
+	}
+	h.mu.Unlock()
+	return v
+}
+
+func (h *hintMap) clear() {
+	h.mu.Lock()
+	h.m = nil
+	h.mu.Unlock()
+}

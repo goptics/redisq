@@ -57,6 +57,7 @@ type Queue struct {
 	closeOnce             sync.Once
 	outcomes              outcomeWatchers  // WatchOutcome watchers (see outcome.go)
 	finishes              group[finishReq] // finishes waiting for a settleBatch call (see finishbatch.go)
+	hints                 hintMap          // popped items' hints by ack ID (see itemHint)
 	pushes                group[[]byte]    // Enqueue items waiting for a listPushWakeN call
 	oncePushes            group[oncePush]  // EnqueueOnce items waiting for a listPushOnceN call
 	scope                 string           // see ScopeID; "" for a queue made by newQueueBase alone
@@ -1031,6 +1032,7 @@ func (q *Queue) dequeueOne(pop *redis.Script, extraKeys ...string) (item any, ok
 	}
 
 	q.beating.Store(q.hbt() > 0)
+	q.hints.put(ackID, itemHint([]byte(v)))
 	return []byte(v), true, ackID
 }
 
@@ -1189,6 +1191,7 @@ func (q *Queue) dequeueBatch(pop, popOne *redis.Script, items []any, ackIDs []st
 	for i, v := range popped {
 		items[i] = []byte(v.(string))
 		ackIDs[i] = q.ackIDOf(resv, i+1)
+		q.hints.put(ackIDs[i], itemHint(items[i].([]byte)))
 	}
 
 	if remaining > 0 {
@@ -1582,6 +1585,7 @@ func (q *Queue) Close() error {
 		q.cancel() // stops the sweep
 		err = q.release()
 		q.outcomes.close()
+		q.hints.clear()
 		q.Notification.Stop()
 	})
 	return err

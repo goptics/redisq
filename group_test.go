@@ -58,7 +58,7 @@ func TestSettleBatchMatchesSequential(t *testing.T) {
 				{4, "failed", "late", ""},
 			}
 			items := []string{envelope("X", "1"), envelope("X", "2"), envelope("", "3"), "plain-bytes", envelope("Y", "4"), envelope("Z", "5")}
-			run := func(key string, batch bool) (map[string]any, []int64) {
+			run := func(key string, batch, hinted bool) (map[string]any, []int64) {
 				q, push, pop := open(key)
 				defer q.Close()
 				for _, v := range items {
@@ -76,7 +76,11 @@ func TestSettleBatchMatchesSequential(t *testing.T) {
 				if batch {
 					args := []any{q.keepCompleted.Load(), int64(86400000), q.keepFailed.Load(), int64(7 * 86400000), q.donePrefix()}
 					for _, f := range fins {
-						args = append(args, acks[f.i], f.state, f.reason, []byte(f.result))
+						h := ""
+						if hinted {
+							h = itemHint([]byte(items[f.i]))
+						}
+						args = append(args, acks[f.i], f.state, f.reason, []byte(f.result), h)
 					}
 					keys := []string{q.getNackedItemKey(), q.getTimeoutKey(), q.getStartedKey(), q.getAttemptsKey(), q.getStatsKey(), q.getJobsKey(), q.getCompletedKey(), q.getFailedKey(), q.getPriorityKey(), q.getCancelledKey()}
 					var err error
@@ -92,11 +96,13 @@ func TestSettleBatchMatchesSequential(t *testing.T) {
 				}
 				return dumpQueue(t, client, q), codes
 			}
-			a, ca := run("test_settle_batch_a", true)
-			b, cb := run("test_settle_batch_b", false)
-			assert.Equal(t, cb, ca)
-			assert.Equal(t, b, a)
-			assert.Equal(t, []int64{1, 0, 1, 1, 1, -1, 1, 1}, ca)
+			b, cb := run("test_settle_batch_b", false, false)
+			for _, hinted := range []bool{false, true} {
+				a, ca := run("test_settle_batch_a", true, hinted)
+				assert.Equal(t, cb, ca)
+				assert.Equal(t, b, a)
+				assert.Equal(t, []int64{1, 0, 1, 1, 1, -1, 1, 1}, ca)
+			}
 			delKeys(t, client, "test_settle_batch_a")
 			delKeys(t, client, "test_settle_batch_b")
 		})
@@ -211,4 +217,37 @@ func TestGroupCommitClose(t *testing.T) {
 	wg.Wait() // returns: no waiter stranded
 	assert.False(t, q.Acknowledge(acks[0]))
 	assert.False(t, q.Enqueue("x"))
+}
+
+// itemHint agrees with cjson (envid, asjson) on every item it hints.
+func TestItemHintMatchesCjson(t *testing.T) {
+	qs := New(getTestRedisURL())
+	defer qs.Close()
+	client := qs.(*queues).client
+	probe := redis.NewScript(envIDFn + asJSONFn + `local id, e, ok = envid(ARGV[1])
+return {ok and 1 or 0, id, asjson(ARGV[1], ok, e) == ARGV[1] and 1 or 0}`)
+	deep := strings.Repeat("[", 1001) + strings.Repeat("]", 1001)
+	items := []string{
+		envelope("a", "1"), envelope("", `{"id":"inner"}`),
+		`{"id":"a","id":"b"}`, `{"id":"a","id":5}`, `{"id":5,"id":"b"}`, `{"id":"x"}`, `{"ID":"x"}`, `{"Id":"x","id":"y"}`,
+		`{"id":"a\"b"}`, `{"id":"aé"}`, `{"id":"é"}`, "{\"id\":\"\xff\"}", "{\"id\xff\":\"x\"}", `{"id":null}`, `{"id":["a"]}`,
+		`{}`, `[]`, `["id"]`, `1e5`, ` 12 `, `-0.5e+10`, `null`, `true`, `"str"`, `NaN`, `0x10`, `inf`, `plain bytes`, ``,
+		"\xef\xbb\xbf{\"id\":\"bom\"}", `{"id":"x","n":12345678901234567890}`, `{"id":"s","d":"\ud800"}`, `{"id":"p","d":"😀"}`, deep,
+		`{"id":"t",}`, `{"id":"ctl","d":"a` + "\x01" + `"}`, "{\"id\":\"ws\"}\n",
+	}
+	for _, it := range items {
+		h := itemHint([]byte(it))
+		if h == "" {
+			continue
+		}
+		r, err := probe.Run(context.Background(), client, nil, it).Slice()
+		require.NoError(t, err, it)
+		assert.EqualValues(t, 1, r[0], "cjson decodes %q", it)
+		assert.Equal(t, h[1:], r[1], "envelope id of %q", it)
+		assert.EqualValues(t, 1, r[2], "asjson keeps %q", it)
+	}
+	assert.Equal(t, "ja", itemHint([]byte(envelope("a", "1"))))
+	assert.Equal(t, "j", itemHint([]byte(envelope("", `{"id":"inner"}`))))
+	assert.Equal(t, "jb", itemHint([]byte(`{"id":"a","id":"b"}`)))
+	assert.Equal(t, "", itemHint([]byte(`{"id":"a\"b"}`)), "escaped id: Lua decodes")
 }
