@@ -186,14 +186,15 @@ func itemHint(b []byte) string {
 }
 
 // hintMap holds the hints of items this Queue object popped, by ack ID,
-// until their finish takes them. Close drops them; past maxHints it starts
-// over (a lost hint only costs a decode).
+// until their finish takes them (FinishTask drops them). Close drops them;
+// past maxHints (items never finished) it starts over: a lost hint only
+// costs a decode.
 type hintMap struct {
 	mu sync.Mutex
 	m  map[string]string
 }
 
-const maxHints = 1 << 20
+const maxHints = 1 << 15
 
 func (h *hintMap) put(ackID, hint string) {
 	if hint == "" {

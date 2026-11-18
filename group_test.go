@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
@@ -18,8 +19,9 @@ import (
 // finish in the same order: dup ack IDs, a Job ID twice, a bad result,
 // plain and non-JSON items, attempts, cancel marks, an old record.
 func TestSettleBatchMatchesSequential(t *testing.T) {
-	for _, prio := range []bool{false, true} {
-		t.Run(fmt.Sprint("priority=", prio), func(t *testing.T) {
+	for _, c := range []struct{ prio, none bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
+		prio := c.prio
+		t.Run(fmt.Sprintf("priority=%v,no_records=%v", c.prio, c.none), func(t *testing.T) {
 			ctx := context.Background()
 			qs := New(getTestRedisURL())
 			defer qs.Close()
@@ -61,6 +63,10 @@ func TestSettleBatchMatchesSequential(t *testing.T) {
 			run := func(key string, batch, hinted bool) (map[string]any, []int64) {
 				q, push, pop := open(key)
 				defer q.Close()
+				if c.none {
+					q.SetCompletedRetention(0, 0)
+					q.SetFailedRetention(0, time.Hour)
+				}
 				for _, v := range items {
 					push(v)
 				}
@@ -74,7 +80,8 @@ func TestSettleBatchMatchesSequential(t *testing.T) {
 				require.NoError(t, client.ZAdd(ctx, q.getCancelledKey(), redis.Z{Score: 9e12, Member: "Z"}).Err())
 				var codes []int64
 				if batch {
-					args := []any{q.keepCompleted.Load(), int64(86400000), q.keepFailed.Load(), int64(7 * 86400000), q.donePrefix()}
+					args := []any{q.keepCompleted.Load(), time.Duration(q.keepCompletedAge.Load()).Milliseconds(),
+						q.keepFailed.Load(), time.Duration(q.keepFailedAge.Load()).Milliseconds(), q.donePrefix()}
 					for _, f := range fins {
 						h := ""
 						if hinted {
