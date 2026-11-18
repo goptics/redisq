@@ -258,3 +258,37 @@ return {ok and 1 or 0, id, asjson(ARGV[1], ok, e) == ARGV[1] and 1 or 0}`)
 	assert.Equal(t, "jb", itemHint([]byte(`{"id":"a","id":"b"}`)))
 	assert.Equal(t, "", itemHint([]byte(`{"id":"a\"b"}`)), "escaped id: Lua decodes")
 }
+
+// A group run takes at most max values and maxGroupBytes of them (one value
+// alone may pass it); every value is run once.
+func TestGroupLimits(t *testing.T) {
+	var g group[int]
+	var mu sync.Mutex
+	seen := map[int]int{}
+	release := make(chan struct{})
+	run := func(b []*groupReq[int]) {
+		<-release
+		mu.Lock()
+		defer mu.Unlock()
+		bytes := 0
+		for _, r := range b {
+			seen[r.v]++
+			bytes += r.size
+			r.ok = true
+		}
+		assert.LessOrEqual(t, len(b), 3)
+		if len(b) > 1 {
+			assert.LessOrEqual(t, bytes, maxGroupBytes)
+		}
+	}
+	var wg sync.WaitGroup
+	for i := range 40 {
+		wg.Go(func() { assert.True(t, g.do(i, (i%4)*maxGroupBytes/3, 3, run)) })
+	}
+	close(release)
+	wg.Wait()
+	assert.Len(t, seen, 40)
+	for v, n := range seen {
+		assert.Equal(t, 1, n, v)
+	}
+}

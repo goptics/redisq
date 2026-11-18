@@ -3,7 +3,8 @@ package redisq
 import "sync"
 
 // group is a group commit: callers queue a value and wait; the caller that
-// finds the group idle (the leader) runs run for up to max queued values,
+// finds the group idle (the leader) runs run for up to max queued values
+// (and maxGroupBytes of them, at least one),
 // then hands the rest to a new goroutine, so a leader waits for one call
 // only. No timer: a lone value runs at once, and values that come in while
 // a call is in flight go together in the next. One call in flight per group.
@@ -13,16 +14,20 @@ type group[T any] struct {
 	busy    bool
 }
 
-// groupReq is one queued value; run sets ok.
+// groupReq is one queued value of size bytes; run sets ok.
 type groupReq[T any] struct {
 	v    T
+	size int
 	ok   bool
 	done chan struct{}
 }
 
-// do queues v and returns its ok once a run took it.
-func (g *group[T]) do(v T, max int, run func([]*groupReq[T])) bool {
-	r := &groupReq[T]{v: v, done: make(chan struct{})}
+// maxGroupBytes caps the bytes of one run's values.
+const maxGroupBytes = 4 << 20
+
+// do queues v, of size bytes, and returns its ok once a run took it.
+func (g *group[T]) do(v T, size, max int, run func([]*groupReq[T])) bool {
+	r := &groupReq[T]{v: v, size: size, done: make(chan struct{})}
 	g.mu.Lock()
 	g.pending = append(g.pending, r)
 	lead := !g.busy
@@ -37,7 +42,11 @@ func (g *group[T]) do(v T, max int, run func([]*groupReq[T])) bool {
 
 func (g *group[T]) flush(max int, run func([]*groupReq[T])) {
 	g.mu.Lock()
-	n := min(len(g.pending), max)
+	n, bytes := 0, 0
+	for n < min(len(g.pending), max) && (n == 0 || bytes+g.pending[n].size <= maxGroupBytes) {
+		bytes += g.pending[n].size
+		n++
+	}
 	batch := make([]*groupReq[T], n)
 	copy(batch, g.pending)
 	rest := copy(g.pending, g.pending[n:])

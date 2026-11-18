@@ -332,7 +332,7 @@ func (q *Queue) Enqueue(item any) bool {
 	if !ok {
 		return false
 	}
-	return q.pushes.do(data, maxPushBatch, q.pushBatch)
+	return q.pushes.do(data, len(data), maxPushBatch, q.pushBatch)
 }
 
 // pushKeys are the keys listPushWakeN takes.
@@ -397,7 +397,7 @@ func (q *Queue) EnqueueOnce(item any, id string) bool {
 	if !ok {
 		return false
 	}
-	return q.oncePushes.do(oncePush{id, data}, maxPushBatch, q.pushOnceBatch)
+	return q.oncePushes.do(oncePush{id, data}, len(data), maxPushBatch, q.pushOnceBatch)
 }
 
 // enqueueOnceWith is enqueueWith for a script built with once: it adds the

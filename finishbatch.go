@@ -33,7 +33,7 @@ func (q *Queue) finish(ackID, state, reason string, result []byte) bool {
 		log.Println("queue closed, cannot acknowledge or reject")
 		return false
 	}
-	return q.finishes.do(finishReq{ackID, state, reason, result, q.hints.take(ackID)}, maxFinishBatch, q.settle)
+	return q.finishes.do(finishReq{ackID, state, reason, result, q.hints.take(ackID)}, len(reason)+len(result), maxFinishBatch, q.settle)
 }
 
 // settle runs settleBatch for batch.
