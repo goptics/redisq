@@ -33,14 +33,29 @@ type outcomeWatch struct {
 	done atomic.Bool // called or cancelled
 }
 
-// outcomeWatchers are a Queue's watchers by job id. mu is held across
-// Subscribe and Unsubscribe, which only write to the connection, so an
-// id's subscription always matches whether it has watchers. Close cancels
-// q.ctx before it drops them, so a watch that finds q.ctx live under mu is
-// dropped by Close.
+// outcomeWatchers are a Queue's watchers by job id. Close cancels q.ctx
+// before it drops them, so a watch that finds q.ctx live under mu is
+// dropped by Close. subs brings the outcome channel subscriptions in line
+// with byID (see flushSubs).
 type outcomeWatchers struct {
 	mu   sync.Mutex
 	byID map[string]map[*outcomeWatch]struct{}
+	subs subFlush
+}
+
+// subFlush coalesces outcome channel (un)subscribes and catch-up reads of
+// overlapping watches: a group commit, as group. dirty: ids whose watch set
+// gained its first or lost its last watcher; catch: watched ids to read
+// once their subscribe is written; waiters: WatchOutcome calls that return
+// once a flush wrote their subscribe. subscribed is the flusher's own (one
+// flush at a time).
+type subFlush struct {
+	mu         sync.Mutex
+	dirty      map[string]struct{}
+	catch      []string
+	waiters    []chan struct{}
+	busy       bool
+	subscribed map[string]struct{}
 }
 
 // donePrefix is the outcome channel prefix, <base>:done:.
@@ -68,17 +83,15 @@ func (q *Queue) WatchOutcome(id string, fn func(contract.JobOutcome)) (cancel fu
 		o.byID = map[string]map[*outcomeWatch]struct{}{}
 	}
 	set := o.byID[id]
-	if set == nil {
+	first := set == nil
+	if first {
 		set = map[*outcomeWatch]struct{}{}
 		o.byID[id] = set
-		if err := q.presence.Subscribe(q.ctx, q.donePrefix()+id); err != nil && q.ctx.Err() == nil {
-			log.Printf("Error subscribing to job %s outcome: %v", id, err) // the sweep catches up
-		}
 	}
 	set[w] = struct{}{}
 	o.mu.Unlock()
 
-	go q.catchUp([]string{id})
+	q.syncSub(id, first, true)
 
 	return func() {
 		if w.done.CompareAndSwap(false, true) {
@@ -91,22 +104,109 @@ func (q *Queue) WatchOutcome(id string, fn func(contract.JobOutcome)) (cancel fu
 func (q *Queue) unwatch(id string, w *outcomeWatch) {
 	o := &q.outcomes
 	o.mu.Lock()
-	defer o.mu.Unlock()
 	set := o.byID[id]
 	if set == nil {
+		o.mu.Unlock()
 		return
 	}
 	delete(set, w)
-	if len(set) == 0 {
+	last := len(set) == 0
+	if last {
 		delete(o.byID, id)
-		q.unsubscribeOutcome(id)
+	}
+	o.mu.Unlock()
+	if last {
+		q.syncSub(id, false, false)
 	}
 }
 
-// unsubscribeOutcome drops id's channel; o.mu is held.
-func (q *Queue) unsubscribeOutcome(id string) {
-	if err := q.presence.Unsubscribe(q.ctx, q.donePrefix()+id); err != nil && q.ctx.Err() == nil {
-		log.Printf("Error unsubscribing from job %s outcome: %v", id, err)
+// syncSub queues id for a flush (see flushSubs): first, its watch set just
+// changed between empty and not (dirty); watch, a WatchOutcome call, which
+// also reads id's record after its subscribe and waits for the flush. Else
+// the flush runs on its own goroutine.
+func (q *Queue) syncSub(id string, dirty, watch bool) {
+	s := &q.outcomes.subs
+	var done chan struct{}
+	s.mu.Lock()
+	if s.dirty == nil {
+		s.dirty = map[string]struct{}{}
+	}
+	if dirty || !watch {
+		s.dirty[id] = struct{}{}
+	}
+	if watch {
+		s.catch = append(s.catch, id)
+		done = make(chan struct{})
+		s.waiters = append(s.waiters, done)
+	}
+	lead := !s.busy
+	s.busy = true
+	s.mu.Unlock()
+	switch {
+	case lead && watch:
+		q.flushSubs()
+	case lead:
+		go q.flushSubs()
+	}
+	if done != nil {
+		<-done
+	}
+}
+
+// flushSubs subscribes the dirty ids that have watchers and unsubscribes
+// those that lost them, one SUBSCRIBE and one UNSUBSCRIBE (writes only, no
+// reply awaited), ends the waits, then reads the records of the watched ids
+// queued for it (one HMGET, own goroutine), for jobs that ended before the
+// subscribe. Flushes run one at a time, in order, so a channel's last
+// write matches whether it has watchers. More queued: a new goroutine.
+func (q *Queue) flushSubs() {
+	o, s := &q.outcomes, &q.outcomes.subs
+	s.mu.Lock()
+	dirty, catch, waiters := s.dirty, s.catch, s.waiters
+	s.dirty, s.catch, s.waiters = nil, nil, nil
+	s.mu.Unlock()
+
+	var sub, unsub []string
+	o.mu.Lock()
+	if s.subscribed == nil {
+		s.subscribed = map[string]struct{}{}
+	}
+	for id := range dirty {
+		_, watched := o.byID[id]
+		_, on := s.subscribed[id]
+		switch {
+		case watched && !on:
+			s.subscribed[id] = struct{}{}
+			sub = append(sub, q.donePrefix()+id)
+		case !watched && on:
+			delete(s.subscribed, id)
+			unsub = append(unsub, q.donePrefix()+id)
+		}
+	}
+	o.mu.Unlock()
+	if len(sub) > 0 {
+		if err := q.presence.Subscribe(q.ctx, sub...); err != nil && q.ctx.Err() == nil {
+			log.Printf("Error subscribing to %d job outcome(s): %v", len(sub), err) // the sweep catches up
+		}
+	}
+	if len(unsub) > 0 {
+		if err := q.presence.Unsubscribe(q.ctx, unsub...); err != nil && q.ctx.Err() == nil {
+			log.Printf("Error unsubscribing from %d job outcome(s): %v", len(unsub), err)
+		}
+	}
+	for _, w := range waiters {
+		close(w)
+	}
+	if len(catch) > 0 {
+		go q.catchUp(catch)
+	}
+
+	s.mu.Lock()
+	more := len(s.dirty) > 0 || len(s.catch) > 0 || len(s.waiters) > 0
+	s.busy = more
+	s.mu.Unlock()
+	if more {
+		go q.flushSubs()
 	}
 }
 
@@ -120,9 +220,11 @@ func (q *Queue) deliver(id string, out contract.JobOutcome) {
 	set := o.byID[id]
 	if set != nil {
 		delete(o.byID, id)
-		q.unsubscribeOutcome(id)
 	}
 	o.mu.Unlock()
+	if set != nil {
+		q.syncSub(id, false, false)
+	}
 
 	for w := range set {
 		go func() {
