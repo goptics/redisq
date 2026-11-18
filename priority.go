@@ -28,7 +28,7 @@ end
 // sequence number (KEYS[2], :seq), sets the queue to expire in ARGV[2] ms
 // when that is above 0, wakes idle consumers of KEYS[3], up to one per
 // waiting item, on channel prefix ARGV[4], and counts the job as submitted
-// in KEYS[4], :stats (see listPushWakeBody).
+// in KEYS[4], :stats (see listPushWakeN).
 const zsetPushWakeBody = `local s = redis.call('INCR', KEYS[2])
 redis.call('ZADD', KEYS[1], ARGV[3], '\255' .. string.format('%016x', s) .. ARGV[1])
 if tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end

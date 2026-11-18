@@ -20,19 +20,21 @@ var (
 	_ interface{ EnqueueOnce(any, int, string) bool } = (*PriorityQueue)(nil)
 )
 
-// dedupCase is a queue kind and the script its EnqueueOnce runs.
+// dedupCase is a queue kind and the script its EnqueueOnce runs; win picks
+// the dedupe window out of an EVALSHA's args.
 type dedupCase struct {
 	name   string
 	script *redis.Script
+	win    func(args []any) any
 	open   func(qs Queues, key string) (q *Queue, push func(item, id string) bool, size func() int, done func())
 }
 
 var dedupCases = []dedupCase{
-	{"list", listPushWakeOnce, func(qs Queues, key string) (*Queue, func(string, string) bool, func() int, func()) {
+	{"list", listPushOnceN, func(a []any) any { return a[3+a[2].(int)+2] }, func(qs Queues, key string) (*Queue, func(string, string) bool, func() int, func()) {
 		q := qs.NewQueue(key)
 		return q, func(v, id string) bool { return q.EnqueueOnce(v, id) }, q.Len, func() { q.Close() }
 	}},
-	{"priority", zsetPushWakeOnce, func(qs Queues, key string) (*Queue, func(string, string) bool, func() int, func()) {
+	{"priority", zsetPushWakeOnce, func(a []any) any { return a[len(a)-1] }, func(qs Queues, key string) (*Queue, func(string, string) bool, func() int, func()) {
 		q := qs.NewPriorityQueue(key)
 		return q.Queue, func(v, id string) bool { return q.EnqueueOnce(v, 1, id) }, q.Len, func() { q.Close() }
 	}},
@@ -171,6 +173,7 @@ func TestEnqueueOnceWindow(t *testing.T) {
 // lastArg records the last argument of each EVALSHA of script hash.
 type lastArg struct {
 	hash string
+	pick func([]any) any
 	mx   sync.Mutex
 	args []any
 }
@@ -183,7 +186,7 @@ func (h *lastArg) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return func(ctx context.Context, cmd redis.Cmder) error {
 		if a := cmd.Args(); len(a) > 1 && a[0] == "evalsha" && a[1] == h.hash {
 			h.mx.Lock()
-			h.args = append(h.args, a[len(a)-1])
+			h.args = append(h.args, h.pick(a))
 			h.mx.Unlock()
 		}
 		return next(ctx, cmd)
@@ -200,7 +203,7 @@ func TestEnqueueOnceWindowArg(t *testing.T) {
 			delKeys(t, client, c.key())
 			defer delKeys(t, client, c.key())
 			require.NoError(t, c.script.Load(context.Background(), client).Err()) // so every push is an EVALSHA
-			h := &lastArg{hash: c.script.Hash()}
+			h := &lastArg{hash: c.script.Hash(), pick: c.win}
 			client.AddHook(h)
 			q, push, _, done := c.open(qs, c.key())
 			defer done()

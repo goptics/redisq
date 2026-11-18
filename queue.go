@@ -55,9 +55,11 @@ type Queue struct {
 	cancelHooks           hookSet[string]             // OnCancel callbacks (see cancel.go)
 	rawKeys               []string                    // what Dequeue's scripts take
 	closeOnce             sync.Once
-	outcomes              outcomeWatchers // WatchOutcome watchers (see outcome.go)
-	finishes              finishQueue     // finishes waiting for a settleBatch call (see finishbatch.go)
-	scope                 string          // see ScopeID; "" for a queue made by newQueueBase alone
+	outcomes              outcomeWatchers  // WatchOutcome watchers (see outcome.go)
+	finishes              group[finishReq] // finishes waiting for a settleBatch call (see finishbatch.go)
+	pushes                group[[]byte]    // Enqueue items waiting for a listPushWakeN call
+	oncePushes            group[oncePush]  // EnqueueOnce items waiting for a listPushOnceN call
+	scope                 string           // see ScopeID; "" for a queue made by newQueueBase alone
 }
 
 func newQueue(c *redis.Client, queueKey string, scope string) *Queue {
@@ -325,11 +327,14 @@ func hex4(b []byte, i int) int {
 // surrogate escape such as \ud800 (see luaDecodable). One rule for every
 // item, with an envelope id or not.
 func (q *Queue) Enqueue(item any) bool {
-	return q.enqueueWith(listPushWake, q.pushKeys(), item, q.wakePrefix)
+	data, ok := q.pushData(item)
+	if !ok {
+		return false
+	}
+	return q.pushes.do(data, maxPushBatch, q.pushBatch)
 }
 
-// pushKeys are the keys listPushWake and listPushWakeOnce take before the
-// id's key.
+// pushKeys are the keys listPushWakeN takes.
 func (q *Queue) pushKeys() []string {
 	return []string{q.queueKey, q.getIdleKey(), q.getStatsKey()}
 }
@@ -375,22 +380,6 @@ redis.call('ZREM', KEYS[#KEYS - 4], ARGV[#ARGV - 1])
 return r`
 }
 
-// listPushWakeBody is Enqueue's push, with ARGV[1] the item, ARGV[2] the
-// queue expiration in ms (0: none) and ARGV[3] the wake channel prefix. It
-// wakes idle consumers of KEYS[2], up to one per waiting item, so a backlog
-// wakes them all, and counts the job as submitted in KEYS[3], :stats; a
-// dedupe repeat (see once) never gets here, so it isn't counted and wakes
-// no one.
-const listPushWakeBody = `local n = redis.call('RPUSH', KEYS[1], ARGV[1])
-if tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
-redis.call('HINCRBY', KEYS[3], 'submitted', 1)
-return wake(KEYS[2], ARGV[3], n)`
-
-var (
-	listPushWake     = redis.NewScript(wakeFn + listPushWakeBody)
-	listPushWakeOnce = redis.NewScript(wakeFn + once(listPushWakeBody))
-)
-
 // EnqueueOnce is Enqueue for a job with an id: it stores item unless an item
 // with the same id was pushed to this queue within the dedupe window (see
 // SetDedupWindow), and returns true in both cases. A retried call, or
@@ -403,7 +392,11 @@ func (q *Queue) EnqueueOnce(item any, id string) bool {
 	if id == "" {
 		return q.Enqueue(item)
 	}
-	return q.enqueueOnceWith(listPushWakeOnce, q.pushKeys(), item, id, q.wakePrefix)
+	data, ok := q.pushData(item)
+	if !ok {
+		return false
+	}
+	return q.oncePushes.do(oncePush{id, data}, maxPushBatch, q.pushOnceBatch)
 }
 
 // enqueueOnceWith is enqueueWith for a script built with once: it adds the
@@ -421,18 +414,8 @@ func (q *Queue) enqueueOnceWith(script *redis.Script, keys []string, item any, i
 // enqueueWith runs script to push item, with ARGV[1] the item bytes, ARGV[2]
 // the queue expiration in milliseconds (0: none) and then extra.
 func (q *Queue) enqueueWith(script *redis.Script, keys []string, item any, extra ...any) bool {
-	if q.ctx.Err() != nil {
-		log.Println("queue closed, cannot enqueue")
-		return false
-	}
-
-	data, err := q.toBytes(item)
-	if err != nil {
-		log.Printf("Error converting item to bytes: %v", err)
-		return false
-	}
-	if !luaDecodable(data) {
-		log.Println("Error enqueueing item: JSON Redis Lua can't decode (nested over 1000, or a lone surrogate escape)")
+	data, ok := q.pushData(item)
+	if !ok {
 		return false
 	}
 
@@ -443,6 +426,26 @@ func (q *Queue) enqueueWith(script *redis.Script, keys []string, item any, extra
 	}
 
 	return true
+}
+
+// pushData is item's bytes for a push; false (logged) when the queue is
+// closed or the item can't go in (see Enqueue).
+func (q *Queue) pushData(item any) ([]byte, bool) {
+	if q.ctx.Err() != nil {
+		log.Println("queue closed, cannot enqueue")
+		return nil, false
+	}
+
+	data, err := q.toBytes(item)
+	if err != nil {
+		log.Printf("Error converting item to bytes: %v", err)
+		return nil, false
+	}
+	if !luaDecodable(data) {
+		log.Println("Error enqueueing item: JSON Redis Lua can't decode (nested over 1000, or a lone surrogate escape)")
+		return nil, false
+	}
+	return data, true
 }
 
 // Len returns the number of items in the queue; a consumer that finds it

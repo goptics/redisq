@@ -2,18 +2,15 @@ package redisq
 
 import (
 	"log"
-	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-// Group commit of finishes. Acknowledge, AcknowledgeResult, Reject and
-// AcknowledgeCancelled of one Queue object queue up; one caller (the leader)
-// runs settleBatch for all queued, the rest wait for its reply. No timer:
-// a lone finish runs at once, and finishes that come in while one call is
-// in flight go together in the next. One call in flight per Queue object.
-// Each caller still returns only after Redis ran its finish.
+// Finishes go through a group commit (see group): Acknowledge,
+// AcknowledgeResult, Reject and AcknowledgeCancelled of one Queue object that
+// overlap run as one settleBatch call. Each caller still returns only after
+// Redis ran its finish.
 
 // maxFinishBatch caps the finishes of one settleBatch call (ARGV size,
 // unpack limit, script length).
@@ -22,16 +19,6 @@ const maxFinishBatch = 256
 type finishReq struct {
 	ackID, state, reason string
 	result               []byte
-	ok                   bool
-	done                 chan struct{}
-}
-
-// finishQueue holds the finishes waiting for a settleBatch call. busy: a
-// leader is flushing; it hands off to a new goroutine while any are left.
-type finishQueue struct {
-	mu      sync.Mutex
-	pending []*finishReq
-	busy    bool
 }
 
 // finish ends ackID's job in state (completed, failed or cancelled). A
@@ -41,55 +28,18 @@ func (q *Queue) finish(ackID, state, reason string, result []byte) bool {
 		log.Println("queue closed, cannot acknowledge or reject")
 		return false
 	}
-
-	r := &finishReq{ackID: ackID, state: state, reason: reason, result: result, done: make(chan struct{})}
-	f := &q.finishes
-	f.mu.Lock()
-	f.pending = append(f.pending, r)
-	lead := !f.busy
-	f.busy = true
-	f.mu.Unlock()
-	if lead {
-		q.flushFinishes()
-	}
-	<-r.done
-	return r.ok
+	return q.finishes.do(finishReq{ackID, state, reason, result}, maxFinishBatch, q.settle)
 }
 
-// flushFinishes runs one settleBatch for up to maxFinishBatch queued
-// finishes, then hands the rest to a new goroutine, so a leader's caller
-// waits for one call only.
-func (q *Queue) flushFinishes() {
-	f := &q.finishes
-	f.mu.Lock()
-	n := min(len(f.pending), maxFinishBatch)
-	batch := make([]*finishReq, n)
-	copy(batch, f.pending)
-	rest := copy(f.pending, f.pending[n:])
-	clear(f.pending[rest:])
-	f.pending = f.pending[:rest]
-	f.mu.Unlock()
-
-	q.settle(batch)
-
-	f.mu.Lock()
-	more := len(f.pending) > 0
-	f.busy = more
-	f.mu.Unlock()
-	if more {
-		go q.flushFinishes()
-	}
-}
-
-// settle runs settleBatch for batch and ends each caller's wait.
-func (q *Queue) settle(batch []*finishReq) {
+// settle runs settleBatch for batch.
+func (q *Queue) settle(batch []*groupReq[finishReq]) {
 	args := make([]any, 0, 5+4*len(batch))
 	args = append(args,
 		q.keepCompleted.Load(), time.Duration(q.keepCompletedAge.Load()).Milliseconds(),
 		q.keepFailed.Load(), time.Duration(q.keepFailedAge.Load()).Milliseconds(),
 		q.donePrefix())
 	for _, r := range batch {
-		args = append(args, r.ackID, r.state, r.reason, r.result)
+		args = append(args, r.v.ackID, r.v.state, r.v.reason, r.v.result)
 	}
 	keys := []string{q.getNackedItemKey(), q.getTimeoutKey(), q.getStartedKey(), q.getAttemptsKey(), q.getStatsKey(), q.getJobsKey(), q.getCompletedKey(), q.getFailedKey(), q.getPriorityKey(), q.getCancelledKey()}
 	res, err := settleBatch.Run(q.ctx, q.client, keys, args...).Int64Slice()
@@ -98,7 +48,6 @@ func (q *Queue) settle(batch []*finishReq) {
 	}
 	for i, r := range batch {
 		r.ok = err == nil && i < len(res) && res[i] >= 0 // -1: result is not JSON
-		close(r.done)
 	}
 }
 
