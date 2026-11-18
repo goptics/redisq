@@ -56,6 +56,7 @@ type Queue struct {
 	rawKeys               []string                    // what Dequeue's scripts take
 	closeOnce             sync.Once
 	outcomes              outcomeWatchers // WatchOutcome watchers (see outcome.go)
+	finishes              finishQueue     // finishes waiting for a settleBatch call (see finishbatch.go)
 	scope                 string          // see ScopeID; "" for a queue made by newQueueBase alone
 }
 
@@ -508,23 +509,6 @@ func (q *Queue) Reject(ackID string, reason string) bool {
 	return q.finish(ackID, "failed", reason, nil)
 }
 
-// finish ends ackID's job in state (completed, failed or cancelled). A
-// cancelled job is indexed, kept and counted as failed (spec 6.14: as Reject).
-func (q *Queue) finish(ackID, state, reason string, result []byte) bool {
-	if q.ctx.Err() != nil {
-		log.Println("queue closed, cannot acknowledge or reject")
-		return false
-	}
-
-	keys, args := q.finishArgs(ackID, state, reason, result)
-	r, err := finishScript.Run(q.ctx, q.client, keys, args...).Int()
-	if err != nil {
-		log.Printf("Error finishing item as %s: %v", state, err)
-		return false
-	}
-	return r >= 0 // -1: result is not JSON
-}
-
 // finishArgs are finishScript's KEYS and ARGV (settleFn's too) for ending
 // ackID's job in state.
 func (q *Queue) finishArgs(ackID, state, reason string, result []byte) ([]string, []any) {
@@ -627,8 +611,9 @@ const trimFn = `local function trim(z, jobs, keep, age, now)
 end
 `
 
-// finishScript is Acknowledge, Reject and AcknowledgeCancelled
-// (spec/redis-storage.md 6.3, 6.4, 6.14).
+// finishScript is one finish (spec/redis-storage.md 6.3, 6.4, 6.14), as
+// FinishTask runs it; Acknowledge, Reject and AcknowledgeCancelled go
+// through settleBatch (see finishbatch.go).
 //
 // KEYS: nacked, timeouts, started, attempts, stats, jobs, the state's ZSET,
 // the other state's ZSET, prio, cancelled. ARGV: ack ID, state (completed,
