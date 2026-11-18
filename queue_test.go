@@ -4322,3 +4322,16 @@ func TestWatchSecondWatcherWaitsForSubscribe(t *testing.T) {
 		t.Errorf("outcome lost: second watcher returned before subscribe was written")
 	}
 }
+
+// PrepareForFutureAck may reuse a popped ack ID with another item: the pop's
+// hint (its envelope id) must not reach that ack's record.
+func TestPrepareForFutureAckDropsHint(t *testing.T) {
+	qs := New(getTestRedisURL())
+	defer qs.Close()
+	q := qs.NewQueue(fmt.Sprintf("hintreuse:%d", time.Now().UnixNano()))
+	require.True(t, q.Enqueue(`{"id":"a"}`))
+	_, ok, ack := q.DequeueWithAckId()
+	require.True(t, ok)
+	require.NoError(t, q.PrepareForFutureAck(ack, `{"id":"b"}`))
+	require.Empty(t, q.hints.take(ack))
+}
