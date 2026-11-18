@@ -3,7 +3,9 @@ package redisq
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -60,7 +62,7 @@ func TestSettleBatchMatchesSequential(t *testing.T) {
 				{4, "failed", "late", ""},
 			}
 			items := []string{envelope("X", "1"), envelope("X", "2"), envelope("", "3"), "plain-bytes", envelope("Y", "4"), envelope("Z", "5")}
-			run := func(key string, batch, hinted bool) (map[string]any, []int64) {
+			run := func(key string, mode string, hinted bool) (map[string]any, []int64) {
 				q, push, pop := open(key)
 				defer q.Close()
 				if c.none {
@@ -79,7 +81,22 @@ func TestSettleBatchMatchesSequential(t *testing.T) {
 				}
 				require.NoError(t, client.ZAdd(ctx, q.getCancelledKey(), redis.Z{Score: 9e12, Member: "Z"}).Err())
 				var codes []int64
-				if batch {
+				switch mode {
+				case "lone": // settleOne, one finish per call
+					for _, f := range fins {
+						h := ""
+						if hinted {
+							h = itemHint([]byte(items[f.i]))
+						}
+						r := &groupReq[finishReq]{v: finishReq{acks[f.i], f.state, f.reason, []byte(f.result), h}}
+						q.settleLone(r)
+						c := int64(0)
+						if r.ok {
+							c = 1
+						}
+						codes = append(codes, c)
+					}
+				case "batch":
 					args := []any{q.keepCompleted.Load(), time.Duration(q.keepCompletedAge.Load()).Milliseconds(),
 						q.keepFailed.Load(), time.Duration(q.keepFailedAge.Load()).Milliseconds(), q.donePrefix()}
 					for _, f := range fins {
@@ -93,7 +110,7 @@ func TestSettleBatchMatchesSequential(t *testing.T) {
 					var err error
 					codes, err = settleBatch.Run(ctx, client, keys, args...).Int64Slice()
 					require.NoError(t, err)
-				} else {
+				default:
 					for _, f := range fins {
 						keys, args := q.finishArgs(acks[f.i], f.state, f.reason, []byte(f.result))
 						c, err := finishScript.Run(ctx, client, keys, args...).Int64()
@@ -103,12 +120,15 @@ func TestSettleBatchMatchesSequential(t *testing.T) {
 				}
 				return dumpQueue(t, client, q), codes
 			}
-			b, cb := run("test_settle_batch_b", false, false)
+			b, cb := run("test_settle_batch_b", "seq", false)
 			for _, hinted := range []bool{false, true} {
-				a, ca := run("test_settle_batch_a", true, hinted)
+				a, ca := run("test_settle_batch_a", "batch", hinted)
 				assert.Equal(t, cb, ca)
 				assert.Equal(t, b, a)
 				assert.Equal(t, []int64{1, 0, 1, 1, 1, -1, 1, 1}, ca)
+				l, cl := run("test_settle_batch_a", "lone", hinted)
+				assert.Equal(t, b, l, "settleOne")
+				assert.Equal(t, []int64{1, 1, 1, 1, 1, 0, 1, 1}, cl) // ok: 0 not processing is a success too
 			}
 			delKeys(t, client, "test_settle_batch_a")
 			delKeys(t, client, "test_settle_batch_b")
@@ -241,6 +261,8 @@ return {ok and 1 or 0, id, asjson(ARGV[1], ok, e) == ARGV[1] and 1 or 0}`)
 		`{}`, `[]`, `["id"]`, `1e5`, ` 12 `, `-0.5e+10`, `null`, `true`, `"str"`, `NaN`, `0x10`, `inf`, `plain bytes`, ``,
 		"\xef\xbb\xbf{\"id\":\"bom\"}", `{"id":"x","n":12345678901234567890}`, `{"id":"s","d":"\ud800"}`, `{"id":"p","d":"😀"}`, deep,
 		`{"id":"t",}`, `{"id":"ctl","d":"a` + "\x01" + `"}`, "{\"id\":\"ws\"}\n",
+		`{"i\u0064":"esc"}`, `{"\u0069d":"e2","x":1}`, `{ "a" : [ 1 , { "id" : "n" } ] , "id" : "w" }`,
+		`{"x":"}","id":"q"}`, `{"a":"\\","id":"bs"}`, `{"id":"k" , "z":true}`, `{"n":-1.5e3,"id":"num"}`,
 	}
 	for _, it := range items {
 		h := itemHint([]byte(it))
@@ -290,5 +312,69 @@ func TestGroupLimits(t *testing.T) {
 	assert.Len(t, seen, 40)
 	for v, n := range seen {
 		assert.Equal(t, 1, n, v)
+	}
+}
+
+// oldTrimFn is the trim before ZPOPMIN (ZRANGEBYSCORE + ZCARD + ZRANGE,
+// then ZREM + HDEL): the reference trimFn must match.
+const oldTrimFn = `local function trim(z, jobs, keep, age, now)
+	local gone
+	if keep <= 0 or age <= 0 then
+		gone = redis.call('ZRANGE', z, 0, 999)
+	else
+		gone = redis.call('ZRANGEBYSCORE', z, '-inf', string.format('%.0f', now - age), 'LIMIT', 0, 1000)
+		local over = redis.call('ZCARD', z) - keep
+		if over > 0 then
+			for _, m in ipairs(redis.call('ZRANGE', z, 0, math.min(over, 1000) - 1)) do gone[#gone + 1] = m end
+		end
+	end
+	if #gone > 0 then
+		redis.call('ZREM', z, unpack(gone))
+		redis.call('HDEL', jobs, unpack(gone))
+	end
+end
+`
+
+// trimFn (ZPOPMIN first, age read skipped when the newest popped is past
+// the cut) leaves what the range trim left: same set, same records.
+func TestTrimMatchesRangeTrim(t *testing.T) {
+	ctx := context.Background()
+	qs := New(getTestRedisURL())
+	defer qs.Close()
+	client := qs.(*queues).client
+	body := `trim(KEYS[1], KEYS[2], tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])) return 1`
+	scripts := map[string]*redis.Script{"old": redis.NewScript(oldTrimFn + body), "new": redis.NewScript(trimFn + body)}
+	const now = 1_000_000
+	rng := rand.New(rand.NewPCG(1, 2))
+	for c := range 200 {
+		size := rng.IntN(60)
+		keep := []int{0, 1, 5, 30, 100}[rng.IntN(5)]
+		age := []int{0, 1000, 50_000, 2_000_000}[rng.IntN(4)]
+		members := make([]redis.Z, size)
+		for i := range members {
+			// ties on purpose: scores on a coarse grid around the cut
+			members[i] = redis.Z{Score: float64(now - rng.IntN(100)*1000), Member: fmt.Sprintf("m%02d", i)}
+		}
+		got := map[string]any{}
+		for name, s := range scripts {
+			z, jobs := "trimtest:"+name+":z", "trimtest:"+name+":jobs"
+			require.NoError(t, client.Del(ctx, z, jobs).Err())
+			if size > 0 {
+				require.NoError(t, client.ZAdd(ctx, z, members...).Err())
+				for _, m := range members {
+					require.NoError(t, client.HSet(ctx, jobs, m.Member, "r").Err())
+				}
+			}
+			require.NoError(t, s.Run(ctx, client, []string{z, jobs}, keep, age, now).Err())
+			left := client.ZRange(ctx, z, 0, -1).Val()
+			recs := client.HKeys(ctx, jobs).Val()
+			slices.Sort(recs)
+			l2 := slices.Clone(left)
+			slices.Sort(l2)
+			assert.Equal(t, l2, recs, "case %d %s: records follow members", c, name)
+			got[name] = left
+			require.NoError(t, client.Del(ctx, z, jobs).Err())
+		}
+		assert.Equal(t, got["old"], got["new"], "case %d size %d keep %d age %d", c, size, keep, age)
 	}
 }
