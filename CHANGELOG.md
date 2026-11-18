@@ -28,6 +28,15 @@ Requires `github.com/goptics/varmq/contract` v0.9.0 and VarMQ ≥ v1.11.0 (#33, 
 - Refused because the pop's cancel gate would miss their id (no cancel, no outcome); 1.5.x stored them and returned `true`. Applies to every item, id or not (#33)
 - `Dequeue` (no ack) is now a script on both FIFO and priority queues, to check the pause (#32)
 
+### Performance
+
+- Group commit: overlapping `Acknowledge` / `AcknowledgeResult` / `Reject` / `AcknowledgeCancelled` of one object run as one `settleBatch` script, FIFO `Enqueue` / `EnqueueOnce` as one push script. No timer: lone call runs at once. Max 256 per call, 4 MiB
+- Same outcome as one script per call; one clock reading per batch. One call in flight per object: a call stuck in go-redis re-sends holds the others; a failed call fails its whole batch
+- Settle decodes an item at most once; a popped item Go reads as plain JSON is not decoded in Lua at all (pop-time hint by ack ID)
+- Owner IDs 52 chars: ack IDs over 64 bytes keep `:timeouts` / `:started` off Redis listpack encoding (listpack float-score ZADD ~9 us at 100 members)
+- Outcome watches: (un)subscribes and catch-up reads of overlapping watches go in one `SUBSCRIBE` / `UNSUBSCRIBE` / `HMGET`
+- Redis CPU per job, Durable NoopW100C1 100u-1Kt: plain ~39 -> ~10 us, tracked ~54 -> ~16 us
+
 ### Added
 
 - `New` takes options; `WithNamespace(ns)` scopes keys under `redisq:ns:` (#27)
