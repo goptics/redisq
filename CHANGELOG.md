@@ -40,7 +40,7 @@ Requires `github.com/goptics/varmq/contract` v0.9.0 and VarMQ ≥ v1.11.0 (#33, 
 - Pop scripts build the cancel-drop closures only when `:cancelled` exists (~2.5 us Lua per pop); one `EXISTS` covers `:paused` and `:cancelled`; one `TIME` per script call
 - Trim pops count victims with `ZPOPMIN` and skips the age read when the newest popped is past the cut (steady state 3 calls, was 5). Needs Redis 5.0+
 - Key names built once per object; pop-time hint scans the top-level `id` without a map decode; `luaDecodable` fast path (no `\\`, few brackets)
-- n=1 settle 17.8 -> 11.5 us, n=1 pop 13.6 -> 9.1 us of Redis time (sequential micro)
+- n=1 settle 17.8 -> 11.5 us of Redis time (sequential micro). Durable NoopW100C1 jobs/s: 1u ~16.9k -> ~18.3k, 100u ~82k -> ~101k
 
 ### Added
 
