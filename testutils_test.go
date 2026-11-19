@@ -15,6 +15,9 @@ import (
 var testRedisURL string
 
 func TestMain(m *testing.M) {
+	// the suite tests the records feature: on, as SetCompletedRetention(1000, 24h).
+	// TestCompletedRecordsOffByDefault covers the real default.
+	defaultKeepCompleted, defaultKeepCompletedAge = 1000, 24*time.Hour
 	// Uses a sensible default on windows (tcp/http) and linux/osx (socket)
 	pool, err := dockertest.NewPool("")
 	if err != nil {

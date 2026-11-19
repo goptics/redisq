@@ -871,6 +871,7 @@ func (s *WorkflowStore) FinishTask(queueID, ackID string, e contract.TaskEnd) ([
 		return nil, q.finish(ackID, state, reason, result)
 	}
 
+	q.hints.take(ackID) // wfFinishScript decodes the item itself
 	settle, args := q.finishArgs(ackID, state, reason, result)
 	undo := "0"
 	if e.Undo {

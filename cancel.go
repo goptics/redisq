@@ -136,15 +136,14 @@ func (q *Queue) cancelRequested(id string) {
 // (no started_at; no errors, no error). res is "" or ',"result":' and the
 // result JSON, spliced raw: a cjson round trip turns big integers into
 // doubles. Built by concatenation: numbers through string.format('%.0f'),
-// strings through cjson.encode, the item through asjson.
-const recordFn = `local function record(id, state, item, started, now, attempts, err, res)
-	local rec = '{"id":' .. cjson.encode(id) .. ',"state":"' .. state .. '","item":' .. asjson(item)
-	if started then rec = rec .. ',"started_at":' .. string.format('%.0f', started) end
-	rec = rec .. ',"finished_at":' .. string.format('%.0f', now) .. ',"attempts":' .. string.format('%.0f', attempts) .. res
-	if err then
-		rec = rec .. ',"errors":[{"attempt":' .. string.format('%.0f', attempts) .. ',"at":' .. string.format('%.0f', now) .. ',"error":' .. cjson.encode(err) .. '}]'
-	end
-	return rec .. '}'
+// strings through cjson.encode, the item through asjson; one concat for the
+// whole record (no ~300-byte partial copies). dok, dec: envid's
+// decode of item (nil dok: decode again).
+const recordFn = `local function record(id, state, item, started, now, attempts, err, res, dok, dec)
+	local nw, at = string.format('%.0f', now), string.format('%.0f', attempts)
+	local sa = started and (',"started_at":' .. string.format('%.0f', started)) or ''
+	local er = err and (',"errors":[{"attempt":' .. at .. ',"at":' .. nw .. ',"error":' .. cjson.encode(err) .. '}]') or ''
+	return '{"id":' .. cjson.encode(id) .. ',"state":"' .. state .. '","item":' .. asjson(item, dok, dec) .. sa .. ',"finished_at":' .. nw .. ',"attempts":' .. at .. res .. er .. '}'
 end
 local function outcome(id, state, err, res)
 	local out = '{"id":' .. cjson.encode(id) .. ',"state":"' .. state .. '"'
@@ -155,13 +154,16 @@ end
 
 // cancelFn defines cancelling(), dropped(v), budget and trimDropped() for
 // the pop scripts (spec 6.14), after deadlineFn; it brings envIDFn,
-// asJSONFn, trimFn and recordFn. k is the KEYS index of
+// asJSONFn, trimFn and recordFn inside cancelkit(), which defines dropped
+// and trimDropped: a gate calls it once it knows a mark exists, so a pop
+// without marks builds none of those closures (~2.5 us of Lua per call). k is the KEYS index of
 // :cancelled, which :jobs, :completed, :failed and :attempts follow; a the
 // ARGV index of the failed retention (most, age ms), which the outcome
 // channel prefix follows.
 //
 // cancelling() reports whether any job is marked, so a pop without marks
-// costs one EXISTS. dropped(v) drops item v if its envelope id has a mark
+// costs one EXISTS; ckn caches it (the pause gate may fill it). dropped(v)
+// drops item v if its envelope id has a mark
 // that has not expired (an item without an id is never dropped; an expired
 // mark is removed and counts as none). A valid workflow item (wftag) is
 // never dropped and its mark stays: the drop can't end its workflow (spec
@@ -177,16 +179,24 @@ end
 // out stops and returns what it has, and its caller pops again (see
 // popGate, popOneGate). trimDropped() trims :failed once, after the drops.
 func cancelFn(k, a string) string {
-	return envIDFn + asJSONFn + trimFn + recordFn + `local ck, ca = ` + k + `, ` + a + `
+	return `local ck, ca = ` + k + `, ` + a + `
 local budget = ` + strconv.Itoa(maxPop) + `
-local function cancelling() return redis.call('EXISTS', KEYS[ck]) == 1 end
-local function trimDropped()
+local ckn
+local function cancelling()
+	if ckn == nil then ckn = redis.call('EXISTS', KEYS[ck]) == 1 end
+	return ckn
+end
+local dropped, trimDropped
+local function cancelkit()
+	if dropped then return end
+` + envIDFn + asJSONFn + trimFn + recordFn + `
+trimDropped = function()
 	if budget < ` + strconv.Itoa(maxPop) + ` then
 		trim(KEYS[ck + 3], KEYS[ck + 1], tonumber(ARGV[ca]), tonumber(ARGV[ca + 1]), tonumber(nowms()))
 	end
 end
-local function dropped(v)
-	local id, e = envid(v)
+dropped = function(v)
+	local id, e, dok = envid(v)
 	if id == '' or wftag(e, id) then return false end
 	local exp = redis.call('ZSCORE', KEYS[ck], id)
 	if not exp then return false end
@@ -199,13 +209,14 @@ local function dropped(v)
 	local keep, age = tonumber(ARGV[ca]), tonumber(ARGV[ca + 1])
 	redis.call('ZREM', KEYS[ck + 2], id)
 	if keep > 0 and age > 0 then
-		redis.call('HSET', KEYS[ck + 1], id, record(id, 'cancelled', v, nil, now, attempts, nil, ''))
+		redis.call('HSET', KEYS[ck + 1], id, record(id, 'cancelled', v, nil, now, attempts, nil, '', dok, e))
 		redis.call('ZADD', KEYS[ck + 3], string.format('%.0f', now), id)
 	else
 		redis.call('HDEL', KEYS[ck + 1], id)
 	end
 	redis.call('PUBLISH', ARGV[ca + 2] .. id, outcome(id, 'cancelled', 'cancelled', ''))
 	return true
+end
 end
 `
 }

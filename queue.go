@@ -1,6 +1,7 @@
 package redisq
 
 import (
+	"bytes"
 	"context"
 	crand "crypto/rand"
 	"encoding/hex"
@@ -55,8 +56,15 @@ type Queue struct {
 	cancelHooks           hookSet[string]             // OnCancel callbacks (see cancel.go)
 	rawKeys               []string                    // what Dequeue's scripts take
 	closeOnce             sync.Once
-	outcomes              outcomeWatchers // WatchOutcome watchers (see outcome.go)
-	scope                 string          // see ScopeID; "" for a queue made by newQueueBase alone
+	outcomes              outcomeWatchers  // WatchOutcome watchers (see outcome.go)
+	finishes              group[finishReq] // finishes waiting for a settleBatch call (see finishbatch.go)
+	hints                 hintMap          // popped items' hints by ack ID (see itemHint)
+	pushes                group[[]byte]    // Enqueue items waiting for a listPushWakeN call
+	oncePushes            group[oncePush]  // EnqueueOnce items waiting for a listPushOnceN call
+	scope                 string           // see ScopeID; "" for a queue made by newQueueBase alone
+	k                     qkeys            // <key>:<suffix> names, built once (no concat per call)
+	listPushKeys          []string         // listPushWakeN KEYS
+	popKeysList           []string         // popKeys() of a list queue, built once
 }
 
 func newQueue(c *redis.Client, queueKey string, scope string) *Queue {
@@ -91,6 +99,22 @@ func (q *Queue) handle(msg *redis.Message) bool {
 	return q.control(msg) || q.outcome(msg)
 }
 
+// qkeys are a queue's key names (see the get*Key methods).
+type qkeys struct {
+	nacked, idle, prio, timeouts, heartbeats, started, attempts string
+	jobs, completed, failed, cancelled, stats, presence, done   string
+}
+
+func newQKeys(base string) qkeys {
+	k := func(s string) string { return base + ":" + s }
+	return qkeys{
+		nacked: k("nacked"), idle: k("idle"), prio: k("prio"), timeouts: k("timeouts"),
+		heartbeats: k("heartbeats"), started: k("started"), attempts: k("attempts"),
+		jobs: k("jobs"), completed: k("completed"), failed: k("failed"),
+		cancelled: k("cancelled"), stats: k("stats"), presence: k("presence"), done: k("done:"),
+	}
+}
+
 func newQueueBase(c *redis.Client, queueKey string) *Queue {
 	ctx, cancel := context.WithCancel(context.Background())
 	q := &Queue{
@@ -98,16 +122,20 @@ func newQueueBase(c *redis.Client, queueKey string) *Queue {
 		queueKey:  queueKey,
 		ctx:       ctx,
 		cancel:    cancel,
-		ackPrefix: newID(),
+		ackPrefix: newOwnerID(),
 	}
 	q.pauseHooks.kick = make(chan struct{}, 1)
+	q.k = newQKeys(queueKey)
+	q.listPushKeys = []string{queueKey, q.k.idle, q.k.stats}
 	q.pausedKey, q.controlKey = queueKey+":paused", queueKey+":control"
+	q.popKeysList = q.popKeys()
 	q.rawKeys = []string{queueKey, q.pausedKey, q.getCancelledKey(), q.getJobsKey(), q.getCompletedKey(), q.getFailedKey(), q.getAttemptsKey()}
 	q.visibilityTimeout.Store(int64(5 * time.Minute))
 	q.dedupWindow.Store(int64(5 * time.Minute))
 	q.heartbeatTimeout.Store(int64(30 * time.Second))
 	q.popLen.Store(maxPop)
-	q.SetCompletedRetention(1000, 24*time.Hour)
+	q.keepCompleted.Store(defaultKeepCompleted)
+	q.keepCompletedAge.Store(int64(defaultKeepCompletedAge))
 	q.SetFailedRetention(10000, 7*24*time.Hour)
 	return q
 }
@@ -118,6 +146,15 @@ func newQueueBase(c *redis.Client, queueKey string) *Queue {
 // and a pop's re-send guard could hand one consumer the items another holds.
 func newID() string {
 	return crand.Text()
+}
+
+// newOwnerID is newID twice, 52 chars, so ack IDs are 78 bytes. Over
+// Redis's zset/hash-max-listpack-value (64) the keys that hold ack IDs
+// (:timeouts, :started, :completed of plain jobs) are skiplists and hash
+// tables from the first member: a listpack zset insert scans and strtod's
+// every float score (~9 us at 100 members against ~0.2 us).
+func newOwnerID() string {
+	return crand.Text() + crand.Text()
 }
 
 func (q *Queue) getExpiration() time.Duration {
@@ -261,6 +298,10 @@ const cjsonMaxDepth = 1000
 // would miss it while varmq still runs it. One pass, no allocation; only a
 // suspect item is checked with json.Valid, so text that isn't JSON passes.
 func luaDecodable(b []byte) bool {
+	// fast path: no escape, at most cjsonMaxDepth brackets (in strings too)
+	if bytes.IndexByte(b, '\\') < 0 && (len(b) <= cjsonMaxDepth || bytes.Count(b, []byte{'{'})+bytes.Count(b, []byte{'['}) <= cjsonMaxDepth) {
+		return true
+	}
 	depth, str := 0, false
 	for i := 0; i < len(b); i++ {
 		switch c := b[i]; {
@@ -315,13 +356,11 @@ func hex4(b []byte, i int) int {
 // surrogate escape such as \ud800 (see luaDecodable). One rule for every
 // item, with an envelope id or not.
 func (q *Queue) Enqueue(item any) bool {
-	return q.enqueueWith(listPushWake, q.pushKeys(), item, q.wakePrefix)
-}
-
-// pushKeys are the keys listPushWake and listPushWakeOnce take before the
-// id's key.
-func (q *Queue) pushKeys() []string {
-	return []string{q.queueKey, q.getIdleKey(), q.getStatsKey()}
+	data, ok := q.pushData(item)
+	if !ok {
+		return false
+	}
+	return q.pushes.do(data, len(data), maxPushBatch, q.pushBatch)
 }
 
 // SetDedupWindow sets how long EnqueueOnce remembers an id: a push of the
@@ -365,22 +404,6 @@ redis.call('ZREM', KEYS[#KEYS - 4], ARGV[#ARGV - 1])
 return r`
 }
 
-// listPushWakeBody is Enqueue's push, with ARGV[1] the item, ARGV[2] the
-// queue expiration in ms (0: none) and ARGV[3] the wake channel prefix. It
-// wakes idle consumers of KEYS[2], up to one per waiting item, so a backlog
-// wakes them all, and counts the job as submitted in KEYS[3], :stats; a
-// dedupe repeat (see once) never gets here, so it isn't counted and wakes
-// no one.
-const listPushWakeBody = `local n = redis.call('RPUSH', KEYS[1], ARGV[1])
-if tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
-redis.call('HINCRBY', KEYS[3], 'submitted', 1)
-return wake(KEYS[2], ARGV[3], n)`
-
-var (
-	listPushWake     = redis.NewScript(wakeFn + listPushWakeBody)
-	listPushWakeOnce = redis.NewScript(wakeFn + once(listPushWakeBody))
-)
-
 // EnqueueOnce is Enqueue for a job with an id: it stores item unless an item
 // with the same id was pushed to this queue within the dedupe window (see
 // SetDedupWindow), and returns true in both cases. A retried call, or
@@ -393,7 +416,11 @@ func (q *Queue) EnqueueOnce(item any, id string) bool {
 	if id == "" {
 		return q.Enqueue(item)
 	}
-	return q.enqueueOnceWith(listPushWakeOnce, q.pushKeys(), item, id, q.wakePrefix)
+	data, ok := q.pushData(item)
+	if !ok {
+		return false
+	}
+	return q.oncePushes.do(oncePush{id, data}, len(data), maxPushBatch, q.pushOnceBatch)
 }
 
 // enqueueOnceWith is enqueueWith for a script built with once: it adds the
@@ -411,18 +438,8 @@ func (q *Queue) enqueueOnceWith(script *redis.Script, keys []string, item any, i
 // enqueueWith runs script to push item, with ARGV[1] the item bytes, ARGV[2]
 // the queue expiration in milliseconds (0: none) and then extra.
 func (q *Queue) enqueueWith(script *redis.Script, keys []string, item any, extra ...any) bool {
-	if q.ctx.Err() != nil {
-		log.Println("queue closed, cannot enqueue")
-		return false
-	}
-
-	data, err := q.toBytes(item)
-	if err != nil {
-		log.Printf("Error converting item to bytes: %v", err)
-		return false
-	}
-	if !luaDecodable(data) {
-		log.Println("Error enqueueing item: JSON Redis Lua can't decode (nested over 1000, or a lone surrogate escape)")
+	data, ok := q.pushData(item)
+	if !ok {
 		return false
 	}
 
@@ -433,6 +450,26 @@ func (q *Queue) enqueueWith(script *redis.Script, keys []string, item any, extra
 	}
 
 	return true
+}
+
+// pushData is item's bytes for a push; false (logged) when the queue is
+// closed or the item can't go in (see Enqueue).
+func (q *Queue) pushData(item any) ([]byte, bool) {
+	if q.ctx.Err() != nil {
+		log.Println("queue closed, cannot enqueue")
+		return nil, false
+	}
+
+	data, err := q.toBytes(item)
+	if err != nil {
+		log.Printf("Error converting item to bytes: %v", err)
+		return nil, false
+	}
+	if !luaDecodable(data) {
+		log.Println("Error enqueueing item: JSON Redis Lua can't decode (nested over 1000, or a lone surrogate escape)")
+		return nil, false
+	}
+	return data, true
 }
 
 // Len returns the number of items in the queue; a consumer that finds it
@@ -472,6 +509,7 @@ func (q *Queue) PrepareForFutureAck(ackID string, item any) error {
 	case <-q.ctx.Done():
 		return fmt.Errorf("queue closed, cannot prepare for acknowledgment")
 	default:
+		q.hints.take(ackID) // item may differ from the one popped under ackID
 		keys := []string{q.getNackedItemKey(), q.getTimeoutKey(), q.getStartedKey()}
 		if err := prepareAck.Run(q.ctx, q.client, keys, ackID, item, q.vt()).Err(); err != nil {
 			return fmt.Errorf("error storing item in pending list: %v", err)
@@ -508,23 +546,6 @@ func (q *Queue) Reject(ackID string, reason string) bool {
 	return q.finish(ackID, "failed", reason, nil)
 }
 
-// finish ends ackID's job in state (completed, failed or cancelled). A
-// cancelled job is indexed, kept and counted as failed (spec 6.14: as Reject).
-func (q *Queue) finish(ackID, state, reason string, result []byte) bool {
-	if q.ctx.Err() != nil {
-		log.Println("queue closed, cannot acknowledge or reject")
-		return false
-	}
-
-	keys, args := q.finishArgs(ackID, state, reason, result)
-	r, err := finishScript.Run(q.ctx, q.client, keys, args...).Int()
-	if err != nil {
-		log.Printf("Error finishing item as %s: %v", state, err)
-		return false
-	}
-	return r >= 0 // -1: result is not JSON
-}
-
 // finishArgs are finishScript's KEYS and ARGV (settleFn's too) for ending
 // ackID's job in state.
 func (q *Queue) finishArgs(ackID, state, reason string, result []byte) ([]string, []any) {
@@ -538,9 +559,23 @@ func (q *Queue) finishArgs(ackID, state, reason string, result []byte) ([]string
 	return keys, []any{ackID, state, reason, keep, time.Duration(age).Milliseconds(), result, q.donePrefix()}
 }
 
+// Completed Job Records are off by default: the record write is the largest
+// cost of a finish. -1 is "not set": this object writes none and its trims
+// leave the completed records alone, so a process on the default never drops
+// what another process chose to keep (a set 0 does drop them, see
+// SetCompletedRetention). A var so the package's tests can keep them on.
+var (
+	defaultKeepCompleted    int64 = -1
+	defaultKeepCompletedAge       = time.Duration(0)
+)
+
 // SetCompletedRetention sets how many completed Job Records the queue keeps
-// (default 1000) and for how long (default 24h). Either at 0 or less keeps
-// none: no record is written and the next trim drops the ones there.
+// and for how long. The default keeps none: turn them on, for example
+// SetCompletedRetention(1000, 24*time.Hour), to list completed jobs and to
+// let a watch that starts after its job ended still get the outcome.
+// Either at 0 or less keeps none: no record is written and the next trim
+// drops the ones there. An object on the default writes none either, but
+// drops nothing: records another process keeps stay.
 // Every instance of a queue should set the same values; each trim uses
 // those of the instance that runs it. The :stats counters count every job
 // whatever the retention.
@@ -556,6 +591,14 @@ func (q *Queue) SetFailedRetention(most int, age time.Duration) {
 	q.keepFailedAge.Store(int64(max(0, age)))
 }
 
+// envidFn is envid alone, for the settle scripts (no wftag).
+const envidFn = `local function envid(v)
+	local ok, e = pcall(cjson.decode, v)
+	if ok and type(e) == 'table' and type(e.id) == 'string' then return e.id, e, true end
+	return '', (ok and e or nil), ok
+end
+`
+
 // envIDFn defines envid(v): the envelope id of item v, or empty when v is not
 // a JSON object with a string id, and the decoded envelope (nil when v is
 // not JSON). Items are only decoded, never re-encoded: cjson.encode rounds
@@ -569,12 +612,7 @@ func (q *Queue) SetFailedRetention(most int, age time.Duration) {
 // case (and folds "ſ" to s, "K" to k), cjson does not: an envelope with
 // any such variant of id, wf, task or undo (wffold) reads differently in
 // varmq, so it is never a workflow item here and a cancel mark drops it.
-const envIDFn = `local function envid(v)
-	local ok, e = pcall(cjson.decode, v)
-	if ok and type(e) == 'table' and type(e.id) == 'string' then return e.id, e end
-	return '', (ok and e or nil)
-end
-local function wfname(s, n)
+const envIDFn = envidFn + `local function wfname(s, n)
 	return type(s) == 'string' and #s >= 1 and #s <= n and string.find(s, '^[A-Za-z0-9_.%-]+$') ~= nil
 end
 local function wffold(k)
@@ -593,11 +631,12 @@ local function wftag(e, id)
 end
 `
 
-// asJSONFn defines asjson(v): item v as it goes into a record, v itself
-// when it is JSON, else v as a JSON string. cjson.decode takes nan, inf and
-// hex numbers, so a bare number counts as JSON only when it looks like one.
-const asJSONFn = `local function asjson(v)
-	local ok, e = pcall(cjson.decode, v)
+// asJSONFn defines asjson(v, ok, e): item v as it goes into a record, v
+// itself when it is JSON, else v as a JSON string. cjson.decode takes nan,
+// inf and hex numbers, so a bare number counts as JSON only when it looks
+// like one. ok, e: envid's decode of v, reused; nil ok decodes here.
+const asJSONFn = `local function asjson(v, ok, e)
+	if ok == nil then ok, e = pcall(cjson.decode, v) end
 	if not ok or (type(e) == 'number' and not string.match(v, '^%s*-?%d[%d.eE+-]*%s*$')) then return cjson.encode(v) end
 	return v
 end
@@ -608,26 +647,34 @@ end
 // outside the newest keep, all of them when either is 0, and their records
 // in HASH jobs. Members are collected before they go, so their records go
 // too. A trim takes up to 1000 of each; the next one takes the rest.
+// Count first, by ZPOPMIN (the oldest go, as ZRANGE 0 over-1 then ZREM):
+// when the newest popped is past the age cut, every member left is too, so
+// the age range read is skipped. A full set at steady state costs ZCARD,
+// ZPOPMIN, HDEL.
 const trimFn = `local function trim(z, jobs, keep, age, now)
-	local gone
-	if keep <= 0 or age <= 0 then
-		gone = redis.call('ZRANGE', z, 0, 999)
-	else
-		gone = redis.call('ZRANGEBYSCORE', z, '-inf', string.format('%.0f', now - age), 'LIMIT', 0, 1000)
-		local over = redis.call('ZCARD', z) - keep
-		if over > 0 then
-			for _, m in ipairs(redis.call('ZRANGE', z, 0, math.min(over, 1000) - 1)) do gone[#gone + 1] = m end
+	if keep < 0 then return end -- retention not set: others' records stay
+	local gone, cut = {}, nil
+	if keep > 0 and age > 0 then cut = now - age end
+	local over = cut and (redis.call('ZCARD', z) - keep) or 1000
+	if over > 0 then
+		local p = redis.call('ZPOPMIN', z, math.min(over, 1000))
+		for i = 1, #p, 2 do gone[#gone + 1] = p[i] end
+		if cut and #p > 0 and tonumber(p[#p]) > cut then cut = nil end
+	end
+	if cut then
+		local old = redis.call('ZRANGEBYSCORE', z, '-inf', string.format('%.0f', cut), 'LIMIT', 0, 1000)
+		if #old > 0 then
+			redis.call('ZREM', z, unpack(old))
+			for _, m in ipairs(old) do gone[#gone + 1] = m end
 		end
 	end
-	if #gone > 0 then
-		redis.call('ZREM', z, unpack(gone))
-		redis.call('HDEL', jobs, unpack(gone))
-	end
+	if #gone > 0 then redis.call('HDEL', jobs, unpack(gone)) end
 end
 `
 
-// finishScript is Acknowledge, Reject and AcknowledgeCancelled
-// (spec/redis-storage.md 6.3, 6.4, 6.14).
+// finishScript is one finish (spec/redis-storage.md 6.3, 6.4, 6.14), as
+// FinishTask runs it; Acknowledge, Reject and AcknowledgeCancelled go
+// through settleBatch (see finishbatch.go).
 //
 // KEYS: nacked, timeouts, started, attempts, stats, jobs, the state's ZSET,
 // the other state's ZSET, prio, cancelled. ARGV: ack ID, state (completed,
@@ -660,7 +707,7 @@ redis.call('HDEL', KEYS[1], ARGV[1])
 redis.call('ZREM', KEYS[2], ARGV[1])
 redis.call('HDEL', KEYS[3], ARGV[1])
 redis.call('HDEL', KEYS[9], ARGV[1])
-local env = envid(item)
+local env, dec, dok = envid(item)
 local id, attempts = env, 1
 if id ~= '' then
 	attempts = 1 + (tonumber(redis.call('HGET', KEYS[4], id)) or 0)
@@ -677,7 +724,7 @@ local err = not done and ARGV[3] or nil
 local res = (done and ARGV[6] ~= '') and (',"result":' .. ARGV[6]) or ''
 redis.call('ZREM', KEYS[8], id)
 if keep > 0 and age > 0 then
-	redis.call('HSET', KEYS[6], id, record(id, ARGV[2], item, started, now, attempts, err, res))
+	redis.call('HSET', KEYS[6], id, record(id, ARGV[2], item, started, now, attempts, err, res, dok, dec))
 	redis.call('ZADD', KEYS[7], string.format('%.0f', now), id)
 else
 	redis.call('HDEL', KEYS[6], id)
@@ -803,6 +850,7 @@ func popScript(lenCmd, take, after string) *redis.Script {
 const popGate = `local sc
 items, sc = take(want)
 if #items > 0 and cancelling() then
+	cancelkit()
 	local all, alls = items, sc
 	items, sc = {}, {}
 	while #all > 0 do
@@ -907,6 +955,7 @@ end
 // returns -1 instead of idling, the lean batch pop reports the items left.
 const popOneGate = `local v, sc = pop1()
 if v and cancelling() then
+	cancelkit()
 	while v and dropped(v) do
 		if budget <= 0 then v = false; break end
 		v, sc = pop1()
@@ -1033,6 +1082,7 @@ func (q *Queue) dequeueOne(pop *redis.Script, extraKeys ...string) (item any, ok
 	}
 
 	q.beating.Store(q.hbt() > 0)
+	q.hints.put(ackID, itemHint([]byte(v)))
 	return []byte(v), true, ackID
 }
 
@@ -1041,6 +1091,9 @@ func (q *Queue) dequeueOne(pop *redis.Script, extraKeys ...string) (item any, ok
 // :cancelled, :jobs, :completed, :failed, :attempts (see cancelFn), :paused,
 // :started, :heartbeats.
 func (q *Queue) popKeys(extraKeys ...string) []string {
+	if len(extraKeys) == 0 && q.popKeysList != nil {
+		return q.popKeysList // read only: go-redis copies keys
+	}
 	return append(append([]string{q.queueKey, q.getNackedItemKey(), q.getTimeoutKey(), q.getIdleKey()}, extraKeys...),
 		q.getCancelledKey(), q.getJobsKey(), q.getCompletedKey(), q.getFailedKey(), q.getAttemptsKey(),
 		q.getPausedKey(), q.getStartedKey(), q.getHeartbeatKey())
@@ -1096,15 +1149,24 @@ func (q *Queue) vt() float64 {
 // TIME is non-deterministic, so Redis 6 configured to replicate scripts
 // verbatim (lua-replicate-commands no) rejects writes after it unless the
 // script switches to replicating its effects first. Redis 7 always does.
+//
+// One TIME per script call: clock() keeps the first reading, so every
+// deadline and timestamp of one call is the same instant (Redis 7 freezes
+// TIME within a script anyway).
 const deadlineFn = `redis.replicate_commands()
+local clk
+local function clock()
+	if not clk then clk = redis.call('TIME') end
+	return clk
+end
 local function deadline(vt)
 	vt = tonumber(vt)
 	if vt <= 0 then return 0 end
-	local t = redis.call('TIME')
+	local t = clock()
 	return tonumber(t[1]) + tonumber(t[2]) / 1e6 + vt
 end
 local function nowms()
-	local t = redis.call('TIME')
+	local t = clock()
 	return string.format('%.0f', tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000))
 end
 `
@@ -1191,6 +1253,7 @@ func (q *Queue) dequeueBatch(pop, popOne *redis.Script, items []any, ackIDs []st
 	for i, v := range popped {
 		items[i] = []byte(v.(string))
 		ackIDs[i] = q.ackIDOf(resv, i+1)
+		q.hints.put(ackIDs[i], itemHint(items[i].([]byte)))
 	}
 
 	if remaining > 0 {
@@ -1501,71 +1564,71 @@ func (q *Queue) GetNackedItemsCount() int {
 
 // getNackedItemKey returns the Redis key for the nacked items list
 func (q *Queue) getNackedItemKey() string {
-	return q.queueKey + ":nacked"
+	return q.k.nacked
 }
 
 // getIdleKey returns the Redis key for the idle consumers of a distributed queue
 func (q *Queue) getIdleKey() string {
-	return q.queueKey + ":idle"
+	return q.k.idle
 }
 
 // getPriorityKey returns the Redis key for the priorities of pending items
 func (q *Queue) getPriorityKey() string {
-	return q.queueKey + ":prio"
+	return q.k.prio
 }
 
 // getTimeoutKey returns the Redis key for the visibility timeout ZSET
 func (q *Queue) getTimeoutKey() string {
-	return q.queueKey + ":timeouts"
+	return q.k.timeouts
 }
 
 // getHeartbeatKey returns the Redis key for the heartbeats of the queues
 // holding pending items
 func (q *Queue) getHeartbeatKey() string {
-	return q.queueKey + ":heartbeats"
+	return q.k.heartbeats
 }
 
 // getStartedKey returns the Redis key for when each processing job started
 func (q *Queue) getStartedKey() string {
-	return q.queueKey + ":started"
+	return q.k.started
 }
 
 // getAttemptsKey returns the Redis key for how often each job (by envelope
 // id) went back to the queue without an outcome
 func (q *Queue) getAttemptsKey() string {
-	return q.queueKey + ":attempts"
+	return q.k.attempts
 }
 
 // getJobsKey returns the Redis key for the Job Records
 func (q *Queue) getJobsKey() string {
-	return q.queueKey + ":jobs"
+	return q.k.jobs
 }
 
 // getCompletedKey returns the Redis key for the completed jobs by finish time
 func (q *Queue) getCompletedKey() string {
-	return q.queueKey + ":completed"
+	return q.k.completed
 }
 
 // getFailedKey returns the Redis key for the failed jobs by finish time
 func (q *Queue) getFailedKey() string {
-	return q.queueKey + ":failed"
+	return q.k.failed
 }
 
 // getCancelledKey returns the Redis key for the Job IDs with a cancel request
 func (q *Queue) getCancelledKey() string {
-	return q.queueKey + ":cancelled"
+	return q.k.cancelled
 }
 
 // getStatsKey returns the Redis key for the submitted, completed and failed
 // counters
 func (q *Queue) getStatsKey() string {
-	return q.queueKey + ":stats"
+	return q.k.stats
 }
 
 // getPresenceKey returns the Redis key for whether the owners of pending
 // items are still subscribed to their wake channel (see tickBody)
 func (q *Queue) getPresenceKey() string {
-	return q.queueKey + ":presence"
+	return q.k.presence
 }
 
 // Close stops the queue and requeues the items it dequeued and has not
@@ -1584,6 +1647,7 @@ func (q *Queue) Close() error {
 		q.cancel() // stops the sweep
 		err = q.release()
 		q.outcomes.close()
+		q.hints.clear()
 		q.Notification.Stop()
 	})
 	return err

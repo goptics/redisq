@@ -4281,3 +4281,57 @@ func TestWorkflowCountsRedisError(t *testing.T) {
 	assert.Equal(t, int64(1), got[contract.WorkflowRunning])
 	assert.Equal(t, c.ZCard(ctx, index).Val(), c.ZCard(ctx, states).Val(), "healed")
 }
+
+// A second watcher must not return before the first watcher's SUBSCRIBE is
+// written: with no record kept, a finish in that gap would be lost to both.
+func TestWatchSecondWatcherWaitsForSubscribe(t *testing.T) {
+	key := fmt.Sprintf("watch2:%d", time.Now().UnixNano())
+	qs := New(getTestRedisURL())
+	defer qs.Close()
+	p := qs.NewQueue(key)
+	qs2 := New(getTestRedisURL())
+	defer qs2.Close()
+	w := qs2.NewQueue(key)
+	p.SetCompletedRetention(0, 0)
+	require.True(t, p.Enqueue(`{"id":"w1"}`))
+	_, ok, ack := p.DequeueWithAckId()
+	require.True(t, ok)
+
+	// W1: what WatchOutcome does before syncSub
+	o := &w.outcomes
+	o.mu.Lock()
+	if o.byID == nil {
+		o.byID = map[string]map[*outcomeWatch]struct{}{}
+	}
+	got1 := make(chan contract.JobOutcome, 1)
+	w1 := &outcomeWatch{fn: func(x contract.JobOutcome) { got1 <- x }}
+	o.byID["w1"] = map[*outcomeWatch]struct{}{w1: {}}
+	o.mu.Unlock()
+	// W2
+	got2 := make(chan contract.JobOutcome, 1)
+	w.WatchOutcome("w1", func(x contract.JobOutcome) { got2 <- x })
+	// W2 returned: finish now
+	require.True(t, p.Acknowledge(ack))
+	time.Sleep(200 * time.Millisecond)
+	// W1 goes on
+	w.syncSub("w1", true, true)
+	select {
+	case x := <-got2:
+		t.Logf("delivered %+v", x)
+	case <-time.After(3 * time.Second):
+		t.Errorf("outcome lost: second watcher returned before subscribe was written")
+	}
+}
+
+// PrepareForFutureAck may reuse a popped ack ID with another item: the pop's
+// hint (its envelope id) must not reach that ack's record.
+func TestPrepareForFutureAckDropsHint(t *testing.T) {
+	qs := New(getTestRedisURL())
+	defer qs.Close()
+	q := qs.NewQueue(fmt.Sprintf("hintreuse:%d", time.Now().UnixNano()))
+	require.True(t, q.Enqueue(`{"id":"a"}`))
+	_, ok, ack := q.DequeueWithAckId()
+	require.True(t, ok)
+	require.NoError(t, q.PrepareForFutureAck(ack, `{"id":"b"}`))
+	require.Empty(t, q.hints.take(ack))
+}
