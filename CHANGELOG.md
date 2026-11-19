@@ -27,6 +27,7 @@ Requires `github.com/goptics/varmq/contract` v0.9.0 and VarMQ ≥ v1.11.0 (#33, 
 - **Behavior change:** `Enqueue` / `EnqueueOnce` refuse (`false`) JSON that Go reads but Redis Lua cjson can't: nesting over 1000, a lone UTF-16 surrogate escape (`\ud800`) (#33)
 - Refused because the pop's cancel gate would miss their id (no cancel, no outcome); 1.5.x stored them and returned `true`. Applies to every item, id or not (#33)
 - `Dequeue` (no ack) is now a script on both FIFO and priority queues, to check the pause (#32)
+- **Behavior change:** completed Job Records are off by default (was 1000 for 24h). Completed jobs are still counted in `:stats` and their outcome published. `SetCompletedRetention(1000, 24*time.Hour)` restores the old default; a watch that starts after its job completed needs it. Failed records unchanged (10000 for 7 days)
 
 ### Performance
 
@@ -37,6 +38,7 @@ Requires `github.com/goptics/varmq/contract` v0.9.0 and VarMQ ≥ v1.11.0 (#33, 
 - Outcome watches: (un)subscribes and catch-up reads of overlapping watches go in one `SUBSCRIBE` / `UNSUBSCRIBE` / `HMGET`
 - Redis CPU per job, Durable NoopW100C1 100u-1Kt: plain ~39 -> ~10 us, tracked ~54 -> ~16 us
 - Lone finish (no batch): lean `settleOne` script, no tables; `HDEL :prio` only on priority queues
+- No completed record by default: no record build, `HSET`, `ZADD`. Durable NoopW100C1 100u-1Kt: plain ~103k -> ~124k jobs/s, with job ids ~66k -> ~80k; 1u-100Kt plain ~18.3k -> ~19.4k
 - Pop scripts build the cancel-drop closures only when `:cancelled` exists (~2.5 us Lua per pop); one `EXISTS` covers `:paused` and `:cancelled`; one `TIME` per script call
 - Trim pops count victims with `ZPOPMIN` and skips the age read when the newest popped is past the cut (steady state 3 calls, was 5). Needs Redis 5.0+
 - Key names built once per object; pop-time hint scans the top-level `id` without a map decode; `luaDecodable` fast path (no `\\`, few brackets)

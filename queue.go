@@ -134,7 +134,7 @@ func newQueueBase(c *redis.Client, queueKey string) *Queue {
 	q.dedupWindow.Store(int64(5 * time.Minute))
 	q.heartbeatTimeout.Store(int64(30 * time.Second))
 	q.popLen.Store(maxPop)
-	q.SetCompletedRetention(1000, 24*time.Hour)
+	q.SetCompletedRetention(defaultKeepCompleted, defaultKeepCompletedAge)
 	q.SetFailedRetention(10000, 7*24*time.Hour)
 	return q
 }
@@ -558,9 +558,19 @@ func (q *Queue) finishArgs(ackID, state, reason string, result []byte) ([]string
 	return keys, []any{ackID, state, reason, keep, time.Duration(age).Milliseconds(), result, q.donePrefix()}
 }
 
+// Completed Job Records are off by default: the record write is the largest
+// cost of a finish. A var so the package's tests can keep them on.
+var (
+	defaultKeepCompleted    = 0
+	defaultKeepCompletedAge = time.Duration(0)
+)
+
 // SetCompletedRetention sets how many completed Job Records the queue keeps
-// (default 1000) and for how long (default 24h). Either at 0 or less keeps
-// none: no record is written and the next trim drops the ones there.
+// and for how long. The default keeps none: turn them on, for example
+// SetCompletedRetention(1000, 24*time.Hour), to list completed jobs and to
+// let a watch that starts after its job ended still get the outcome.
+// Either at 0 or less keeps none: no record is written and the next trim
+// drops the ones there.
 // Every instance of a queue should set the same values; each trim uses
 // those of the instance that runs it. The :stats counters count every job
 // whatever the retention.

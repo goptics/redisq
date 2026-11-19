@@ -38,7 +38,7 @@
 - **Fast handover**: a consumer that [closes](#when-a-consumer-closes) hands its unacknowledged jobs back at once; one that [dies](#when-a-consumer-dies), in about 3-4 s; one cut off from Redis, after a 30 s heartbeat.
 - **Batch dequeue** of up to 1000 items per round trip, each under its own ack ID.
 - **Deduplicated enqueue**: `EnqueueOnce` stores a job once per id within a dedup window.
-- **Job records and inspection** in Redis, shared by every instance: completed and failed jobs with payloads, kept by count and age.
+- **Job records and inspection** in Redis, shared by every instance: failed jobs with payloads by default, completed ones when you turn them on, kept by count and age.
 - **[Queue pause](#queue-pause)**: `Pause` stops every consumer of a queue, in every process, until `Resume`.
 - **[Job cancel](#job-cancel)**: `CancelJob` asks to cancel a waiting or running job, from any process.
 - **[Workflows](#workflows)**: VarMQ workflows (a DAG of jobs across queues) run on Redis, in any process.
@@ -194,10 +194,14 @@ never sees the old outcome.
 script, counts the job, keeps its Job Record (item verbatim, start and finish times, attempts, and `Reject`'s reason as its `errors` entry)
 and trims old records. Every enqueue counts as submitted, except an `EnqueueOnce` repeat.
 
+Completed records are **off by default**: the record write is the largest cost of a finish. A completed job is still
+counted, and its outcome is still published to live watchers. Turn them on with `SetCompletedRetention` to list
+completed jobs and to let a watch that starts after its job ended still get the outcome. Failed records are on.
+
 ```go
 queue.Reject(ackID, "payment declined")
 
-queue.SetCompletedRetention(1000, 24*time.Hour)  // default; 0 for either keeps none
+queue.SetCompletedRetention(1000, 24*time.Hour)  // off by default; 0 for either keeps none
 queue.SetFailedRetention(10000, 7*24*time.Hour)  // default
 
 queue.QueueID()    // "redisq:fifo:{orders}", the same on every instance
@@ -233,7 +237,8 @@ q.AcknowledgeResult(ackID, []byte(`{"total":42}`)) // Acknowledge + result JSON;
 in the same script, kept record or not. So does a pop that drops a cancelled job (see [Job cancel](#job-cancel)). A watch
 subscribes that channel on the queue object's one pub/sub connection, reads the Job Record right after, and again
 each sweep (1 s), so a job that ended before the watch, or a message lost in a reconnect, is still reported while
-its record is kept. `AcknowledgeResult` stores the result raw as the record's `result`, big integers intact.
+its record is kept. Completed records are off by default (see [Job records](#job-records-and-inspection)): without
+them a watch must be live when its job completes, so watch before the job can end or call `SetCompletedRetention`. `AcknowledgeResult` stores the result raw as the record's `result`, big integers intact.
 `Close` drops watchers without calling them (a delivery already under way may still call its fn).
 
 ### Queue pause
