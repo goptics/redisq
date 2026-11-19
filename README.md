@@ -264,7 +264,7 @@ A pause stops every consumer, in every process, until `Resume`. So authorize unt
 ### Job cancel
 
 ```go
-err := queue.CancelJob("job-0b7e9c2a") // from any process; contract.ErrJobEnded if its record shows it ended
+err := queue.CancelJob("job-0b7e9c2a") // from any process; contract.ErrJobEnded if its record shows it ended (a completed job keeps none by default: nil)
 
 stop := queue.OnCancel(func(jobID string) { /* stop the running job */ })
 defer stop()

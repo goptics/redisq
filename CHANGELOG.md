@@ -27,7 +27,7 @@ Requires `github.com/goptics/varmq/contract` v0.9.0 and VarMQ ≥ v1.11.0 (#33, 
 - **Behavior change:** `Enqueue` / `EnqueueOnce` refuse (`false`) JSON that Go reads but Redis Lua cjson can't: nesting over 1000, a lone UTF-16 surrogate escape (`\ud800`) (#33)
 - Refused because the pop's cancel gate would miss their id (no cancel, no outcome); 1.5.x stored them and returned `true`. Applies to every item, id or not (#33)
 - `Dequeue` (no ack) is now a script on both FIFO and priority queues, to check the pause (#32)
-- **Behavior change:** completed Job Records are off by default (was 1000 for 24h). Completed jobs are still counted in `:stats` and their outcome published. `SetCompletedRetention(1000, 24*time.Hour)` restores the old default; a watch that starts after its job completed needs it. An object on the default drops no records: those another process keeps stay (a set 0 still drops them). Failed records unchanged (10000 for 7 days)
+- **Behavior change:** completed Job Records are off by default (was 1000 for 24h). Completed jobs are still counted in `:stats` and their outcome published. `SetCompletedRetention(1000, 24*time.Hour)` restores the old default; a watch that starts after its job completed needs it, and so does `CancelJob` to answer `ErrJobEnded` for a completed job (without the record it returns nil and leaves a 24h mark). An object on the default drops no records: those another process keeps stay (a set 0 still drops them). Failed records unchanged (10000 for 7 days)
 
 ### Performance
 
