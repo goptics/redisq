@@ -152,7 +152,7 @@ func TestAcknowledgeAndRejectWriteRecords(t *testing.T) {
 // completed record on.
 func TestCompletedRecordsOffByDefault(t *testing.T) {
 	keep, age := defaultKeepCompleted, defaultKeepCompletedAge
-	defaultKeepCompleted, defaultKeepCompletedAge = 0, 0 // the shipped default (TestMain turns it on)
+	defaultKeepCompleted, defaultKeepCompletedAge = -1, 0 // the shipped default (TestMain turns it on)
 	defer func() { defaultKeepCompleted, defaultKeepCompletedAge = keep, age }()
 	eachJobsCase(t, func(t *testing.T, q *Queue, in contract.QueueInspector, push func(string, string) bool, pop func() (string, bool)) {
 		ctx := context.Background()
@@ -182,6 +182,22 @@ func TestCompletedRecordsOffByDefault(t *testing.T) {
 		done := jobs(t, in, contract.JobCompleted, 0, 10)
 		require.Len(t, done, 1)
 		assert.Equal(t, "kept", done[0].ID)
+
+		// an object on the default drops nothing: its finish and its sweep
+		// trim leave the record another object kept
+		other := newQueueBase(q.client, q.queueKey)
+		other.isPriority = q.isPriority
+		require.EqualValues(t, -1, other.keepCompleted.Load())
+		require.True(t, push(envelope("late", "1"), "late"))
+		a, _ = pop()
+		require.True(t, other.Acknowledge(a))
+		other.trim()
+		assert.Equal(t, []string{"kept"}, ids(jobs(t, in, contract.JobCompleted, 0, 10)))
+
+		// a set 0 drops them
+		other.SetCompletedRetention(0, 0)
+		other.trim()
+		assert.Empty(t, jobs(t, in, contract.JobCompleted, 0, 10))
 	})
 }
 

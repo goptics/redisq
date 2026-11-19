@@ -134,7 +134,8 @@ func newQueueBase(c *redis.Client, queueKey string) *Queue {
 	q.dedupWindow.Store(int64(5 * time.Minute))
 	q.heartbeatTimeout.Store(int64(30 * time.Second))
 	q.popLen.Store(maxPop)
-	q.SetCompletedRetention(defaultKeepCompleted, defaultKeepCompletedAge)
+	q.keepCompleted.Store(defaultKeepCompleted)
+	q.keepCompletedAge.Store(int64(defaultKeepCompletedAge))
 	q.SetFailedRetention(10000, 7*24*time.Hour)
 	return q
 }
@@ -559,10 +560,13 @@ func (q *Queue) finishArgs(ackID, state, reason string, result []byte) ([]string
 }
 
 // Completed Job Records are off by default: the record write is the largest
-// cost of a finish. A var so the package's tests can keep them on.
+// cost of a finish. -1 is "not set": this object writes none and its trims
+// leave the completed records alone, so a process on the default never drops
+// what another process chose to keep (a set 0 does drop them, see
+// SetCompletedRetention). A var so the package's tests can keep them on.
 var (
-	defaultKeepCompleted    = 0
-	defaultKeepCompletedAge = time.Duration(0)
+	defaultKeepCompleted    int64 = -1
+	defaultKeepCompletedAge       = time.Duration(0)
 )
 
 // SetCompletedRetention sets how many completed Job Records the queue keeps
@@ -570,7 +574,8 @@ var (
 // SetCompletedRetention(1000, 24*time.Hour), to list completed jobs and to
 // let a watch that starts after its job ended still get the outcome.
 // Either at 0 or less keeps none: no record is written and the next trim
-// drops the ones there.
+// drops the ones there. An object on the default writes none either, but
+// drops nothing: records another process keeps stay.
 // Every instance of a queue should set the same values; each trim uses
 // those of the instance that runs it. The :stats counters count every job
 // whatever the retention.
@@ -647,6 +652,7 @@ end
 // the age range read is skipped. A full set at steady state costs ZCARD,
 // ZPOPMIN, HDEL.
 const trimFn = `local function trim(z, jobs, keep, age, now)
+	if keep < 0 then return end -- retention not set: others' records stay
 	local gone, cut = {}, nil
 	if keep > 0 and age > 0 then cut = now - age end
 	local over = cut and (redis.call('ZCARD', z) - keep) or 1000
